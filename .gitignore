@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+runs/
+
+# Captured Obsidian Sync login (account token + vault link) — never commit
+secrets/
+
+# Personal, per-machine Claude Code settings (shared config goes in settings.json)
+.claude/settings.local.json

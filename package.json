@@ -1,0 +1,23 @@
+{
+  "name": "obsidian-sync-tester",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "description": "Convergence / data-loss tester for Obsidian Sync, driven entirely through the Obsidian CLI",
+  "engines": {
+    "node": ">=22",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "smoke": "tsx src/smoke.ts",
+    "local": "tsx src/run-local.ts",
+    "start": "tsx src/run.ts",
+    "test": "node --import tsx --test src/**/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
