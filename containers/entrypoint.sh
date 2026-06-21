@@ -23,6 +23,11 @@ if [[ -d /secrets/vault ]]; then
   cp -a /secrets/vault/. "$VAULT_DIR/.obsidian"/
 fi
 
+# Pre-create the log files so the streaming `tail -F` has them immediately.
+mkdir -p /var/log
+: > /var/log/xvfb.log
+: > /var/log/obsidian.log
+
 export DISPLAY=:99
 Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp >/var/log/xvfb.log 2>&1 &
 sleep 2
@@ -32,16 +37,26 @@ eval "$(dbus-launch --sh-syntax)"
 export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 
 echo "[entrypoint] launching Obsidian"
-/usr/local/bin/obsidian --no-sandbox --disable-gpu >/var/log/obsidian.log 2>&1 &
+/usr/local/bin/obsidian --no-sandbox --disable-gpu --disable-dev-shm-usage \
+  >>/var/log/obsidian.log 2>&1 &
+obsidian_pid=$!
 
 if [[ "${CAPTURE:-0}" == "1" ]]; then
   echo "[entrypoint] CAPTURE mode — VNC on :5900 (no password). In the VNC session:"
   echo "  1. Open folder as vault -> $VAULT_DIR"
-  echo "  2. log into Obsidian Sync; connect/create the TEST remote vault"
-  echo "  3. set conflict handling = 'Create conflict file'"
-  echo "  4. wait for initial sync to finish, then on the host: make capture"
+  echo "  2. enable the CLI: Settings > General > Advanced > Command line interface"
+  echo "  3. log into Obsidian Sync; connect/create the TEST remote vault"
+  echo "  4. set conflict handling = 'Create conflict file'"
+  echo "  5. wait for initial sync to finish, then on the host: make capture"
   x11vnc -display :99 -forever -nopw -shared -rfbport 5900 >/var/log/x11vnc.log 2>&1 &
 fi
 
-# Keep the container running; surface Obsidian's log.
-tail -f /var/log/obsidian.log
+# Stream Obsidian's log to the container's stdout.
+tail -F /var/log/obsidian.log &
+
+# Tie the container's lifetime to Obsidian: if it exits (e.g. a failed launch),
+# so does the container — failures then show up in `podman ps` / `make logs`, and
+# any waiter fails fast instead of hanging on a log that never grows.
+if wait "$obsidian_pid"; then status=0; else status=$?; fi
+echo "[entrypoint] Obsidian exited (status $status) — stopping container" >&2
+exit "$status"

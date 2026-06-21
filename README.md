@@ -65,7 +65,7 @@ make install && make check   # install + typecheck + unit tests
 make local                   # TEST_VAULT=Throwaway by default (override: make local TEST_VAULT=Foo)
 
 # two-node containers:
-make build && make login     # VNC in, link a TEST remote vault, "create conflict file"
+make build && make login     # VNC in: enable CLI, link a TEST remote vault, "create conflict file"
 make capture                 # copies the login into ./secrets (git-ignored), not an image
 make up && make run          # or: ISOLATOR=network make run
 ```

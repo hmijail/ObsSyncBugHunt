@@ -20,7 +20,9 @@ import { runDivergenceRound } from "./runner.js";
 
 const nodes = (process.env.NODES ?? "n1,n2").split(",").map((s) => s.trim());
 const vault = process.env.VAULT ?? "TestVault";
-const bin = process.env.OBSIDIAN_BIN ?? "/usr/local/bin/obsidian";
+// In containers the CLI is the dedicated obsidian-cli binary (the GUI binary
+// can't run CLI as root). It must be enabled in Settings > General > Advanced.
+const bin = process.env.OBSIDIAN_BIN ?? "/opt/obsidian/obsidian-cli";
 const network = process.env.NETWORK ?? "obsidian-net";
 const isolatorKind = process.env.ISOLATOR ?? "sync";
 const note = process.env.NOTE ?? `conv-${Date.now()}`;

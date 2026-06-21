@@ -56,13 +56,14 @@ secrets-dir:
 login: build net secrets-dir ## Start a VNC container for the one-time Sync login
 	-podman rm -f $(LOGIN) 2>/dev/null || true
 	podman run -d --name $(LOGIN) --network $(NET) \
-	  -e CAPTURE=1 -p 5900:5900 --shm-size=1g \
+	  -e CAPTURE=1 -p 5900:5900 \
 	  -v $(SECRETS):/secrets:rw $(IMAGE)
 	@echo
 	@echo "VNC ready at localhost:5900. In the session:"
-	@echo "  open /root/vaults/TestVault as a vault, log into Sync, link the TEST"
-	@echo "  remote vault, set conflict handling = 'Create conflict file', sync fully."
-	@echo "Then: make capture"
+	@echo "  1. open /root/vaults/TestVault as a vault"
+	@echo "  2. enable CLI: Settings > General > Advanced > Command line interface"
+	@echo "  3. log into Sync, link the TEST remote vault, set 'Create conflict file'"
+	@echo "  4. wait for full sync, then: make capture"
 
 capture: ## Copy the login out of the container into ./secrets, then stop it
 	podman exec $(LOGIN) sh -c '\
@@ -77,7 +78,7 @@ up: build net ## Launch n1 + n2 (each seeds from ./secrets, read-only)
 	@for n in $(NODES); do \
 	  podman rm -f $$n 2>/dev/null || true; \
 	  echo "starting $$n"; \
-	  podman run -d --name $$n --hostname $$n --network $(NET) --shm-size=1g \
+	  podman run -d --name $$n --hostname $$n --network $(NET) \
 	    -v $(SECRETS):/secrets:ro $(IMAGE); \
 	done
 	@echo "nodes up: $(NODES). Give them time to sync, then: make run"
