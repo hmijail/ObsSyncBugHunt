@@ -11,7 +11,6 @@
 // Requires real Obsidian nodes; wired to Podman in the topology step. The
 // oracle it calls is already unit-tested (src/oracle.test.ts).
 
-import { randomUUID } from "node:crypto";
 import { formatToken, type NodeId } from "./types.js";
 import { ObsidianDriver, isConflictFile } from "./driver.js";
 import type { Isolator } from "./isolate.js";
@@ -169,7 +168,7 @@ export async function runDivergenceRound(
   let seq = 0;
   for (const d of drivers) {
     seq += 1;
-    const token = formatToken({ node: d.node, seq, uuid: randomUUID().slice(0, 8) });
+    const token = formatToken({ node: d.node, seq });
     const r = await d.appendLine(note, `edit ${token}`);
     logger.log({ kind: "append", node: d.node, note, token, ok: r.ok, code: r.raw.code });
     if (r.ok) acked.push({ note, node: d.node, token });

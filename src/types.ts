@@ -21,19 +21,19 @@ export interface OpResult<T = string> {
 }
 
 /**
- * A uniquely-identifiable edit. We embed `formatToken(...)` into note content
- * so the oracle can locate each acknowledged edit by exact string match in the
- * canonical file OR any "(Conflicted copy ...)" file. Uniqueness makes the
- * check immune to coincidental merges and trivial to audit.
+ * A uniquely-identifiable edit. We embed `formatToken(...)` into note content so
+ * the oracle can locate each acknowledged edit by exact string match in the
+ * canonical file OR any "(Conflicted copy ...)" file. `seq` is a per-run
+ * monotonic counter and note names are unique per history, so `op-<node>-<seq>`
+ * is already unique — no UUID needed.
  */
 export interface EditToken {
   node: NodeId;
   seq: number;
-  uuid: string;
 }
 
 export function formatToken(t: EditToken): string {
-  return `op-${t.node}-${t.seq}-${t.uuid}`;
+  return `op-${t.node}-${t.seq}`;
 }
 
 /** A server-side sync version, as listed by `diff filter=sync` (newest = 1). */

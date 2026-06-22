@@ -3,6 +3,8 @@ dist/
 *.log
 .DS_Store
 runs/
+# Forensic screenshots from `make health` / debugging
+_*.png
 
 # Captured Obsidian Sync login (account token + vault link) — never commit
 secrets/

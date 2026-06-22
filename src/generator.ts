@@ -29,6 +29,7 @@ export interface GenParams {
   weights?: Partial<Record<OpKind, number>>;
   isolateProb?: number; // chance this history uses isolation at all (else "none")
   delaySecRange?: [number, number]; // whole seconds, default [1, 3]
+  prepend?: boolean; // allow prepend edits (aggressive); default append-only
   rng?: () => number; // default Math.random; injectable for tests
   noteName?: (i: number) => string; // how to name created notes
 }
@@ -98,7 +99,7 @@ export function generateHistory(params: GenParams): History {
         kind,
         node: pick(rng, nodes),
         note: pick(rng, existing),
-        where: rng() < 0.5 ? "append" : "prepend",
+        where: params.prepend && rng() < 0.5 ? "prepend" : "append",
         delaySec: delay(),
       });
     } else if (kind === "isolate") {
@@ -143,7 +144,7 @@ export function staleReconnect(params: GenParams): History {
       kind: "edit",
       node: pick(rng, nodes),
       note,
-      where: rng() < 0.5 ? "append" : "prepend",
+      where: params.prepend && rng() < 0.5 ? "prepend" : "append",
       delaySec: delay(),
     });
   }
