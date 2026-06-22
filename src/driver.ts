@@ -11,21 +11,17 @@ import type { Executor } from "./exec.js";
 import type { ExecResult, FileVersion, OpResult, SyncVersion } from "./types.js";
 
 export class ObsidianDriver {
-  constructor(
-    private readonly executor: Executor,
-    private readonly vault: string,
-  ) {}
+  constructor(private readonly executor: Executor) {}
 
   get node() {
     return this.executor.id;
   }
 
-  get vaultName() {
-    return this.vault;
-  }
-
+  // Each node runs exactly one vault, so we never pass vault=. File commands
+  // would accept it, but sync:* commands ignore it (e.g. `sync:status
+  // vault=X` still reports the active remote vault) — so it's pure noise.
   private run(command: string, params: string[] = []): Promise<ExecResult> {
-    return this.executor.exec([command, `vault=${this.vault}`, ...params]);
+    return this.executor.exec([command, ...params]);
   }
 
   private wrap(raw: ExecResult): OpResult {
@@ -105,7 +101,7 @@ export class ObsidianDriver {
     return this.wrap(await this.run("sync", ["on"]));
   }
 
-  /** Authoritative sync state. Output format TBC under load (see runner). */
+  /** Authoritative sync state (reports the active vault). */
   async syncStatus(): Promise<OpResult> {
     return this.wrap(await this.run("sync:status"));
   }

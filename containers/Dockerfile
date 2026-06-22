@@ -12,7 +12,9 @@ ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         wget ca-certificates \
-        xvfb x11vnc \
+        xvfb x11vnc x11-utils openbox \
+        # imagemagick (import/identify) drives the GUI liveness screenshot check
+        imagemagick \
         dbus dbus-x11 \
         procps \
         # zlib is linked by the Obsidian/Electron binary
@@ -44,8 +46,19 @@ RUN printf '#!/bin/sh\nexport LD_LIBRARY_PATH="/opt/obsidian:$LD_LIBRARY_PATH"\n
 # the captured login is bind-mounted at /secrets and seeded in by entrypoint.sh).
 RUN mkdir -p /root/.config/obsidian /root/vaults/TestVault/.obsidian
 
+# VNC password for the login container so auth-requiring clients (e.g. macOS
+# Screen Sharing) can connect. Throwaway, localhost-only.
+RUN x11vnc -storepasswd obsidian /etc/x11vnc.pass
+
+# The GUI runs on Xvfb display :99. Bake it into the image env so every `podman
+# exec` (and thus every obsidian-cli call) shares the GUI's display — otherwise
+# exec sessions get an empty DISPLAY, and a CLI call that launches a GUI would
+# spawn a display-less instance.
+ENV DISPLAY=:99
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY healthcheck.sh /usr/local/bin/obsidian-healthcheck
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/obsidian-healthcheck
 
 # VNC, only used during the login/capture phase.
 EXPOSE 5900

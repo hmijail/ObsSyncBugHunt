@@ -28,7 +28,7 @@ if (!vault) {
 const settleMs = Number(process.env.SETTLE_MS ?? 10000);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const drv = new ObsidianDriver(new LocalExecutor(bin), vault);
+const drv = new ObsidianDriver(new LocalExecutor(bin));
 const note = `smoke-${Date.now()}`;
 
 function show(label: string, r: OpResult<unknown>) {

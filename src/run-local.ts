@@ -7,10 +7,10 @@
 //
 //   OBSIDIAN_BIN=... TEST_VAULT="Throwaway" npm run local
 //
-// Note: for the sync:status quiescence path to engage, TEST_VAULT must be the
-// OPEN vault in Obsidian (sync:status reports on the active vault); otherwise the
-// run falls back to content-stability, which is still fine for a plumbing check.
-// A test note is left behind in the throwaway vault each run.
+// The local CLI acts on whichever vault Obsidian currently has open, so TEST_VAULT
+// is only a safety acknowledgment that a throwaway vault (never a real one) is
+// open — make sure it actually is, since sync:status reports the active vault and
+// quiescence trusts it exclusively. A test note is left behind each run.
 
 import { LocalExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
@@ -28,7 +28,7 @@ if (!vault) {
   process.exit(2);
 }
 
-const driver = new ObsidianDriver(new LocalExecutor(bin, "local"), vault);
+const driver = new ObsidianDriver(new LocalExecutor(bin, "local"));
 const logger = new RunLogger();
 
 const verdict = await runDivergenceRound([driver], new NoopIsolator(), logger, {

@@ -57,19 +57,10 @@ async function waitForPropagation(
   }
 }
 
-// `sync:status` reports on the app's *active* vault (it ignores vault=), as
-// "key: value" lines, e.g. "status: synced" / "vault: Throwaway". We trust it as
-// the quiescence signal ONLY when it's reporting on the expected vault — a
-// different active vault would otherwise give a misleading "synced".
-interface SyncStatus {
-  state: string | null; // "synced" | "syncing" | ...
-  vault: string | null;
-}
-function parseSyncStatus(out: string): SyncStatus {
-  return {
-    state: /^status:\s*(.+)$/m.exec(out)?.[1]?.trim().toLowerCase() ?? null,
-    vault: /^vault:\s*(.+)$/m.exec(out)?.[1]?.trim() ?? null,
-  };
+// `sync:status` prints "key: value" lines for the active vault, e.g.
+// "status: synced". The `status:` line is our quiescence signal.
+function parseSyncState(out: string): string | null {
+  return /^status:\s*(.+)$/m.exec(out)?.[1]?.trim().toLowerCase() ?? null;
 }
 
 export interface QuiescenceResult {
@@ -79,12 +70,11 @@ export interface QuiescenceResult {
 
 /**
  * Quiescence is decided solely by Obsidian's own `sync:status`: every node must
- * report `synced` for its expected vault, stable across two polls. There is no
- * content-stability fallback — it could mask a node that simply hasn't started
- * pulling yet. If `sync:status` is NOT understandable on any node (errored,
- * unparseable, or reporting the wrong vault) we throw: that's an abnormal
- * condition worth surfacing, not papering over. A timeout returns
- * `{quiesced:false}` so the caller can record a node stuck `syncing`.
+ * report `synced`, stable across two polls. There is no content-stability
+ * fallback — it could mask a node that simply hasn't started pulling yet. If
+ * `sync:status` is unreadable on any node (errored or unparseable) we throw:
+ * that's an abnormal condition worth surfacing, not papering over. A timeout
+ * returns `{quiesced:false}` so the caller can record a node stuck `syncing`.
  */
 async function waitForQuiescence(
   drivers: ObsidianDriver[],
@@ -97,8 +87,8 @@ async function waitForQuiescence(
     const probes = await Promise.all(
       drivers.map(async (d) => {
         const res = await d.syncStatus();
-        const parsed = res.ok ? parseSyncStatus(res.value ?? "") : { state: null, vault: null };
-        return { node: d.node, expected: d.vaultName, raw: res.value ?? res.error ?? "", ...parsed };
+        const state = res.ok ? parseSyncState(res.value ?? "") : null;
+        return { node: d.node, raw: res.value ?? res.error ?? "", state };
       }),
     );
 
@@ -106,12 +96,6 @@ async function waitForQuiescence(
     for (const p of probes) {
       if (p.state === null) {
         throw new Error(`sync:status on ${p.node} is unreadable (got: ${JSON.stringify(p.raw)})`);
-      }
-      if (p.vault !== p.expected) {
-        throw new Error(
-          `sync:status on ${p.node} reports vault "${p.vault}", expected "${p.expected}" ` +
-            `— wrong vault open on that node?`,
-        );
       }
     }
 
@@ -149,6 +133,24 @@ export async function runDivergenceRound(
   const quiescenceMs = opts.quiescenceMs ?? 60_000;
   const pollMs = opts.pollMs ?? 3_000;
   const startedAt = Date.now();
+
+  // 0. ensure every node is actively syncing. Obsidian boots a fresh device/
+  // session with Sync PAUSED (confirmed empirically), so an unresumed node would
+  // silently never exchange edits — making the contention fake and any "no data
+  // loss" verdict meaningless. Resume all, then wait for a synced baseline so the
+  // base note propagates from a known-converged state.
+  for (const d of drivers) {
+    const r = await d.syncResume();
+    logger.log({ kind: "resume", node: d.node, ok: r.ok });
+  }
+  const baseline = await waitForQuiescence(drivers, basePropagationMs, pollMs);
+  logger.log({ kind: "baseline", ...baseline });
+  if (!baseline.quiesced) {
+    console.warn(
+      `[runner] nodes did not reach "synced" baseline within ${basePropagationMs}ms ` +
+        `after resume — proceeding, but the run starts from a non-converged state`,
+    );
+  }
 
   // 1. common base
   const base = drivers[0];

@@ -2,7 +2,6 @@
 // divergence round. Configured via environment variables:
 //
 //   NODES          comma-separated container names      (default "n1,n2")
-//   VAULT          test vault name inside the nodes      (default "TestVault")
 //   OBSIDIAN_BIN   CLI path inside the container         (default "/usr/local/bin/obsidian")
 //   ISOLATOR       "sync" (control) | "network" (rude)   (default "sync")
 //   NETWORK        podman network (for ISOLATOR=network) (default "obsidian-net")
@@ -19,7 +18,6 @@ import { RunLogger } from "./history.js";
 import { runDivergenceRound } from "./runner.js";
 
 const nodes = (process.env.NODES ?? "n1,n2").split(",").map((s) => s.trim());
-const vault = process.env.VAULT ?? "TestVault";
 // In containers the CLI is the dedicated obsidian-cli binary (the GUI binary
 // can't run CLI as root). It must be enabled in Settings > General > Advanced.
 const bin = process.env.OBSIDIAN_BIN ?? "/opt/obsidian/obsidian-cli";
@@ -28,14 +26,14 @@ const isolatorKind = process.env.ISOLATOR ?? "sync";
 const note = process.env.NOTE ?? `conv-${Date.now()}`;
 const isolated = process.env.ISOLATED ?? nodes[0];
 
-const drivers = nodes.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vault));
+const drivers = nodes.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));
 const byId = new Map(drivers.map((d) => [d.node, d]));
 
 const isolator: Isolator =
   isolatorKind === "network" ? new PodmanIsolator(network) : new SyncToggleIsolator(byId);
 
 console.log(
-  `nodes=${nodes.join(",")} vault=${vault} isolator=${isolatorKind} isolated=${isolated} note=${note}`,
+  `nodes=${nodes.join(",")} isolator=${isolatorKind} isolated=${isolated} note=${note}`,
 );
 
 const logger = new RunLogger();
