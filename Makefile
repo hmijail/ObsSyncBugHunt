@@ -20,10 +20,12 @@ SECRETS    := $(CURDIR)/secrets/obsidian
 TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
+# Number of histories for `make campaign` (override: make campaign CAMPAIGN=50)
+CAMPAIGN   ?= 20
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
-        build net secrets-dir scratch login capture node1 up run trial down ps logs health clean
+        build net secrets-dir scratch login capture node1 up solo-check run campaign trial down ps logs health clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -105,7 +107,7 @@ up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC published per no
 	@for n in $(NODES); do scripts/wait-node.sh $$n; done
 	@echo "nodes ready: $(NODES). VNC from localhost:$(VNC_PORT) (password: obsidian). Then: make run"
 
-run: ## Run the convergence test against the already-running nodes (ISOLATOR=sync|network)
+solo-check:
 	@# Isolation guard: every node shares the same cloned Sync login, so a stray
 	@# container on the test network would confound the run. Abort if anything
 	@# running isn't one of the intended NODES.
@@ -113,9 +115,14 @@ run: ## Run the convergence test against the already-running nodes (ISOLATOR=syn
 	  echo " $(NODES) " | grep -q " $$c " || { \
 	    echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make down')"; exit 1; }; \
 	done
+
+run: solo-check ## Run ONE generated history (SCENARIO=random|stale OPS=min-max ISOLATOR=sync|network)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run start
 
-trial: up run ## Clean-slate run: recreate + gate the nodes, then test from a cold (paused) state
+campaign: solo-check ## Run CAMPAIGN histories and tally the error rate (CAMPAIGN=N SCENARIO=... OPS=...)
+	NODES="$(shell echo $(NODES) | tr ' ' ',')" CAMPAIGN="$(CAMPAIGN)" npm run start
+
+trial: up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
 
 down: ## Stop + remove n1/n2
 	-@for n in $(NODES); do podman rm -f $$n 2>/dev/null || true; done

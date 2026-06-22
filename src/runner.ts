@@ -33,9 +33,9 @@ export interface DivergenceOpts {
   pollMs?: number;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function readCanonical(d: ObsidianDriver, note: string): Promise<string | null> {
+export async function readCanonical(d: ObsidianDriver, note: string): Promise<string | null> {
   const r = await d.read(note);
   return r.ok ? (r.value ?? "") : null;
 }
@@ -106,7 +106,7 @@ async function waitForQuiescence(
   }
 }
 
-async function gatherObservation(d: ObsidianDriver, note: string): Promise<NodeObservation> {
+export async function gatherObservation(d: ObsidianDriver, note: string): Promise<NodeObservation> {
   const canonical = await readCanonical(d, note);
   const conflicts: ConflictFile[] = [];
   const files = await d.listFiles();

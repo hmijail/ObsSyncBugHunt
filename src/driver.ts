@@ -43,6 +43,11 @@ export class ObsidianDriver {
     return this.wrap(await this.run("append", [`file=${name}`, `content=${line}`]));
   }
 
+  /** Prepends `line` to the top of the note (CLI `prepend`) — edits the other end. */
+  async prependLine(name: string, line: string): Promise<OpResult> {
+    return this.wrap(await this.run("prepend", [`file=${name}`, `content=${line}`]));
+  }
+
   async read(name: string): Promise<OpResult> {
     return this.wrap(await this.run("read", [`file=${name}`]));
   }
@@ -109,6 +114,20 @@ export class ObsidianDriver {
   /** Server-side sync version list for a note (raw until format confirmed). */
   async syncHistory(name: string): Promise<OpResult> {
     return this.wrap(await this.run("sync:history", [`file=${name}`]));
+  }
+
+  /**
+   * Cumulative count of server-side sync versions for a note (`sync:history total`).
+   * Monotonic and server-side (all nodes agree), so its delta over time is a
+   * level signal for "a sync happened" that polling can't alias.
+   */
+  async syncVersionsTotal(name: string): Promise<OpResult<number>> {
+    const raw = await this.run("sync:history", [`file=${name}`, "total"]);
+    if (raw.code !== 0) return { ok: false, error: errText(raw), raw };
+    const n = Number(raw.stdout.trim());
+    return Number.isFinite(n)
+      ? { ok: true, value: n, raw }
+      : { ok: false, error: `unparseable total: ${JSON.stringify(raw.stdout.trim())}`, raw };
   }
 
   /** Read the content of a specific server-side sync version. */

@@ -24,4 +24,9 @@ export class RunLogger {
     writeFileSync(path.join(this.dir, "results.json"), JSON.stringify(obj, null, 2));
     console.log(`→ results: ${path.join(this.dir, "results.json")}`);
   }
+
+  /** Write an arbitrary named artifact (e.g. the generated history) into the run dir. */
+  artifact(filename: string, obj: unknown): void {
+    writeFileSync(path.join(this.dir, filename), JSON.stringify(obj, null, 2));
+  }
 }

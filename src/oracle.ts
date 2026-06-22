@@ -38,6 +38,7 @@ export interface NoteVerdict {
   onlyInConflict: string[]; // preserved only via a conflict file (OK in that mode)
   duplicated: { token: string; maxCount: number }[]; // a token repeated in one file
   perNodeMissing: { node: NodeId; missing: string[] }[]; // tokens absent from a node
+  conflictFiles: number; // max conflict-file count on any node (storm indicator; informational)
 }
 
 export interface RunVerdict {
@@ -54,7 +55,7 @@ function occurrences(haystack: string, needle: string): number {
   return count;
 }
 
-function sameConflictSet(a: ConflictFile[], b: ConflictFile[]): boolean {
+export function sameConflictSet(a: ConflictFile[], b: ConflictFile[]): boolean {
   if (a.length !== b.length) return false;
   // JSON-encode the (file, content) pair: unambiguous and text-safe.
   const key = (c: ConflictFile) => JSON.stringify([c.file, c.content]);
@@ -106,10 +107,15 @@ export function checkNote(
     }
   }
 
+  // Conflict-file count (max across nodes) — a "stale device floods conflicts"
+  // storm shows up as an unexpectedly large number here. Informational: doesn't
+  // affect ok (an "expected" count is too fuzzy to gate on), but always recorded.
+  const conflictFiles = obs.reduce((m, o) => Math.max(m, o.conflicts.length), 0);
+
   // onlyInConflict is acceptable (that's the conflict-file mode working);
   // lost / duplicated / divergence are failures.
   const ok = lost.length === 0 && duplicated.length === 0 && converged;
-  return { note, ok, converged, lost, onlyInConflict, duplicated, perNodeMissing };
+  return { note, ok, converged, lost, onlyInConflict, duplicated, perNodeMissing, conflictFiles };
 }
 
 export function checkRun(acked: AckedEdit[], observations: NodeObservation[]): RunVerdict {
