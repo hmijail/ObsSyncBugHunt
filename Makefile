@@ -25,7 +25,7 @@ CAMPAIGN   ?= 20
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
-        build net secrets-dir scratch login capture node1 up solo-check run campaign trial down ps logs health clean
+        build net secrets-dir scratch login capture node1 up solo-check run campaign soak analyze trial down ps logs health clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -121,6 +121,12 @@ run: solo-check ## Run ONE generated history (SCENARIO=random|stale OPS=min-max 
 
 campaign: solo-check ## Run CAMPAIGN histories and tally the error rate (CAMPAIGN=N SCENARIO=... OPS=...)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" CAMPAIGN="$(CAMPAIGN)" npm run start
+
+soak: solo-check ## Run histories until stopped (Ctrl-C) for an overnight run; DURATION_MIN=N for a fixed span
+	NODES="$(shell echo $(NODES) | tr ' ' ',')" CAMPAIGN=0 npm run start
+
+analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)
+	npm run analyze
 
 trial: up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
 

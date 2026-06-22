@@ -50,6 +50,7 @@ const execOpts: ExecuteOpts = {
   pollSec: Number(process.env.POLL_SEC ?? 1),
   settlePolls: Number(process.env.SETTLE_POLLS ?? 2),
   capSec: Number(process.env.CAP_SEC ?? 60),
+  dwellSec: Number(process.env.DWELL_SEC ?? 10),
   concurrent: flag(process.env.CONCURRENT), // benign: wait-for-synced before cross-node edits
 };
 
@@ -66,17 +67,43 @@ console.log(
     `campaign=${campaign} isolateProb=${baseParams.isolateProb} prepend=${baseParams.prepend} concurrent=${execOpts.concurrent}`,
 );
 
+// Long-running mode for overnight soaks: DURATION_MIN>0 runs for that long;
+// else CAMPAIGN<=0 runs until killed; else CAMPAIGN histories. Each history is a
+// self-contained run dir, so Ctrl-C just stops after the current one — the
+// analyzer reads whatever completed.
+const durationMin = Number(process.env.DURATION_MIN ?? 0);
+const startedAt = Date.now();
+const keepGoing = (h: number) =>
+  durationMin > 0 ? Date.now() - startedAt < durationMin * 60_000 : campaign <= 0 ? true : h < campaign;
+
 let pass = 0;
 let fail = 0;
 let conflicts = 0; // histories where a conflict occurred (benign mode expects zero)
 const failures: string[] = [];
 
-for (let h = 0; h < campaign; h++) {
+const tally = () =>
+  `\n=== TALLY: PASS=${pass} FAIL=${fail} run=${pass + fail}  (histories with any conflict: ${conflicts}) ===` +
+  (failures.length ? "\nfailing histories:\n" + failures.map((f) => "  " + f).join("\n") : "");
+process.on("SIGINT", () => {
+  console.log(tally());
+  process.exit(fail === 0 ? 0 : 1);
+});
+
+for (let h = 0; keepGoing(h); h++) {
   const params: GenParams = { ...baseParams, noteName: (i) => `note-${hhmmss()}-${h}-${i}` };
   const history: History = scenario === "stale" ? staleReconnect(params) : generateHistory(params);
 
   const logger = new RunLogger();
-  console.log(`\n=== history ${h + 1}/${campaign} (${history.length} ops) → ${logger.dir} ===`);
+  logger.artifact("meta.json", {
+    scenario,
+    isolator: isolatorKind,
+    concurrent: execOpts.concurrent,
+    isolateProb: baseParams.isolateProb,
+    prepend: baseParams.prepend,
+    ops: ops.join("-"),
+    nodes,
+  });
+  console.log(`\n=== history ${h + 1} (${history.length} ops) → ${logger.dir} ===`);
   const { verdict, timings } = await runHistory(drivers, isolator, logger, history, execOpts);
 
   const bad = verdict.notes.flatMap((n) => [
@@ -100,6 +127,5 @@ for (let h = 0; h < campaign; h++) {
   }
 }
 
-console.log(`\n=== CAMPAIGN TALLY: PASS=${pass} FAIL=${fail} / ${campaign}  (histories with any conflict: ${conflicts}) ===`);
-if (failures.length) console.log("failing histories:\n" + failures.map((f) => "  " + f).join("\n"));
+console.log(tally());
 process.exit(fail === 0 ? 0 : 1);

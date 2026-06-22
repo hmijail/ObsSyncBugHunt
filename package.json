@@ -12,6 +12,7 @@
     "smoke": "tsx src/smoke.ts",
     "local": "tsx src/run-local.ts",
     "start": "tsx src/run.ts",
+    "analyze": "tsx src/analyze.ts",
     "test": "node --import tsx --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
