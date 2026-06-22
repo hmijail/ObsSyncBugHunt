@@ -115,6 +115,12 @@ solo-check:
 	  echo " $(NODES) " | grep -q " $$c " || { \
 	    echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make down')"; exit 1; }; \
 	done
+	@# Warn when reusing long-lived nodes (accumulated vault/conflict cruft can
+	@# skew a run); 'make up' recreates them fresh from the captured login.
+	@for n in $(NODES); do \
+	  up=$$(podman ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
+	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make up' for a fresh start" || true; \
+	done
 
 run: solo-check ## Run ONE generated history (SCENARIO=random|stale OPS=min-max ISOLATOR=sync|network)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run start
