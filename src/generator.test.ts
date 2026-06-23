@@ -1,9 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateHistory, staleReconnect, type History, type GenParams } from "./generator.js";
+import { generateHistory, staleReconnect, type GenParams } from "./generator.js";
+import { serialize, type History } from "./dsl.js";
 
-// Small deterministic PRNG so the generator's *logic* is testable (production
-// uses Math.random; we don't seed for replay — the system is nondeterministic).
 function mulberry32(seed: number): () => number {
   return () => {
     seed |= 0;
@@ -14,65 +13,60 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-const NODES = ["n1", "n2"];
-
-/** Replay a history through the same precondition model the generator claims. */
-function assertValid(h: History) {
-  const existing = new Set<string>();
-  const isolated = new Set<string>();
+const editCount = (h: History) => h.filter((o) => o.cmd === "append").length;
+const crossNodeUnwaited = (h: History) => {
+  // count appends whose node differs from the previous append's node with no W between
+  let prev = 0;
+  let waitedSince = true;
+  let n = 0;
   for (const op of h) {
-    assert.ok(op.delaySec >= 1, "delaySec >= 1");
-    assert.ok(NODES.includes(op.node), "node is known");
-    if (op.kind === "create") {
-      assert.ok(op.note, "create has a note");
-      existing.add(op.note!);
-    } else if (op.kind === "edit") {
-      assert.ok(existing.has(op.note!), "edit targets an existing note");
-      assert.ok(op.where === "append" || op.where === "prepend", "edit has a where");
-    } else if (op.kind === "isolate") {
-      assert.ok(!isolated.has(op.node), "isolate only a connected node");
-      isolated.add(op.node);
-    } else {
-      assert.ok(isolated.has(op.node), "heal only an isolated node");
-      isolated.delete(op.node);
+    if (op.cmd === "node") {/* track via append's active node below */}
+    if (op.cmd === "wait") waitedSince = true;
+    if (op.cmd === "append") {
+      const cur = lastNode(h, op);
+      if (prev && prev !== cur && !waitedSince) n++;
+      prev = cur;
+      waitedSince = false;
     }
   }
+  return n;
+};
+// resolve the active node at the position of op by scanning preceding node ops
+function lastNode(h: History, target: History[number]): number {
+  let node = 0;
+  for (const op of h) {
+    if (op.cmd === "node") node = op.node!;
+    if (op === target) return node;
+  }
+  return node;
 }
 
-test("op count lands within the requested range and first op creates", () => {
+test("generateHistory: edit count in range, valid ops, serializable", () => {
   for (let s = 1; s <= 20; s++) {
-    const params: GenParams = { nodes: NODES, ops: [6, 12], rng: mulberry32(s) };
-    const h = generateHistory(params);
-    assert.ok(h.length >= 6 && h.length <= 12, `length ${h.length} in [6,12]`);
-    assert.equal(h[0].kind, "create", "first op is create");
-    assertValid(h);
+    const h = generateHistory({ nodes: 2, ops: [4, 10], rng: mulberry32(s) });
+    assert.ok(editCount(h) >= 4 && editCount(h) <= 10);
+    assert.doesNotThrow(() => serialize(h));
   }
 });
 
-test("isolateProb=0 yields no isolation ops", () => {
+test("benign (concurrent:false) waits before every cross-node edit", () => {
+  for (let s = 1; s <= 20; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 10], concurrent: false, rng: mulberry32(s) });
+    assert.equal(crossNodeUnwaited(h), 0, `benign history should have no unwaited cross-node edits: ${serialize(h)}`);
+  }
+});
+
+test("aggressive (concurrent:true) inserts no waits", () => {
   for (let s = 1; s <= 10; s++) {
-    const h = generateHistory({ nodes: NODES, ops: [8, 8], isolateProb: 0, rng: mulberry32(s) });
-    assert.ok(!h.some((o) => o.kind === "isolate" || o.kind === "heal"), "no isolate/heal");
-    assertValid(h);
+    const h = generateHistory({ nodes: 2, ops: [6, 10], concurrent: true, rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "wait"), "no W ops in concurrent mode");
   }
 });
 
-test("isolateProb=1 produces isolation and stays valid", () => {
-  let sawIsolate = false;
-  for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: NODES, ops: [10, 12], isolateProb: 1, rng: mulberry32(s) });
-    if (h.some((o) => o.kind === "isolate")) sawIsolate = true;
-    assertValid(h);
-  }
-  assert.ok(sawIsolate, "at least one history isolated a node");
-});
-
-test("staleReconnect: create, isolate-early, edits, heal-late, same stale node", () => {
-  const h = staleReconnect({ nodes: NODES, ops: [5, 5], rng: mulberry32(7) });
-  assert.equal(h[0].kind, "create");
-  assert.equal(h[1].kind, "isolate");
-  assert.equal(h[h.length - 1].kind, "heal");
-  assert.equal(h[1].node, h[h.length - 1].node, "same node isolated then healed");
-  assert.ok(h.filter((o) => o.kind === "edit").length >= 1, "has edits during the window");
-  assertValid(h);
+test("staleReconnect: disconnect early, pause, edits, reconnect", () => {
+  const h = staleReconnect({ nodes: 2, ops: [4, 4], rng: mulberry32(3) });
+  assert.ok(h.some((o) => o.cmd === "disconnect"));
+  assert.ok(h.some((o) => o.cmd === "connect"));
+  assert.ok(h.some((o) => o.cmd === "pause"));
+  assert.equal(h[h.length - 1].cmd, "connect", "ends by reconnecting the stale node");
 });

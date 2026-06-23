@@ -57,6 +57,17 @@ export class ObsidianDriver {
     return this.wrap(await this.run("read", [`path=${path}`]));
   }
 
+  /**
+   * Whether a note exists locally on this node. `read` exits 0 even when absent
+   * (printing `Error: File "X" not found.`), so we key on the content: present =
+   * non-empty, non-error; absent = empty or that error string.
+   */
+  async exists(name: string): Promise<boolean> {
+    const r = await this.read(name);
+    const v = (r.value ?? "").trim();
+    return r.ok && v !== "" && !v.startsWith("Error:");
+  }
+
   async deleteNote(name: string, permanent = false): Promise<OpResult> {
     const p = [`file=${name}`];
     if (permanent) p.push("permanent");

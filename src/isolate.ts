@@ -39,18 +39,52 @@ export class SyncToggleIsolator implements Isolator {
   }
 }
 
-/** Detach/attach a container from a Podman network. */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Detach/attach a container from a Podman network — the real "device goes
+ * offline" fault. We don't trust the command to take effect instantly (an
+ * in-flight sync can keep draining); instead we BLOCK until the container's own
+ * connectivity confirms it, with a TCP reachability probe to a well-known numeric
+ * endpoint (8.8.8.8:53 — no DNS): disconnect waits until it's unreachable, connect
+ * until reachable. (TCP, not ping: rootless podman blocks ICMP — no raw socket.)
+ * This is a pure network-state check, independent of what Obsidian does about it.
+ */
 export class PodmanIsolator implements Isolator {
-  constructor(private readonly network: string) {}
+  constructor(
+    private readonly network: string,
+    private readonly host = "8.8.8.8",
+    private readonly port = 53,
+    private readonly capMs = 30_000,
+  ) {}
+
+  private async reachable(node: NodeId): Promise<boolean> {
+    const r = await runProcess("podman", [
+      "exec", node, "timeout", "2", "bash", "-c", `echo > /dev/tcp/${this.host}/${this.port}`,
+    ]);
+    return r.code === 0;
+  }
+
+  private async waitReach(node: NodeId, want: boolean, label: string): Promise<void> {
+    const deadline = Date.now() + this.capMs;
+    for (;;) {
+      if ((await this.reachable(node)) === want) return;
+      if (Date.now() > deadline) {
+        throw new Error(`${label} ${node}: ${this.host}:${this.port} ${want ? "still unreachable" : "still reachable"} after ${this.capMs / 1000}s`);
+      }
+      await sleep(500);
+    }
+  }
 
   async disconnect(node: NodeId): Promise<void> {
-    const r = await runProcess("podman", ["network", "disconnect", this.network, node]);
-    if (r.code !== 0) throw new Error(`disconnect ${node}: ${r.stderr.trim()}`);
+    // Ignore command errors (e.g. already disconnected) — reachability is the truth.
+    await runProcess("podman", ["network", "disconnect", this.network, node]);
+    await this.waitReach(node, false, "disconnect");
   }
 
   async connect(node: NodeId): Promise<void> {
-    const r = await runProcess("podman", ["network", "connect", this.network, node]);
-    if (r.code !== 0) throw new Error(`connect ${node}: ${r.stderr.trim()}`);
+    await runProcess("podman", ["network", "connect", this.network, node]);
+    await this.waitReach(node, true, "connect");
   }
 }
 

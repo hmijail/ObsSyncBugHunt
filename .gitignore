@@ -11,3 +11,5 @@ secrets/
 
 # Personal, per-machine Claude Code settings (shared config goes in settings.json)
 .claude/settings.local.json
+# Personal editor settings
+.vscode/
