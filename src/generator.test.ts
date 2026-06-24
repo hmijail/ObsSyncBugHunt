@@ -41,11 +41,31 @@ function lastNode(h: History, target: History[number]): number {
   return node;
 }
 
-test("generateHistory: edit count in range, valid ops, serializable", () => {
+test("generateHistory: edit count bounded, valid ops, serializable", () => {
   for (let s = 1; s <= 20; s++) {
     const h = generateHistory({ nodes: 2, ops: [4, 10], rng: mulberry32(s) });
-    assert.ok(editCount(h) >= 4 && editCount(h) <= 10);
+    // Collapsing consecutive appends can only reduce the count below the upper bound.
+    assert.ok(editCount(h) >= 1 && editCount(h) <= 10);
     assert.doesNotThrow(() => serialize(h));
+  }
+});
+
+test("no two appends are adjacent (collapse)", () => {
+  for (let s = 1; s <= 20; s++) {
+    const h = generateHistory({ nodes: 2, ops: [4, 12], partitionProb: 0.3, pauseProb: 0.2, rng: mulberry32(s) });
+    for (let i = 1; i < h.length; i++) {
+      assert.ok(!(h[i].cmd === "append" && h[i - 1].cmd === "append"), `adjacent appends: ${serialize(h)}`);
+    }
+  }
+});
+
+test("partitionProb: disconnects are balanced and always heal before the end", () => {
+  for (let s = 1; s <= 25; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 12], partitionProb: 0.6, rng: mulberry32(s) });
+    const cmds = h.map((o) => o.cmd);
+    assert.equal(cmds.filter((c) => c === "disconnect").length, cmds.filter((c) => c === "connect").length, `D/C balanced: ${serialize(h)}`);
+    const lastD = cmds.lastIndexOf("disconnect");
+    if (lastD >= 0) assert.ok(cmds.lastIndexOf("connect") > lastD, `reconnect after last disconnect: ${serialize(h)}`);
   }
 });
 

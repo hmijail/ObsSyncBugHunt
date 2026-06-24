@@ -13,6 +13,7 @@
 //   NOTES        distinct notes per history               (default 1)
 //   CONCURRENT   =1 drop the wait-for-sync (aggressive)   (default benign)
 //   PAUSE_PROB   chance of a ~10s pause after an edit      (default 0)
+//   PARTITION_PROB chance per edit of a network partition  (default 0; needs 2+ nodes)
 //   REPEAT       reps per history                          (default 10)
 //   CAMPAIGN     number of histories (<=0 = until killed) (default 1)
 //   DURATION_MIN run for N minutes instead of a count
@@ -51,6 +52,7 @@ const genParams: GenParams = {
   notes: Number(process.env.NOTES ?? 1),
   concurrent: flag(process.env.CONCURRENT),
   pauseProb: Number(process.env.PAUSE_PROB ?? 0),
+  partitionProb: Number(process.env.PARTITION_PROB ?? 0),
 };
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(process.env.POLL_SEC ?? 1),
@@ -128,6 +130,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     scenario,
     isolator: isolatorKind,
     concurrent: genParams.concurrent,
+    partitionProb: genParams.partitionProb,
     notes: genParams.notes,
     ops: ops.join("-"),
     nodes: nodesList.length,
