@@ -145,9 +145,10 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   const onlyInConflict = verdict.notes.reduce((s, n) => s + n.onlyInConflict.length, 0);
   if (conflictFiles > 0 || onlyInConflict > 0) conflicts++;
 
-  // A note that never reached the server (timings.unsynced) is a failure even if the
-  // token oracle is happy, so fold it into the OK check.
-  if (verdict.ok && !timings.unsynced) {
+  // A clean PASS requires the token oracle happy AND a conclusive settle: a note
+  // that never reached the server (unsynced) or a settle that never quiesced before
+  // the cap (syncTimedOut) is not a pass — the latter is inconclusive, not trusted.
+  if (verdict.ok && !timings.unsynced && !timings.syncTimedOut) {
     pass++;
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
     console.log(`  rep ${id}: PASS${tag} conv=${timings.convergenceSec}s`);

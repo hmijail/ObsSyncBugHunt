@@ -52,7 +52,7 @@ function tally(g: Group, r: Results) {
   for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
   // Bucket the rep by its (ranked) outcome — mirrors run.ts's suffix ladder so a
   // rep counted as DUPL/DIFF here matches its on-disk `-DUPL`/`-DIFF` dir.
-  if (r.verdict.ok && !r.timings?.unsynced) { g.pass++; return; }
+  if (r.verdict.ok && !r.timings?.unsynced && !r.timings?.syncTimedOut) { g.pass++; return; }
   g.fail++;
   if (r.timings?.unsynced || r.timings?.syncTimedOut || lost > 0) return; // already counted above
   if (r.verdict.notes.some((n) => n.duplicated.length > 0)) g.duplReps++;
