@@ -259,8 +259,11 @@ export async function runHistory(
         // editing before propagation is a natural create-create; after, it's
         // append-contention — timing decides, no forced sync.
         const exists = await d.exists(activeNote);
-        if (exists) await d.appendLine(activeNote, `edit ${token}`);
-        else { await d.createNote(activeNote, `base ${token}`); await d.open(activeNote); } // foreground the new note
+        // Foreground the note on the EDITING node before each edit — the active node
+        // changes via `N` without re-selecting, so opening here (not just on select)
+        // makes the GUI follow whichever node is actually writing.
+        if (exists) { await d.open(activeNote); await d.appendLine(activeNote, `edit ${token}`); }
+        else { await d.createNote(activeNote, `base ${token}`); await d.open(activeNote); }
         // Exit codes are meaningless (the CLI always exits 0) and append-to-missing
         // silently no-ops — so we only ack an edit after reading its token back
         // locally. A no-op then can't masquerade as an acknowledged-then-lost edit.
