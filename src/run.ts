@@ -59,7 +59,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   minFloorSec: Number(process.env.MIN_FLOOR_SEC ?? 3),
   capSec: Number(process.env.CAP_SEC ?? 120),
   wSettleSec: Number(process.env.W_SETTLE_SEC ?? 4),
-  finalSettleSec: Number(process.env.FINAL_SETTLE_SEC ?? 25),
+  finalSettleSec: Number(process.env.FINAL_SETTLE_SEC ?? 6),
 };
 
 const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));

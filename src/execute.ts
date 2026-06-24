@@ -27,12 +27,13 @@ export interface ExecuteOpts {
   pollSec?: number; // observation poll cadence (default 1)
   minFloorSec?: number; // observe at least this long (catches slow-to-start syncs after C; default 3)
   capSec?: number; // soft cap on a wait (default 120)
-  // "Synced" = the full observed state (every node's canonical + conflict-file set)
-  // is converged AND unchanged for the settle window. The final settle uses a
-  // longer window so a late conflict file (created client-side, then up/down-synced
-  // ~2 round-trips after the note reconciles) is caught before judging.
+  // Done = every node reports `synced` AND the full observed state (canonical +
+  // conflict-file set) is converged AND has held for the settle window. The `synced`
+  // gate means the window only has to absorb a just-lagging conflict file, not stand
+  // in for "Sync is idle", so it can be short. Set to 0 for a pure synced+converged
+  // check (relies entirely on the conflict-set equality to catch a late conflict file).
   wSettleSec?: number; // mid-history W: quiescent-for window (default 4)
-  finalSettleSec?: number; // final settle: quiescent-for window (default 25)
+  finalSettleSec?: number; // final settle: quiescent-for window (default 6)
 }
 
 export interface LostForensic {
@@ -86,13 +87,20 @@ function signature(notes: string[], obs: NodeObservation[]): string {
   return parts.join("\n");
 }
 
+/** A node's own sync state, e.g. "synced" / "syncing" (or "error"/"?" if unreadable). */
+async function syncState(d: ObsidianDriver): Promise<string> {
+  const st = await d.syncStatus();
+  return st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "error";
+}
+
 /**
- * Wait until the vault is genuinely quiescent for `notes` across `drivers`: the
- * full observed state (every node's canonical content AND conflict-file set) is
- * converged across nodes AND has been UNCHANGED for `settleSec`. A conflict file
- * that arrives late changes the state → resets the window, so we keep waiting
- * rather than judge mid-sync. `minFloorSec` guards the just-after-connect case
- * where a sync hasn't started yet. No blind dwell — this is the explicit wait.
+ * Wait until the vault is genuinely quiescent for `notes` across `drivers`: every
+ * node reports `synced` (Sync's own "idle" signal), the full observed state (each
+ * node's canonical content AND conflict-file set) is converged across nodes, and
+ * that has held for `settleSec`. The `synced` gate lets the window stay short while
+ * still not judging mid-sync; a late conflict file is a content change that resets
+ * the window. `minFloorSec` guards the just-after-connect case where a sync hasn't
+ * started yet. No blind dwell — this is the explicit wait.
  */
 async function waitForSynced(
   drivers: ObsidianDriver[],
@@ -119,9 +127,13 @@ async function waitForSynced(
     if (sig !== lastSig) { lastSig = sig; lastChange = now; }
 
     const converged = notesConverged(notes, obs);
+    // Only consult Sync's own signal once content agrees, to avoid polling status
+    // during active propagation: finish when every node reports `synced` AND the
+    // converged state has held for the (now short) window.
+    const allSynced = converged && (await Promise.all(drivers.map(syncState))).every((s) => s === "synced");
     const quietMs = now - lastChange;
     const elapsed = now - start;
-    const done = converged && quietMs >= settleMs && elapsed >= floorMs;
+    const done = converged && allSynced && quietMs >= settleMs && elapsed >= floorMs;
     const timedOut = !done && elapsed > capMs;
     if (done || timedOut) {
       const totals = await readTotals(drivers, notes);
@@ -134,9 +146,7 @@ async function waitForSynced(
         // Capture each node's own sync state — a wedged node (e.g. stuck "syncing"
         // after a network reconnect) is the usual cause and is worth seeing later.
         for (const d of drivers) {
-          const st = await d.syncStatus();
-          const state = st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "error";
-          logger.log({ kind: "status-at-timeout", node: d.node, state });
+          logger.log({ kind: "status-at-timeout", node: d.node, state: await syncState(d) });
         }
       }
       // Snapshot each node's settled content for the audit trail — a time series
@@ -289,7 +299,7 @@ export async function runHistory(
   // Final settle: wait until the whole vault (canonical + conflict files) is
   // converged and quiescent for the long window — explicitly waiting out the
   // conflict file's own ~2-round-trip sync rather than dwelling blindly.
-  const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 25, opts, logger, { final: true });
+  const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 6, opts, logger, { final: true });
 
   const observations = await Promise.all(drivers.flatMap((d) => noteList.map((n) => gatherObservation(d, n))));
   const verdict = checkRun(acked, observations);
