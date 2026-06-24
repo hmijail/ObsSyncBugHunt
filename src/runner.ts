@@ -12,7 +12,7 @@
 // oracle it calls is already unit-tested (src/oracle.test.ts).
 
 import { formatToken, type NodeId } from "./types.js";
-import { ObsidianDriver, isConflictFile } from "./driver.js";
+import { ObsidianDriver, isConflictFile, isAbsentRead } from "./driver.js";
 import type { Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import {
@@ -36,7 +36,9 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function readCanonical(d: ObsidianDriver, note: string): Promise<string | null> {
   const r = await d.read(note);
-  return r.ok ? (r.value ?? "") : null;
+  // `read` exits 0 even when the note is absent (printing `Error: …not found.`);
+  // normalize that to null so it can't masquerade as canonical content.
+  return isAbsentRead(r.value) ? null : (r.value ?? null);
 }
 
 /** Wait until every node's canonical content contains `marker`, or timeout. */

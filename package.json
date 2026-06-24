@@ -13,6 +13,7 @@
     "local": "tsx src/run-local.ts",
     "start": "tsx src/run.ts",
     "analyze": "tsx src/analyze.ts",
+    "clean-notes": "tsx src/clean-notes.ts",
     "test": "node --import tsx --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },

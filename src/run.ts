@@ -20,7 +20,8 @@
 //
 //   npm run start
 
-import { existsSync, renameSync } from "node:fs";
+import { existsSync, renameSync, readdirSync, statSync } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { PodmanExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
@@ -91,8 +92,35 @@ function uniqueRepId(strDir: string): string {
   return name;
 }
 
-async function runRep(history: History, str: string): Promise<void> {
-  const strDir = path.join("runs", str);
+// Any rep dir carrying one of these suffixes is a non-OK rep.
+const FAIL_SUFFIXES = ["-UNSYNCED", "-TIMEOUT", "-LOST", "-DUPL", "-DIFF", "-FAIL"];
+const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
+const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(s));
+
+/** Re-runs fold an existing `runs/<str>-BAD<pct>` back to the clean `runs/<str>`
+ *  so new reps accumulate and the percentage is recomputed over the full set. */
+function cleanStrDir(str: string): string {
+  const clean = path.join("runs", str);
+  if (!existsSync(clean) && existsSync("runs")) {
+    const re = new RegExp(`^${str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-BAD\\d+$`);
+    const prev = readdirSync("runs").find((d) => re.test(d) && isDir(path.join("runs", d)));
+    if (prev) renameSync(path.join("runs", prev), clean);
+  }
+  return clean;
+}
+
+/** After a history's reps, suffix the history dir with `-BAD<pct>` (percentage of
+ *  non-OK reps) so it's eyeball-obvious where to dig; leave it clean if all passed. */
+function tagHistoryDir(strDir: string, str: string): void {
+  if (!isDir(strDir)) return;
+  const reps = readdirSync(strDir).filter((d) => isDir(path.join(strDir, d)));
+  if (reps.length === 0) return;
+  const bad = reps.filter(isBadRep).length;
+  const target = bad > 0 ? path.join("runs", `${str}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
+  if (target !== strDir) { try { renameSync(strDir, target); } catch { /* keep */ } }
+}
+
+async function runRep(history: History, str: string, strDir: string): Promise<void> {
   const id = uniqueRepId(strDir);
   const logger = new RunLogger(strDir, id);
   logger.artifact("meta.json", {
@@ -104,40 +132,72 @@ async function runRep(history: History, str: string): Promise<void> {
     ops: ops.join("-"),
     nodes: nodesList.length,
   });
-  const noteName = (L: string) => `${id}-${L}`;
+  const noteName = (L: string) => `${id}-${str}-${L}`;
   const { verdict, timings, forensics } = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
 
   const lost = verdict.notes.flatMap((n) => n.lost);
+  const duplicated = verdict.notes.flatMap((n) => n.duplicated);
+  const diverged = verdict.notes.some((n) => !n.converged);
   const conflictFiles = Math.max(0, ...verdict.notes.map((n) => n.conflictFiles));
   const onlyInConflict = verdict.notes.reduce((s, n) => s + n.onlyInConflict.length, 0);
   if (conflictFiles > 0 || onlyInConflict > 0) conflicts++;
 
-  if (verdict.ok) {
+  // A note that never reached the server (timings.unsynced) is a failure even if the
+  // token oracle is happy, so fold it into the OK check.
+  if (verdict.ok && !timings.unsynced) {
     pass++;
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
     console.log(`  rep ${id}: PASS${tag} conv=${timings.convergenceSec}s`);
   } else {
     fail++;
-    // A sync timeout (often a node wedged after reconnect) is inconclusive, not a
-    // confirmed loss — mark it distinctly so it doesn't pollute the loss count.
-    const suffix = timings.syncTimedOut ? "-TIMEOUT" : lost.length ? "-LOST" : "-FAIL";
+    // Ranked, most-severe-first: never-synced > inconclusive timeout > real loss >
+    // duplication > divergence. -FAIL is a catch-all that should never fire.
+    const suffix =
+      timings.unsynced ? "-UNSYNCED"
+      : timings.syncTimedOut ? "-TIMEOUT"
+      : lost.length ? "-LOST"
+      : duplicated.length ? "-DUPL"
+      : diverged ? "-DIFF"
+      : "-FAIL";
     let dir = logger.dir;
     try { renameSync(logger.dir, logger.dir + suffix); dir = logger.dir + suffix; } catch { /* keep original */ }
     failures.push(dir);
     const dropped = forensics.filter((f) => f.serverRecoverable).length;
     const unregistered = forensics.length - dropped;
-    console.log(`  rep ${id}: *** ${lost.length ? "LOST" : "FAIL"} *** lost=${lost.length} (server-dropped=${dropped}, never-registered=${unregistered}) → ${path.basename(dir)}`);
+    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) → ${path.basename(dir)}`);
   }
 }
 
 async function runHistoryReps(history: History): Promise<void> {
   const str = serialize(history);
+  const strDir = cleanStrDir(str);
   console.log(`\n=== history ${str}  (×${repeat}) ===`);
-  for (let r = 0; r < repeat; r++) await runRep(history, str);
+  for (let r = 0; r < repeat; r++) await runRep(history, str, strDir);
+  tagHistoryDir(strDir, str);
 }
 
 const keepGoing = (h: number) =>
   durationMin > 0 ? Date.now() - startedAt < durationMin * 60_000 : campaign <= 0 ? true : h < campaign;
+
+// Confirm the host itself has connectivity before blaming Sync for anything — a
+// host outage would otherwise masquerade as data loss. SKIP_HOST_CHECK=1 bypasses
+// (e.g. a sandboxed environment that blocks outbound TCP).
+function hostOnline(host = "8.8.8.8", port = 53, timeoutMs = 4000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    const done = (ok: boolean) => { sock.destroy(); resolve(ok); };
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => done(true));
+    sock.once("timeout", () => done(false));
+    sock.once("error", () => done(false));
+    sock.connect(port, host);
+  });
+}
+
+if (!flag(process.env.SKIP_HOST_CHECK) && !(await hostOnline())) {
+  console.error("host appears OFFLINE (can't reach 8.8.8.8:53) — aborting so a host outage isn't mistaken for Sync loss. Set SKIP_HOST_CHECK=1 to override.");
+  process.exit(2);
+}
 
 if (historyEnv) {
   await runHistoryReps(parse(historyEnv));

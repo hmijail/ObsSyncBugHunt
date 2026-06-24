@@ -39,6 +39,10 @@ export interface NoteVerdict {
   duplicated: { token: string; maxCount: number }[]; // a token repeated in one file
   perNodeMissing: { node: NodeId; missing: string[] }[]; // tokens absent from a node
   conflictFiles: number; // max conflict-file count on any node (storm indicator; informational)
+  // Per conflict file: the device named in `(Conflicted copy <device> <ts>)`, whether
+  // that name is well-formed (device is a known node), and which nodes hold it.
+  // Informational — the token oracle stays the correctness gate (auto-merge is legal).
+  conflictMeta: { file: string; device: string | null; wellFormed: boolean; holders: NodeId[] }[];
 }
 
 export interface RunVerdict {
@@ -50,7 +54,12 @@ function occurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
   let count = 0;
   for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + needle.length)) {
-    count++;
+    // Boundary guard: don't count a token that is only a prefix of a longer one
+    // (e.g. `op-n1-1` inside `op-n1-10`). Tokens are bracketed (`[op-…]`) so the
+    // trailing `]` already delimits them, but this keeps the count correct even if
+    // the token format ever regresses to a bare, digit-terminated form.
+    const after = haystack[i + needle.length];
+    if (after === undefined || after < "0" || after > "9") count++;
   }
   return count;
 }
@@ -112,10 +121,26 @@ export function checkNote(
   // affect ok (an "expected" count is too fuzzy to gate on), but always recorded.
   const conflictFiles = obs.reduce((m, o) => Math.max(m, o.conflicts.length), 0);
 
+  // Per conflict file: parse the device named in `(Conflicted copy <device> <ts>)`,
+  // check it's a known node (Obsidian names the file after the device that produced
+  // it — the local/losing side), and record which nodes hold the file.
+  const validDevices = new Set(obs.map((o) => o.node));
+  const cfMap = new Map<string, { device: string | null; wellFormed: boolean; holders: NodeId[] }>();
+  for (const o of obs) {
+    for (const c of o.conflicts) {
+      const m = /\(Conflicted copy (.+) (\d{12})\)\.md$/.exec(c.file);
+      const device = m ? m[1] : null;
+      const entry = cfMap.get(c.file) ?? { device, wellFormed: m != null && validDevices.has(device!), holders: [] };
+      if (!entry.holders.includes(o.node)) entry.holders.push(o.node);
+      cfMap.set(c.file, entry);
+    }
+  }
+  const conflictMeta = [...cfMap.entries()].map(([file, v]) => ({ file, ...v }));
+
   // onlyInConflict is acceptable (that's the conflict-file mode working);
   // lost / duplicated / divergence are failures.
   const ok = lost.length === 0 && duplicated.length === 0 && converged;
-  return { note, ok, converged, lost, onlyInConflict, duplicated, perNodeMissing, conflictFiles };
+  return { note, ok, converged, lost, onlyInConflict, duplicated, perNodeMissing, conflictFiles, conflictMeta };
 }
 
 export function checkRun(acked: AckedEdit[], observations: NodeObservation[]): RunVerdict {

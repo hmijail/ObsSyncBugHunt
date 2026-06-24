@@ -26,6 +26,12 @@ export interface OpResult<T = string> {
  * canonical file OR any "(Conflicted copy ...)" file. `seq` is a per-run
  * monotonic counter and note names are unique per history, so `op-<node>-<seq>`
  * is already unique — no UUID needed.
+ *
+ * The token is wrapped in brackets — `[op-<node>-<seq>]` — so it is
+ * **self-delimiting**: without the closing `]`, `op-n1-1` would be a substring of
+ * `op-n1-10`, making the oracle miscount occurrences (false-positive duplication,
+ * and masked loss). A bare `[...]` is literal text in CommonMark (not a `[[wikilink]]`),
+ * and the CLI stores/returns raw markdown, so it round-trips untouched.
  */
 export interface EditToken {
   node: NodeId;
@@ -33,7 +39,7 @@ export interface EditToken {
 }
 
 export function formatToken(t: EditToken): string {
-  return `op-${t.node}-${t.seq}`;
+  return `[op-${t.node}-${t.seq}]`;
 }
 
 /** A server-side sync version, as listed by `diff filter=sync` (newest = 1). */

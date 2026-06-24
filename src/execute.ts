@@ -46,7 +46,7 @@ export interface RunResult {
   verdict: RunVerdict;
   acked: AckedEdit[];
   observations: NodeObservation[];
-  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean };
+  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean };
   forensics: LostForensic[];
 }
 
@@ -101,13 +101,13 @@ async function waitForSynced(
   opts: ExecuteOpts,
   logger: RunLogger,
   context: Record<string, unknown> = {},
-): Promise<{ seconds: number; timedOut: boolean }> {
+): Promise<{ seconds: number; timedOut: boolean; unsynced: boolean }> {
   const pollMs = (opts.pollSec ?? 1) * 1000;
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
   const start = Date.now();
-  if (notes.length === 0 || drivers.length === 0) return { seconds: 0, timedOut: false };
+  if (notes.length === 0 || drivers.length === 0) return { seconds: 0, timedOut: false, unsynced: false };
 
   const baseline = await readTotals(drivers, notes);
   let lastSig: string | null = null;
@@ -126,6 +126,10 @@ async function waitForSynced(
     if (done || timedOut) {
       const totals = await readTotals(drivers, notes);
       const seconds = Math.round(elapsed / 1000);
+      // A note with no server-side history (total < 1) never reached the server —
+      // it is NOT synced however quiescent the local vault looks. Distinct from a
+      // timeout (which is inconclusive); this is a hard "nothing got there".
+      const unsynced = !timedOut && notes.some((n) => totals[n] < 1);
       if (timedOut) {
         // Capture each node's own sync state — a wedged node (e.g. stuck "syncing"
         // after a network reconnect) is the usual cause and is worth seeing later.
@@ -135,10 +139,17 @@ async function waitForSynced(
           logger.log({ kind: "status-at-timeout", node: d.node, state });
         }
       }
-      for (const n of notes) {
-        logger.log({ kind: timedOut ? "sync-timeout" : "synced", note: n, from: baseline[n], to: totals[n], seconds, ...context });
+      // Snapshot each node's settled content for the audit trail — a time series
+      // across the run's W's catches a token that vanished then recovered before the
+      // final check (which only ever sees the end state).
+      for (const o of obs) {
+        logger.log({ kind: "content-at-wait", note: o.note, node: o.node, canonical: o.canonical, conflicts: o.conflicts, ...context });
       }
-      return { seconds, timedOut };
+      for (const n of notes) {
+        const kind = timedOut ? "sync-timeout" : totals[n] < 1 ? "unsynced" : "synced";
+        logger.log({ kind, note: n, from: baseline[n], to: totals[n], seconds, ...context });
+      }
+      return { seconds, timedOut, unsynced };
     }
     await sleep(pollMs);
   }
@@ -164,6 +175,20 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
   return out;
 }
 
+/** Gate the start of a rep on a known-clean baseline: every node reporting `synced`. */
+async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, logger: RunLogger): Promise<void> {
+  const deadline = Date.now() + capSec * 1000;
+  for (;;) {
+    const states = await Promise.all(drivers.map(async (d) => {
+      const st = await d.syncStatus();
+      return st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "error";
+    }));
+    if (states.every((s) => s === "synced")) { logger.log({ kind: "baseline-synced", states }); return; }
+    if (Date.now() > deadline) { logger.log({ kind: "baseline-sync-timeout", states }); return; }
+    await sleep(1000);
+  }
+}
+
 export async function runHistory(
   drivers: ObsidianDriver[],
   isolator: Isolator,
@@ -180,6 +205,8 @@ export async function runHistory(
     const r = await d.syncResume();
     logger.log({ kind: "resume", node: d.node, ok: r.ok });
   }
+  // Start from a known-clean baseline: don't begin editing until every node is synced.
+  await waitNodesSynced(drivers, opts.capSec ?? 120, logger);
 
   const driverOf = (num: number) => drivers[num - 1];
   const online = () => drivers.filter((_, idx) => !offline.has(idx + 1));
@@ -199,6 +226,7 @@ export async function runHistory(
       case "select":
         activeNote = opts.noteName(op.note!);
         touched.add(activeNote);
+        await driverOf(activeNode).open(activeNote); // foreground in the GUI (no-op if not yet created)
         break;
       case "pause":
         logger.log({ kind: "pause", node: activeNode, seconds: op.seconds });
@@ -231,11 +259,16 @@ export async function runHistory(
         // editing before propagation is a natural create-create; after, it's
         // append-contention — timing decides, no forced sync.
         const exists = await d.exists(activeNote);
-        const r = exists
-          ? await d.appendLine(activeNote, `edit ${token}`)
-          : await d.createNote(activeNote, `base ${token}`);
-        logger.log({ kind: exists ? "append" : "create", node: d.node, note: activeNote, token, ok: r.ok, code: r.raw.code });
-        if (r.ok) acked.push({ note: activeNote, node: d.node, token });
+        if (exists) await d.appendLine(activeNote, `edit ${token}`);
+        else { await d.createNote(activeNote, `base ${token}`); await d.open(activeNote); } // foreground the new note
+        // Exit codes are meaningless (the CLI always exits 0) and append-to-missing
+        // silently no-ops — so we only ack an edit after reading its token back
+        // locally. A no-op then can't masquerade as an acknowledged-then-lost edit.
+        const back = await d.read(activeNote);
+        const landed = (back.value ?? "").includes(token);
+        logger.log({ kind: exists ? "append" : "create", node: d.node, note: activeNote, token, landed });
+        if (landed) acked.push({ note: activeNote, node: d.node, token });
+        else logger.log({ kind: "edit-failed", node: d.node, note: activeNote, token });
         break;
       }
     }
@@ -258,6 +291,15 @@ export async function runHistory(
   const observations = await Promise.all(drivers.flatMap((d) => noteList.map((n) => gatherObservation(d, n))));
   const verdict = checkRun(acked, observations);
 
+  // Surface conflict-file structure: device named in the file (the producing node),
+  // whether the name is well-formed, and which nodes hold it. A malformed name is
+  // worth eyeballing even though it doesn't gate the token oracle.
+  for (const nv of verdict.notes) {
+    for (const cm of nv.conflictMeta) {
+      logger.log({ kind: "conflict-file", note: nv.note, file: cm.file, device: cm.device, wellFormed: cm.wellFormed, holders: cm.holders });
+    }
+  }
+
   const forensics = await lostForensics(drivers[0], verdict);
   for (const f of forensics) {
     logger.log({ kind: "lost-forensic", note: f.note, token: f.token, serverRecoverable: f.serverRecoverable, serverVersions: f.serverVersions });
@@ -267,6 +309,7 @@ export async function runHistory(
     totalSec: Math.round((Date.now() - startedAt) / 1000),
     convergenceSec: stab.seconds,
     syncTimedOut: stab.timedOut,
+    unsynced: stab.unsynced,
   };
   logger.log({ kind: "timings", ...timings });
   logger.results({ history: str, timings, acked, observations, verdict, forensics });

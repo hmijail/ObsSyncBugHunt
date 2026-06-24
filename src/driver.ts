@@ -24,6 +24,9 @@ export class ObsidianDriver {
     return this.executor.exec([command, ...params]);
   }
 
+  // NOTE: obsidian-cli ALWAYS exits 0 (known upstream bug), so `ok` here is
+  // effectively always true and MUST NOT be used to judge success. Correctness is
+  // decided by reading content back (see `exists` / `isAbsentRead` / `syncVersionsTotal`).
   private wrap(raw: ExecResult): OpResult {
     return raw.code === 0
       ? { ok: true, value: raw.stdout.trim(), raw }
@@ -59,13 +62,17 @@ export class ObsidianDriver {
 
   /**
    * Whether a note exists locally on this node. `read` exits 0 even when absent
-   * (printing `Error: File "X" not found.`), so we key on the content: present =
-   * non-empty, non-error; absent = empty or that error string.
+   * (printing `Error: File "X" not found.`), so we key on the content, not the code.
    */
   async exists(name: string): Promise<boolean> {
     const r = await this.read(name);
-    const v = (r.value ?? "").trim();
-    return r.ok && v !== "" && !v.startsWith("Error:");
+    return !isAbsentRead(r.value);
+  }
+
+  /** Open a note in the GUI (visible via VNC). Errors harmlessly on a missing note
+   *  — it does NOT create one — so it's safe to call on `select` before first edit. */
+  async open(name: string): Promise<OpResult> {
+    return this.wrap(await this.run("open", [`file=${name}`]));
   }
 
   async deleteNote(name: string, permanent = false): Promise<OpResult> {
@@ -81,7 +88,6 @@ export class ObsidianDriver {
   /** Vault file names, one per line. */
   async listFiles(folder?: string): Promise<OpResult<string[]>> {
     const raw = await this.run("files", folder ? [`folder=${folder}`] : []);
-    if (raw.code !== 0) return { ok: false, error: errText(raw), raw };
     return { ok: true, value: parseLines(raw.stdout), raw };
   }
 
@@ -95,14 +101,12 @@ export class ObsidianDriver {
   /** Obsidian's own view: list server-side sync versions (newest = 1). */
   async diffSync(name: string): Promise<OpResult<SyncVersion[]>> {
     const raw = await this.run("diff", [`file=${name}`, "filter=sync"]);
-    if (raw.code !== 0) return { ok: false, error: errText(raw), raw };
     return { ok: true, value: parseSyncVersions(raw.stdout), raw };
   }
 
   /** Local (File recovery) version list. */
   async history(name: string): Promise<OpResult<FileVersion[]>> {
     const raw = await this.run("history", [`file=${name}`]);
-    if (raw.code !== 0) return { ok: false, error: errText(raw), raw };
     return { ok: true, value: parseFileVersions(raw.stdout), raw };
   }
 
@@ -134,7 +138,8 @@ export class ObsidianDriver {
    */
   async syncVersionsTotal(name: string): Promise<OpResult<number>> {
     const raw = await this.run("sync:history", [`file=${name}`, "total"]);
-    if (raw.code !== 0) return { ok: false, error: errText(raw), raw };
+    // A missing/never-synced note prints a non-numeric line (still exit 0) → NaN →
+    // ok:false, which callers read as "no server history" (total < 1).
     const n = Number(raw.stdout.trim());
     return Number.isFinite(n)
       ? { ok: true, value: n, raw }
@@ -158,8 +163,14 @@ export class ObsidianDriver {
 
 // --- output parsers (verified against real CLI output; see src/smoke.ts) -----
 
-function errText(raw: ExecResult): string {
-  return (raw.stderr || raw.stdout).trim();
+/**
+ * A `read` whose content means "the note isn't here". `read` exits 0 even when a
+ * note is absent, printing `Error: File "X" not found.`, so absence is detected by
+ * content: empty, or starting with `Error:`. Shared by `exists` and `readCanonical`.
+ */
+export function isAbsentRead(value: string | undefined): boolean {
+  const v = (value ?? "").trim();
+  return v === "" || v.startsWith("Error:");
 }
 
 function parseLines(stdout: string): string[] {

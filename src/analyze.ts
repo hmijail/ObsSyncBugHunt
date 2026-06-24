@@ -10,10 +10,10 @@ import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 
 interface Forensic { serverRecoverable: boolean }
-interface NoteVerdict { lost: string[]; onlyInConflict: string[]; converged: boolean; conflictFiles: number }
+interface NoteVerdict { lost: string[]; onlyInConflict: string[]; converged: boolean; conflictFiles: number; duplicated: { token: string; maxCount: number }[] }
 interface Results {
   verdict: { ok: boolean; notes: NoteVerdict[] };
-  timings: { convergenceSec: number; syncTimedOut: boolean };
+  timings: { convergenceSec: number; syncTimedOut: boolean; unsynced?: boolean };
   forensics?: Forensic[];
 }
 
@@ -26,9 +26,10 @@ if (!existsSync(base)) {
 interface Group {
   reps: number; pass: number; fail: number;
   lost: number; serverDropped: number; neverRegistered: number;
+  duplReps: number; diffReps: number; unsyncedReps: number;
   conflictReps: number; timeouts: number; conv: number[];
 }
-const newGroup = (): Group => ({ reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, conflictReps: 0, timeouts: 0, conv: [] });
+const newGroup = (): Group => ({ reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0, unsyncedReps: 0, conflictReps: 0, timeouts: 0, conv: [] });
 const groups = new Map<string, Group>();
 const overall = newGroup();
 let skipped = 0;
@@ -44,11 +45,18 @@ function tally(g: Group, r: Results) {
   g.reps++;
   g.conv.push(r.timings?.convergenceSec ?? 0);
   if (r.timings?.syncTimedOut) g.timeouts++;
+  if (r.timings?.unsynced) g.unsyncedReps++;
   if (r.verdict.notes.some((n) => n.conflictFiles > 0 || n.onlyInConflict.length > 0)) g.conflictReps++;
   const lost = r.verdict.notes.reduce((s, n) => s + n.lost.length, 0);
   g.lost += lost;
   for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
-  if (r.verdict.ok) g.pass++; else g.fail++;
+  // Bucket the rep by its (ranked) outcome — mirrors run.ts's suffix ladder so a
+  // rep counted as DUPL/DIFF here matches its on-disk `-DUPL`/`-DIFF` dir.
+  if (r.verdict.ok && !r.timings?.unsynced) { g.pass++; return; }
+  g.fail++;
+  if (r.timings?.unsynced || r.timings?.syncTimedOut || lost > 0) return; // already counted above
+  if (r.verdict.notes.some((n) => n.duplicated.length > 0)) g.duplReps++;
+  else if (r.verdict.notes.some((n) => !n.converged)) g.diffReps++;
 }
 
 for (const str of readdirSync(base)) {
@@ -68,7 +76,8 @@ for (const str of readdirSync(base)) {
 }
 
 const line = (g: Group) =>
-  `reps=${g.reps} pass=${g.pass} fail=${g.fail}  LOST=${g.lost} (server-dropped=${g.serverDropped}, NEVER-REGISTERED=${g.neverRegistered})  conflictReps=${g.conflictReps}  syncTimeouts=${g.timeouts}\n  convergenceSec: ${stats(g.conv)}`;
+  `reps=${g.reps} pass=${g.pass} fail=${g.fail}  LOST=${g.lost} (server-dropped=${g.serverDropped}, NEVER-REGISTERED=${g.neverRegistered})  ` +
+  `DUPL=${g.duplReps} DIFF=${g.diffReps} UNSYNCED=${g.unsyncedReps}  conflictReps=${g.conflictReps}  syncTimeouts=${g.timeouts}\n  convergenceSec: ${stats(g.conv)}`;
 
 console.log(`Analyzed ${overall.reps} reps from ${base}/ (${skipped} skipped/incomplete)\n`);
 for (const [str, g] of [...groups.entries()].sort((a, b) => b[1].lost - a[1].lost)) {
