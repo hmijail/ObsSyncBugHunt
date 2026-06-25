@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateHistory, staleReconnect, type GenParams } from "./generator.js";
-import { serialize, type History } from "./dsl.js";
+import { generateHistory, staleReconnect } from "./generator.js";
+import { serialize, type Cmd, type History } from "./dsl.js";
 
 function mulberry32(seed: number): () => number {
   return () => {
@@ -14,73 +14,84 @@ function mulberry32(seed: number): () => number {
 }
 
 const editCount = (h: History) => h.filter((o) => o.cmd === "append").length;
-const crossNodeUnwaited = (h: History) => {
-  // count appends whose node differs from the previous append's node with no W between
-  let prev = 0;
-  let waitedSince = true;
-  let n = 0;
+
+// Count cross-node appends that have no coordination op (`coord`) since the previous
+// append — tracks the active node inline.
+const crossNodeUncoordinated = (h: History, coord: Cmd) => {
+  let prev = 0, node = 0, coordSince = true, n = 0;
   for (const op of h) {
-    if (op.cmd === "node") {/* track via append's active node below */}
-    if (op.cmd === "wait") waitedSince = true;
+    if (op.cmd === "node") node = op.node!;
+    if (op.cmd === coord) coordSince = true;
     if (op.cmd === "append") {
-      const cur = lastNode(h, op);
-      if (prev && prev !== cur && !waitedSince) n++;
-      prev = cur;
-      waitedSince = false;
+      if (prev && prev !== node && !coordSince) n++;
+      prev = node;
+      coordSince = false;
     }
   }
   return n;
 };
-// resolve the active node at the position of op by scanning preceding node ops
-function lastNode(h: History, target: History[number]): number {
-  let node = 0;
+
+const maxConcurrentOffline = (h: History) => {
+  let cur = 0, max = 0;
   for (const op of h) {
-    if (op.cmd === "node") node = op.node!;
-    if (op === target) return node;
+    if (op.cmd === "disconnect") max = Math.max(max, ++cur);
+    if (op.cmd === "connect") cur--;
   }
-  return node;
-}
+  return max;
+};
+
+const COLLAPSIBLE: Cmd[] = ["append", "disconnect", "connect", "wait", "pause"];
 
 test("generateHistory: edit count bounded, valid ops, serializable", () => {
   for (let s = 1; s <= 20; s++) {
     const h = generateHistory({ nodes: 2, ops: [4, 10], rng: mulberry32(s) });
-    // Collapsing consecutive appends can only reduce the count below the upper bound.
-    assert.ok(editCount(h) >= 1 && editCount(h) <= 10);
+    assert.ok(editCount(h) >= 1 && editCount(h) <= 10); // collapse can only reduce below the upper bound
     assert.doesNotThrow(() => serialize(h));
   }
 });
 
-test("no two appends are adjacent (collapse)", () => {
-  for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [4, 12], partitionProb: 0.3, pauseProb: 0.2, rng: mulberry32(s) });
+test("collapse: no two adjacent collapsible ops of the same kind", () => {
+  for (let s = 1; s <= 25; s++) {
+    const h = generateHistory({ nodes: 3, ops: [4, 12], turns: "paced", partitionProb: 0.3, pauseProb: 0.2, rng: mulberry32(s) });
     for (let i = 1; i < h.length; i++) {
-      assert.ok(!(h[i].cmd === "append" && h[i - 1].cmd === "append"), `adjacent appends: ${serialize(h)}`);
+      assert.ok(!(h[i].cmd === h[i - 1].cmd && COLLAPSIBLE.includes(h[i].cmd)), `adjacent ${h[i].cmd}: ${serialize(h)}`);
     }
   }
 });
 
-test("partitionProb: disconnects are balanced and always heal before the end", () => {
-  for (let s = 1; s <= 25; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 12], partitionProb: 0.6, rng: mulberry32(s) });
+test("barrier turns: a W before every cross-node edit", () => {
+  for (let s = 1; s <= 20; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "barrier", rng: mulberry32(s) });
+    assert.equal(crossNodeUncoordinated(h, "wait"), 0, `barrier should W before cross-node edits: ${serialize(h)}`);
+  }
+});
+
+test("paced turns: a P (not W) before every cross-node edit", () => {
+  for (let s = 1; s <= 20; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "paced", rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "wait"), `paced uses no W: ${serialize(h)}`);
+    assert.equal(crossNodeUncoordinated(h, "pause"), 0, `paced should P before cross-node edits: ${serialize(h)}`);
+  }
+});
+
+test("concurrent turns: no coordination at all", () => {
+  for (let s = 1; s <= 10; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "concurrent", rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "wait" || o.cmd === "pause"), `concurrent inserts no W/P: ${serialize(h)}`);
+  }
+});
+
+test("partitions: D/C balanced, healed by the end, and can overlap (all-offline)", () => {
+  let sawConcurrent = false;
+  for (let s = 1; s <= 30; s++) {
+    const h = generateHistory({ nodes: 3, ops: [6, 12], partitionProb: 0.6, rng: mulberry32(s) });
     const cmds = h.map((o) => o.cmd);
     assert.equal(cmds.filter((c) => c === "disconnect").length, cmds.filter((c) => c === "connect").length, `D/C balanced: ${serialize(h)}`);
     const lastD = cmds.lastIndexOf("disconnect");
     if (lastD >= 0) assert.ok(cmds.lastIndexOf("connect") > lastD, `reconnect after last disconnect: ${serialize(h)}`);
+    if (maxConcurrentOffline(h) >= 2) sawConcurrent = true;
   }
-});
-
-test("benign (concurrent:false) waits before every cross-node edit", () => {
-  for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], concurrent: false, rng: mulberry32(s) });
-    assert.equal(crossNodeUnwaited(h), 0, `benign history should have no unwaited cross-node edits: ${serialize(h)}`);
-  }
-});
-
-test("aggressive (concurrent:true) inserts no waits", () => {
-  for (let s = 1; s <= 10; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], concurrent: true, rng: mulberry32(s) });
-    assert.ok(!h.some((o) => o.cmd === "wait"), "no W ops in concurrent mode");
-  }
+  assert.ok(sawConcurrent, "expected at least one history with 2+ nodes offline at once");
 });
 
 test("staleReconnect: disconnect early, pause, edits, reconnect", () => {

@@ -1,42 +1,40 @@
 # Obsidian Sync Tester
 
 A small TypeScript harness that hunts for **data loss in Obsidian Sync** when the
-same note is edited on two devices. Every edit goes through the **Obsidian CLI**
-(no direct file writes), so Sync engages exactly as it would for a human.
+same note is edited on multiple devices. Every edit goes through the **Obsidian CLI**, so Sync hopefully works as it would for a human.
 
-## Histories: a tiny DSL
+## Generating sequences of edits with a tiny DSL
 
-A test is a **history** — a string of user actions replayed against two
+A test is a **history** — a string of user actions replayed against
 containerized nodes. Commands are uppercase, parameters lowercase/digits. An
 **active node** and **active note** are cursors that persist until changed.
 
-| token | meaning |
+| Command | meaning |
 |---|---|
 | `N<d>` | set the active node (`N1`, `N2`) |
 | `E<x>` | select the active note (`Ea`); also opens it in the GUI |
 | `A`    | append a uniquely-tagged line to the active note, by the active node |
 | `D` / `C` | disconnect / connect the active node from the network |
-| `W`    | wait until the active note is synced & settled |
+| `W`    | wait until the active node reports that the active note is synced |
 | `P<n>` | pause ~`n` seconds (default 10) |
 
 Example: `N1EaAWN2A` → node 1 selects note `a`, appends, waits for sync; node 2
-appends to the same note. **Trailing waits are implicit** — the executor always
-reconnects everyone and settles before judging, so a string needn't end in `W`.
-Timing comes *only* from explicit `W`/`P`, so the one thing varying across repeats
-is Sync itself. The user never "syncs" — they only edit, wait, and hope. Edits are
-append-only for now (`M`, same-line modify, is a deliberately deferred harsher lever).
+appends to the same note.
+
+At the end of the history, the harness waits for all nodes to report synced (reconnecting them to the network if necessary).
+The thing varying across repeats is timing, as it depends on how fast the Obsidian CLI processes commands. Most importantly, Obsidian Sync itself will take its time, and the simulated user might wait for it to finish (command `W`).
+
+Edits are append-only for now, since that is a case supported by the CLI, and the bug reports in the forum seem to hint that this should be enough to cause trouble.
 
 A history can be hand-written (`HISTORY=N1EaAWN2A`) or generated (see below), and
 each is **repeated** `REPEAT` times (default 10) to cope with Sync's nondeterminism.
 
-## The oracle: token survival
+## Judging whether there was a bug: token survival
 
-Each `A` embeds a unique, **self-delimiting** token `[op-<node>-<seq>]` into the
-note. After sync settles, the oracle (`src/oracle.ts`, unit-tested) verifies — by
-exact match across `canonical ∪ (Conflicted copy …)` files — three invariants, with
-no model of the "expected" merged text:
+Each command `A` appends a unique token `[op-<node>-<seq>]` to the
+note. At the end of the history, the oracle (`src/oracle.ts`) checks that those tokens exist, either in the notes created during that history, or in any corresponding "Conflicted copy". It can detect 3 types of problems:
 
-- **loss** — an acknowledged token present nowhere → data loss;
+- **loss** — a token was introduced but at the end of the history it's been lost;
 - **duplication** — a token repeated within a file;
 - **divergence** — nodes disagree on final content or conflict-file set.
 
@@ -78,12 +76,21 @@ A node must be **running but unable to sync** to diverge. Two primitives, via
 
 ## Generation
 
-`generateHistory` emits random histories in the DSL vocabulary:
+`generateHistory` builds random histories. Cross-node edits to the same note are
+coordinated by **`TURNS`** — a spectrum of synchronization strength:
 
-- **benign** (default) inserts a `W` before every cross-node edit, so edits never
-  overlap (append-contention after propagation);
-- **concurrent** (`CONCURRENT=1`) omits the wait (maybe create-create, maybe contention);
-- the **stale** preset (`SCENARIO=stale`) disconnects a node early, piles edits, then heals.
+- **`barrier`** (default) — a `W` before each cross-node edit: strict turns, edits
+  never overlap (append-contention on a propagated base);
+- **`paced`** — a `P` (~10s) instead of the wait: edits *sometimes* race the sync window;
+- **`concurrent`** — nothing: maximum overlap.
+
+**`PARTITION_PROB`** independently injects network partitions: a node — or several, up
+to all — goes offline, edits diverge across the gap, then it heals (the
+`SCENARIO=stale` preset is just a biased corner of this). Coordination is suppressed
+across a partition (you can't take a turn with a disconnected node), so `TURNS`
+governs *online* edits and `PARTITION_PROB` governs *offline* divergence,
+independently. Consecutive same-kind ops are collapsed in generated histories — and
+consecutive pauses summed — since back-to-back local edits add no contention.
 
 ## Layout
 
@@ -129,6 +136,26 @@ Per-run artifacts live in `runs/<history>/<epoch6>/`: `history.json` (the intend
 ops), `history.jsonl` (the timestamped execution trace, incl. `content-at-wait`
 snapshots), `results.json` (the verdict), and `meta.json`.
 
+## Parameters
+
+All set via environment variables (`src/run.ts` holds the authoritative list):
+
+| env | default | meaning |
+|---|---|---|
+| `HISTORY` | *(generate)* | run a specific DSL string instead of generating |
+| `REPEAT` | 10 | repeats per history |
+| `CAMPAIGN` | 1 | number of histories (≤0 = until killed) |
+| `DURATION_MIN` | — | run for N minutes instead of a count — **checked only between histories**, so it finishes the current history's `REPEAT` reps first |
+| `SCENARIO` | `random` | `random` (generator) or `stale` (disconnect-pile-reconnect preset) |
+| `OPS` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer in the string |
+| `NOTES` | 1 | distinct notes per history (1 = max contention) |
+| `TURNS` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
+| `PAUSE_PROB` | 0 | chance of a ~10s pause after an edit |
+| `PARTITION_PROB` | 0 | chance per edit of a `D`…`C` network partition (needs 2+ nodes) |
+| `ISOLATOR` | `network` | `network` (partition) or `sync` (cooperative baseline) |
+| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
+| `POLL_SEC` / `MIN_FLOOR_SEC` / `CAP_SEC` / `W_SETTLE_SEC` / `FINAL_SETTLE_SEC` | 1 / 3 / 120 / 4 / 6 | sync-wait tuning (seconds) |
+
 ## Future work
 
 Schedule-aware **conflict expectation**: from the offline trace, a node that made
@@ -137,6 +164,7 @@ missing one needs reasoning over the schedule, not just the end state. Worth a l
 as prior art / lit review (verify before relying on any of these): Jepsen's
 consistency-testing methodology (the project's namesake), CRDT / operational-
 transformation theory, and academic studies of file-sync conflict handling.
+FIXME XXX
 
 ## Tooling
 

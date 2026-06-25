@@ -3,21 +3,26 @@
 // can pass once and fail another time, so we don't seed for replay — the concrete
 // history string IS the artifact, and we repeat each one (see run.ts).
 //
-// `generateHistory`: benign (`concurrent:false`) inserts a `W` before every
-// cross-node edit so they never overlap; aggressive omits it. With
-// `partitionProb>0` it also opens random `D`…`C` partitions (a node goes offline,
-// edits diverge across the gap, then it heals) — so the bespoke `staleReconnect`
-// preset is really just a biased corner of this space. Consecutive same-node
-// appends are collapsed (they add no contention).
+// `generateHistory` coordinates cross-node edits by `turns`:
+//   barrier    — insert `W` before a cross-node edit (strict turns, no overlap)
+//   paced      — insert a default `P` instead (a timed pause → edits sometimes race)
+//   concurrent — insert nothing (maximum overlap)
+// Coordination only applies while both editors are online — you can't take a turn
+// across a partition. With `partitionProb>0` it also opens random `D`…`C`
+// partitions (one or more nodes go offline, edits diverge, then they heal), so the
+// `staleReconnect` preset is just a biased corner of this space. Consecutive
+// same-kind ops are collapsed (back-to-back local edits add no contention).
 
-import type { History } from "./dsl.js";
+import { DEFAULT_PAUSE_SEC, type Cmd, type History } from "./dsl.js";
+
+export type Turns = "barrier" | "paced" | "concurrent";
 
 export interface GenParams {
   nodes: number; // node count (>=1)
-  ops: [number, number]; // inclusive range for the number of edits
+  ops: [number, number]; // inclusive range for the number of edits (counts `A` only)
   notes?: number; // distinct notes (default 1 = max contention)
-  concurrent?: boolean; // false (benign) => wait-for-sync before cross-node edits
-  pauseProb?: number; // chance of a ~10s pause after an edit (default 0)
+  turns?: Turns; // cross-node coordination (default "barrier")
+  pauseProb?: number; // chance of a default-length pause after an edit (default 0)
   partitionProb?: number; // chance per edit-step of opening a network partition (needs nodes>1; default 0)
   rng?: () => number; // default Math.random; injectable for tests
 }
@@ -34,7 +39,7 @@ const LETTERS = "abcdefghijklmnopqrstuvwxyz".split("");
 export function generateHistory(params: GenParams): History {
   const rng = params.rng ?? Math.random;
   const nodeCount = params.nodes;
-  const concurrent = params.concurrent ?? false;
+  const turns = params.turns ?? "barrier";
   const pauseProb = params.pauseProb ?? 0;
   const partitionProb = params.partitionProb ?? 0;
   const letters = LETTERS.slice(0, Math.max(1, params.notes ?? 1));
@@ -45,56 +50,72 @@ export function generateHistory(params: GenParams): History {
   let curNote = "";
   let prevEditor = 0;
   const offline = new Set<number>(); // nodes currently partitioned
-  let offlineSince = -1;
+  const offlineSince = new Map<number, number>(); // node -> edit index it went offline
 
   const setNode = (n: number) => { if (n !== curNode) { ops.push({ cmd: "node", node: n }); curNode = n; } };
-  const reconnectAll = () => {
-    if (offline.size === 0) return;
-    // Pause before healing so the online side's edits propagate to the server
-    // before the stale node rejoins with its divergent version (the conflict setup).
-    ops.push({ cmd: "pause", seconds: 10 });
-    for (const v of [...offline]) { setNode(v); ops.push({ cmd: "connect" }); }
-    offline.clear();
-    offlineSince = -1;
+  const disconnect = (v: number, at: number) => { setNode(v); ops.push({ cmd: "disconnect" }); offline.add(v); offlineSince.set(v, at); };
+  const reconnect = (v: number) => {
+    // Pause before healing so the online side's edits propagate before the stale
+    // node rejoins with its divergent version (the conflict setup).
+    ops.push({ cmd: "pause", seconds: DEFAULT_PAUSE_SEC });
+    setNode(v);
+    ops.push({ cmd: "connect" });
+    offline.delete(v);
+    offlineSince.delete(v);
   };
 
   for (let i = 0; i < count; i++) {
-    // Maybe open a partition (one node at a time, and only with a peer left online).
-    if (partitionProb > 0 && offline.size === 0 && nodeCount > 1 && rng() < partitionProb) {
-      const victim = randInt(rng, 1, nodeCount);
-      setNode(victim);
-      ops.push({ cmd: "disconnect" });
-      offline.add(victim);
-      offlineSince = i;
+    // Maybe open a partition on a random currently-online node — multiple (up to
+    // all) nodes can be offline at once.
+    const onlineNodes: number[] = [];
+    for (let x = 1; x <= nodeCount; x++) if (!offline.has(x)) onlineNodes.push(x);
+    if (partitionProb > 0 && nodeCount > 1 && onlineNodes.length > 0 && rng() < partitionProb) {
+      disconnect(pick(rng, onlineNodes), i);
     }
-    // Heal an open partition after it has spanned a couple of edits (so edits can
-    // diverge across it first).
-    if (offline.size > 0 && (i - offlineSince >= 2 || rng() < 0.4)) reconnectAll();
+    // Heal each offline node that has lingered past the step it went offline
+    // (a couple of edits, or by chance) — never open and heal in the same step.
+    for (const v of [...offline]) {
+      const since = offlineSince.get(v) ?? i;
+      if (i > since && (i - since >= 2 || rng() < 0.4)) reconnect(v);
+    }
 
     const n = randInt(rng, 1, nodeCount);
     const note = pick(rng, letters);
     setNode(n);
     if (note !== curNote) { ops.push({ cmd: "select", note }); curNote = note; }
-    // Benign: wait for sync before a different node edits the note (so it propagates
-    // → append-contention). But never across a partition — you can't sync a
-    // disconnected node, and divergence is the whole point of one. Aggressive
-    // (concurrent) omits the wait entirely. The first edit to a note creates it.
-    if (!concurrent && prevEditor && prevEditor !== n && !offline.has(n) && !offline.has(prevEditor)) {
-      ops.push({ cmd: "wait" });
+    // Coordinate a cross-node edit per `turns`, but only while both editors are
+    // online (you can't take a turn across a partition — divergence is the point).
+    if (turns !== "concurrent" && prevEditor && prevEditor !== n && !offline.has(n) && !offline.has(prevEditor)) {
+      ops.push(turns === "barrier" ? { cmd: "wait" } : { cmd: "pause", seconds: DEFAULT_PAUSE_SEC });
     }
     ops.push({ cmd: "append" });
-    if (rng() < pauseProb) ops.push({ cmd: "pause", seconds: 10 });
+    if (rng() < pauseProb) ops.push({ cmd: "pause", seconds: DEFAULT_PAUSE_SEC });
     prevEditor = n;
   }
-  reconnectAll(); // never leave a node partitioned at the end (executor would heal it anyway)
+  for (const v of [...offline]) reconnect(v); // never leave a node partitioned at the end
 
-  return collapseAppends(ops);
+  return collapse(ops);
 }
 
-/** Collapse runs of consecutive appends (same active node + note, nothing between)
- *  into a single append — back-to-back local edits exercise no new sync contention. */
-function collapseAppends(ops: History): History {
-  return ops.filter((op, i) => !(op.cmd === "append" && ops[i - 1]?.cmd === "append"));
+const DEDUP = new Set<Cmd>(["append", "disconnect", "connect", "wait"]);
+
+/** Collapse adjacent redundancy in generated histories: a duplicate of a bare op
+ *  (append/disconnect/connect/wait) is dropped, and consecutive pauses are summed.
+ *  `node`/`select` carry params and are left alone. */
+function collapse(ops: History): History {
+  const out: History = [];
+  for (const op of ops) {
+    const prev = out[out.length - 1];
+    if (prev && prev.cmd === op.cmd) {
+      if (op.cmd === "pause") {
+        prev.seconds = (prev.seconds ?? DEFAULT_PAUSE_SEC) + (op.seconds ?? DEFAULT_PAUSE_SEC);
+        continue;
+      }
+      if (DEDUP.has(op.cmd)) continue;
+    }
+    out.push({ ...op });
+  }
+  return out;
 }
 
 /**
@@ -110,8 +131,8 @@ export function staleReconnect(params: GenParams): History {
   const other = stale === 1 ? Math.min(2, nodeCount) : 1;
 
   const ops: History = [
-    { cmd: "node", node: other }, { cmd: "select", note: "a" }, { cmd: "append" }, { cmd: "pause", seconds: 10 }, // base; pause lets it propagate naturally
-    { cmd: "node", node: stale }, { cmd: "disconnect" }, { cmd: "pause", seconds: 30 },
+    { cmd: "node", node: other }, { cmd: "select", note: "a" }, { cmd: "append" }, { cmd: "pause", seconds: DEFAULT_PAUSE_SEC }, // base; pause lets it propagate naturally
+    { cmd: "node", node: stale }, { cmd: "disconnect" }, { cmd: "pause", seconds: 30 }, // deliberately long stale window
   ];
   let cur = stale;
   for (let i = 0; i < edits; i++) {

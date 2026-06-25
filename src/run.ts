@@ -1,7 +1,8 @@
 // Test entrypoint: generates (or takes) a DSL history, runs it REPEAT times
 // against the containerized nodes, and tallies. Each history string is a
-// directory; each repeat is a sub-run named by epoch6; failing reps get a
-// `-LOST`/`-FAIL` suffix. Env vars:
+// directory; each repeat is a sub-run named by epoch6. A non-OK rep dir is
+// suffixed -UNSYNCED / -TIMEOUT / -LOST / -DUPL / -DIFF, and a history dir gets
+// -BAD<pct> (share of non-OK reps). Env vars:
 //
 //   NODES        comma-separated container names          (default "n1,n2")
 //   OBSIDIAN_BIN CLI path inside the container            (default "/opt/obsidian/obsidian-cli")
@@ -11,7 +12,7 @@
 //   SCENARIO     "random" | "stale"                       (default "random")
 //   OPS          edit-count range "min-max"               (default "6-12")
 //   NOTES        distinct notes per history               (default 1)
-//   CONCURRENT   =1 drop the wait-for-sync (aggressive)   (default benign)
+//   TURNS        barrier | paced | concurrent             (default barrier)
 //   PAUSE_PROB   chance of a ~10s pause after an edit      (default 0)
 //   PARTITION_PROB chance per edit of a network partition  (default 0; needs 2+ nodes)
 //   REPEAT       reps per history                          (default 10)
@@ -29,7 +30,7 @@ import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
-import { generateHistory, staleReconnect, type GenParams } from "./generator.js";
+import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, type History } from "./dsl.js";
 
 const flag = (v: string | undefined) => v === "1" || v === "true";
@@ -46,11 +47,13 @@ const historyEnv = process.env.HISTORY;
 
 const opsRange = (process.env.OPS ?? "6-12").split("-").map(Number);
 const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
+const turnsEnv = process.env.TURNS ?? "barrier";
+const turns = (["barrier", "paced", "concurrent"].includes(turnsEnv) ? turnsEnv : "barrier") as Turns;
 const genParams: GenParams = {
   nodes: nodesList.length,
   ops,
   notes: Number(process.env.NOTES ?? 1),
-  concurrent: flag(process.env.CONCURRENT),
+  turns,
   pauseProb: Number(process.env.PAUSE_PROB ?? 0),
   partitionProb: Number(process.env.PARTITION_PROB ?? 0),
 };
@@ -68,7 +71,7 @@ const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId
 
 console.log(
   `nodes=${nodesList.join(",")} isolator=${isolatorKind} scenario=${scenario} ops=${ops.join("-")} ` +
-    `notes=${genParams.notes} concurrent=${genParams.concurrent} repeat=${repeat} ` +
+    `notes=${genParams.notes} turns=${genParams.turns} repeat=${repeat} ` +
     (historyEnv ? `history=${historyEnv}` : `campaign=${campaign}`),
 );
 
@@ -129,7 +132,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     history: str,
     scenario,
     isolator: isolatorKind,
-    concurrent: genParams.concurrent,
+    turns: genParams.turns,
     partitionProb: genParams.partitionProb,
     notes: genParams.notes,
     ops: ops.join("-"),

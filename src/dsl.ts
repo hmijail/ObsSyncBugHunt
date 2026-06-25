@@ -26,7 +26,7 @@ export interface Op {
 
 export type History = Op[];
 
-const DEFAULT_PAUSE = 10;
+export const DEFAULT_PAUSE_SEC = 10;
 
 /** Parse a history string into ops. Whitespace is ignored (for readability). */
 export function parse(s: string): History {
@@ -60,7 +60,7 @@ export function parse(s: string): History {
       case "W": ops.push({ cmd: "wait" }); break;
       case "P": {
         const n = digits();
-        ops.push({ cmd: "pause", seconds: n ? Number(n) : DEFAULT_PAUSE });
+        ops.push({ cmd: "pause", seconds: n ? Number(n) : DEFAULT_PAUSE_SEC });
         break;
       }
       default:
@@ -81,7 +81,7 @@ export function serialize(h: History): string {
         case "disconnect": return "D";
         case "connect": return "C";
         case "wait": return "W";
-        case "pause": return op.seconds === DEFAULT_PAUSE ? "P" : `P${op.seconds}`;
+        case "pause": return op.seconds === DEFAULT_PAUSE_SEC ? "P" : `P${op.seconds}`;
       }
     })
     .join("");

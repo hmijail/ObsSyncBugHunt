@@ -20,7 +20,7 @@ import {
   type NodeObservation,
   type RunVerdict,
 } from "./oracle.js";
-import { serialize, type History } from "./dsl.js";
+import { serialize, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
 
 export interface ExecuteOpts {
   noteName: (letter: string) => string; // DSL note letter -> concrete vault note name (per-rep)
@@ -240,7 +240,7 @@ export async function runHistory(
         break;
       case "pause":
         logger.log({ kind: "pause", node: activeNode, seconds: op.seconds });
-        await sleep((op.seconds ?? 10) * 1000);
+        await sleep((op.seconds ?? DEFAULT_PAUSE_SEC) * 1000);
         break;
       case "disconnect":
         await isolator.disconnect(driverOf(activeNode).node);
@@ -253,9 +253,13 @@ export async function runHistory(
         logger.log({ kind: "reconnect", node: driverOf(activeNode).node });
         break;
       case "wait": {
-        if (!activeNote) break;
-        if (offline.has(activeNode)) {
-          logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
+        if (!activeNote) break; // nothing selected to wait on
+        // A W on a disconnected node (or with no online peer to sync with) can't
+        // make progress — NOP it rather than block. (waitForSynced is also hard-
+        // bounded by capSec, so a W never hangs even in the online case.)
+        if (offline.has(activeNode) || online().length === 0) {
+          const reason = offline.has(activeNode) ? "offline" : "no-online-peers";
+          logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason });
           break;
         }
         await waitForSynced(online(), [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
