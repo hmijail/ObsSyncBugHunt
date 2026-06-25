@@ -24,6 +24,17 @@ appends to the same note.
 At the end of the history, the harness waits for all nodes to report synced (reconnecting them to the network if necessary).
 The thing varying across repeats is timing, as it depends on how fast the Obsidian CLI processes commands. Most importantly, Obsidian Sync itself will take its time, and the simulated user might wait for it to finish (command `W`).
 
+**Execution model (and its limits).** A history runs **strictly sequentially** — one
+awaited op loop — so any `P`/`W`/`D`/`C` blocks the *whole* harness from issuing the
+next command (background Sync keeps running during a pause; only new *edits* are
+serialized). This is deliberate: it models one human moving between their own devices,
+not two devices typing into the same note at the same instant. The bug we're after —
+logically-concurrent edits on a shared base — still arises, just not from wall-clock
+simultaneity: a partition (`D … C`) has both sides edit the same base unaware of each
+other, and `concurrent` turns race edits against the live sync window. True
+sub-second-simultaneous edits with no partition are out of scope — both rare for a
+single user and barely well-defined.
+
 Edits are append-only for now, since that is a case supported by the CLI, and the bug reports in the forum seem to hint that this should be enough to cause trouble.
 
 A history can be hand-written (`HISTORY=N1EaAWN2A`) or generated (see below), and
@@ -31,17 +42,19 @@ each is **repeated** `REPEAT` times (default 10) to cope with Sync's nondetermin
 
 ## Judging whether there was a bug: token survival
 
-Each command `A` appends a unique token `[op-<node>-<seq>]` to the
+Each command `A` appends a unique token `(op-<node>-<seq>)` to the
 note. At the end of the history, the oracle (`src/oracle.ts`) checks that those tokens exist, either in the notes created during that history, or in any corresponding "Conflicted copy". It can detect 3 types of problems:
 
 - **loss** — a token was introduced but at the end of the history it's been lost;
 - **duplication** — a token repeated within a file;
 - **divergence** — nodes disagree on final content or conflict-file set.
 
-> The token is bracketed so one can't be a substring of another (`[op-n1-1]` vs
-> `[op-n1-10]`); matching is also boundary-aware. An edit is only *acknowledged*
-> after its token is read back locally — because **`obsidian-cli` always exits 0**
-> (a known upstream bug), success is judged by content, never by the exit code.
+> The token is parenthesized so one can't be a substring of another (`(op-n1-1)` vs
+> `(op-n1-10)`); matching is also boundary-aware. Parens (not `[ ]`/`[[ ]]`, which
+> read as a checkbox/wikilink in the editor) keep it inert plain text in the GUI. An
+> edit is only *acknowledged* after its token is read back locally — because
+> **`obsidian-cli` always exits 0** (a known upstream bug), success is judged by
+> content, never by the exit code; a write that doesn't read back is retried.
 
 Nodes run in **"create conflict file"** mode. A present conflict file is checked for
 a well-formed `(Conflicted copy <device> <ts>)` name attributable to a node (each
@@ -108,7 +121,7 @@ src/
   run.ts         containerized entrypoint   (npm run start)
   run-local.ts   single-node pipeline check (npm run local)
   analyze.ts     offline soak aggregator    (npm run analyze)
-  clean-notes.ts empty the vault on all nodes (npm run clean-notes)
+  clean-notes.ts delete the harness's notes (bughunt/) on all nodes (npm run clean-notes)
   smoke.ts       driver probe               (npm run smoke)
 containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
 Makefile         podman lifecycle: build -> login -> capture -> containers-up -> run
@@ -135,6 +148,13 @@ make analyze                             # aggregate runs/ into a report
 Per-run artifacts live in `runs/<history>/<epoch6>/`: `history.json` (the intended
 ops), `history.jsonl` (the timestamped execution trace, incl. `content-at-wait`
 snapshots), `results.json` (the verdict), and `meta.json`.
+
+The notes a run creates are named `bughunt/<epoch6>-<history>-<letter>` — e.g.
+`bughunt/393937-N1EaAN2WA-a.md`. `<epoch6>` is the last 6 digits of the Unix second:
+the per-repeat id that keeps each repeat's notes distinct (a `-2` is appended on the
+rare same-second collision). `<history>` is the DSL string, and the trailing
+`-<letter>` is the DSL note letter the concrete note maps to (the target of `Ea`), so
+a multi-note history (`NOTES>1`) yields `…-a`, `…-b`, … side by side.
 
 **Vault safety:** every note the harness creates lives under a `bughunt/` folder, and
 `clean-notes`/`clean-data` only ever delete *inside* `bughunt/`. So even if pointed at a
@@ -165,7 +185,11 @@ Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
 | `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
 | `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online preflight |
-| `POLL_SEC` … | `--poll-sec` `--min-floor-sec` `--cap-sec` `--w-settle-sec` `--final-settle-sec` | 1/3/120/4/6 | sync-wait tuning (seconds) |
+| `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
+| `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
+| `CAP_SEC` | `--cap-sec` | 120 | hard ceiling on any single wait; exceeding it is a `-TIMEOUT` (inconclusive) |
+| `W_SETTLE_SEC` | `--w-settle-sec` | 4 | mid-history `W`: how long the converged + `synced` state must hold |
+| `FINAL_SETTLE_SEC` | `--final-settle-sec` | 6 | end-of-history settle window; longer than `W`'s, to absorb a lagging conflict file |
 
 ## Future work
 

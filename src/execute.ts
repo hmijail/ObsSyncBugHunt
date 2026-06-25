@@ -9,6 +9,7 @@
 // as a severity witness.
 
 import { formatToken, type NodeId } from "./types.js";
+import { isAbsentRead } from "./driver.js";
 import type { ObsidianDriver } from "./driver.js";
 import type { Isolator } from "./isolate.js";
 import type { RunLogger } from "./history.js";
@@ -149,11 +150,21 @@ async function waitForSynced(
           logger.log({ kind: "status-at-timeout", node: d.node, state: await syncState(d) });
         }
       }
-      // Snapshot each node's settled content for the audit trail — a time series
-      // across the run's W's catches a token that vanished then recovered before the
-      // final check (which only ever sees the end state).
-      for (const o of obs) {
-        logger.log({ kind: "content-at-wait", note: o.note, node: o.node, canonical: o.canonical, conflicts: o.conflicts, ...context });
+      // Snapshot the settled content for the audit trail — a time series across the
+      // run's W's catches a token that vanished then recovered before the final check
+      // (which only ever sees the end state). When all nodes agree on a note, log ONE
+      // `converged:true` row instead of one-per-node so the reader isn't left diffing
+      // identical rows; only a real divergence is broken out per node.
+      for (const note of notes) {
+        const g = obs.filter((o) => o.note === note);
+        const first = g[0];
+        const allEqual = first != null && g.every((o) =>
+          (o.canonical ?? null) === (first.canonical ?? null) && sameConflictSet(o.conflicts, first.conflicts));
+        if (allEqual) {
+          logger.log({ kind: "content-at-wait", note, converged: true, canonical: first.canonical, conflicts: first.conflicts, ...context });
+        } else {
+          for (const o of g) logger.log({ kind: "content-at-wait", note, node: o.node, converged: false, canonical: o.canonical, conflicts: o.conflicts, ...context });
+        }
       }
       for (const n of notes) {
         const kind = timedOut ? "sync-timeout" : totals[n] < 1 ? "unsynced" : "synced";
@@ -269,23 +280,39 @@ export async function runHistory(
         if (!activeNote) break;
         const d = driverOf(activeNode);
         const token = formatToken({ node: d.node, seq: ++seq });
-        // Create if THIS node doesn't have the note locally yet, else append. So
-        // editing before propagation is a natural create-create; after, it's
-        // append-contention — timing decides, no forced sync.
-        const exists = await d.exists(activeNote);
-        // Foreground the note on the EDITING node before each edit — the active node
-        // changes via `N` without re-selecting, so opening here (not just on select)
-        // makes the GUI follow whichever node is actually writing.
-        if (exists) { await d.open(activeNote); await d.appendLine(activeNote, `edit ${token}`); }
-        else { await d.createNote(activeNote, `base ${token}`); await d.open(activeNote); }
         // Exit codes are meaningless (the CLI always exits 0) and append-to-missing
-        // silently no-ops — so we only ack an edit after reading its token back
-        // locally. A no-op then can't masquerade as an acknowledged-then-lost edit.
-        const back = await d.read(activeNote);
-        const landed = (back.value ?? "").includes(token);
-        logger.log({ kind: exists ? "append" : "create", node: d.node, note: activeNote, token, landed });
-        if (landed) acked.push({ note: activeNote, node: d.node, token });
-        else logger.log({ kind: "edit-failed", node: d.node, note: activeNote, token });
+        // silently no-ops, so an edit is only acked after its token is read back
+        // locally. If it doesn't land, retry a few times (logging each miss as
+        // `edit-unconfirmed`) rather than silently dropping it. Each attempt re-reads
+        // first: if the token is already present, a prior attempt landed and a flaky
+        // read just hid it — stop, so we never double-append (which would trip the
+        // duplication oracle). The happy path logs no extra field — just the op.
+        const MAX_ATTEMPTS = 3;
+        let landed = false;
+        let created = false;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS && !landed; attempt++) {
+          const before = await d.read(activeNote);
+          if ((before.value ?? "").includes(token)) { landed = true; break; }
+          // Create if THIS node doesn't have the note locally yet, else append. So
+          // editing before propagation is a natural create-create; after, it's
+          // append-contention — timing decides, no forced sync.
+          const exists = !isAbsentRead(before.value);
+          created = !exists;
+          // Foreground the note on the EDITING node before each edit — the active
+          // node changes via `N` without re-selecting, so opening here (not just on
+          // select) makes the GUI follow whichever node is actually writing.
+          if (exists) { await d.open(activeNote); await d.appendLine(activeNote, token); }
+          else { await d.createNote(activeNote, token); await d.open(activeNote); }
+          const back = await d.read(activeNote);
+          landed = (back.value ?? "").includes(token);
+          if (!landed) logger.log({ kind: "edit-unconfirmed", node: d.node, note: activeNote, token, attempt });
+        }
+        if (landed) {
+          logger.log({ kind: created ? "create" : "append", node: d.node, note: activeNote, token });
+          acked.push({ note: activeNote, node: d.node, token });
+        } else {
+          logger.log({ kind: "edit-failed", node: d.node, note: activeNote, token, attempts: MAX_ATTEMPTS });
+        }
         break;
       }
     }

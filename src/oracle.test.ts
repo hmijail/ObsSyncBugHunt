@@ -73,15 +73,15 @@ test("boundary guard: a token that is a prefix of a longer one is NOT a dup (Bug
   assert.equal(v.ok, true);
 });
 
-test("genuine duplication is still flagged (bracketed tokens)", () => {
-  const ack: AckedEdit[] = [{ note: NOTE, node: "n1", token: "[op-n1-1]" }];
-  const canonical = "base [op-n1-1]\nedit [op-n1-1]";
+test("genuine duplication is still flagged (parenthesized tokens)", () => {
+  const ack: AckedEdit[] = [{ note: NOTE, node: "n1", token: "(op-n1-1)" }];
+  const canonical = "(op-n1-1)\n(op-n1-1)";
   const obs: NodeObservation[] = [
     { node: "n1", note: NOTE, canonical, conflicts: [] },
     { node: "n2", note: NOTE, canonical, conflicts: [] },
   ];
   const v = checkNote(NOTE, ack, obs);
-  assert.equal(v.duplicated[0]?.token, "[op-n1-1]");
+  assert.equal(v.duplicated[0]?.token, "(op-n1-1)");
   assert.equal(v.duplicated[0]?.maxCount, 2);
   assert.equal(v.ok, false);
 });

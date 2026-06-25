@@ -258,26 +258,47 @@ if (!values["skip-host-check"] && !(await hostOnline())) {
   process.exit(2);
 }
 
-// Standard pre-run check: log each node's sync state + vault note count, and gate
-// the run on every node being reachable (otherwise the findings are logged and we
-// abort rather than soak against a bad baseline).
+// Standard pre-run check: log each node's sync state + vault note count, then gate
+// the run on a sane baseline — every node reachable AND agreeing on note count.
+// Otherwise the findings are logged and we abort rather than soak against a bad
+// baseline (which would manufacture false losses/divergence).
 async function preflight(): Promise<boolean> {
-  let ok = true;
+  const rows: { node: string; reachable: boolean; state: string; notes: number }[] = [];
   for (const d of drivers) {
     const st = await d.syncStatus();
     const state = st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "unreachable";
     const files = await d.listFiles();
     const notes = st.ok && files.ok ? (files.value?.length ?? 0) : -1;
     console.log(`preflight ${d.node}: status=${state} notes=${notes}`);
-    if (!st.ok) ok = false;
+    rows.push({ node: d.node, reachable: st.ok, state, notes });
   }
-  return ok;
+  // An unreachable node can't be soaked against at all.
+  if (rows.some((r) => !r.reachable)) {
+    console.log("preflight FAILED — a node is unreachable (is `make containers-up` done?). Aborting.");
+    return false;
+  }
+  // A node not `synced`/`syncing` (e.g. `error`) is a sick baseline — soaking on it
+  // just burns reps into -TIMEOUTs. Abort so it's recreated/healed first rather than
+  // silently degrading the run. (`syncing` is fine — it's mid-progress, not broken.)
+  const unhealthy = rows.filter((r) => r.state !== "synced" && r.state !== "syncing");
+  if (unhealthy.length > 0) {
+    console.log(`preflight UNHEALTHY: node(s) not synced/syncing (${unhealthy.map((r) => `${r.node}:${r.state}`).join(" ")}) — recreate with 'make containers-up' (or wait for recovery); aborting.`);
+    return false;
+  }
+  // A clean, synced baseline MUST converge. If reachable nodes disagree on note
+  // count, something is off (leftover conflict cruft, or a node not done syncing) —
+  // abort rather than blame Sync for the resulting phantom divergence. A node not yet
+  // `synced` is the usual cause, so name it.
+  if (new Set(rows.map((r) => r.notes)).size > 1) {
+    const detail = rows.map((r) => `${r.node}=${r.notes}`).join(" ");
+    const unsynced = rows.filter((r) => r.state !== "synced").map((r) => `${r.node}:${r.state}`);
+    console.log(`preflight DIVERGENT: nodes disagree on note count (${detail})${unsynced.length ? ` [not synced: ${unsynced.join(" ")}]` : ""} — run 'make clean-data' or wait for sync; aborting.`);
+    return false;
+  }
+  return true;
 }
 
-if (!(await preflight())) {
-  console.log("preflight FAILED — a node is unreachable (is `make containers-up` done?). Aborting.");
-  process.exit(2);
-}
+if (!(await preflight())) process.exit(2);
 
 if (historyArg) {
   await runHistoryReps(parse(historyArg));

@@ -55,8 +55,8 @@ function occurrences(haystack: string, needle: string): number {
   let count = 0;
   for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + needle.length)) {
     // Boundary guard: don't count a token that is only a prefix of a longer one
-    // (e.g. `op-n1-1` inside `op-n1-10`). Tokens are bracketed (`[op-…]`) so the
-    // trailing `]` already delimits them, but this keeps the count correct even if
+    // (e.g. `op-n1-1` inside `op-n1-10`). Tokens are parenthesized (`(op-…)`) so the
+    // trailing `)` already delimits them, but this keeps the count correct even if
     // the token format ever regresses to a bare, digit-terminated form.
     const after = haystack[i + needle.length];
     if (after === undefined || after < "0" || after > "9") count++;

@@ -8,7 +8,7 @@ test("isAbsentRead: empty / not-found read counts as absent (Bug B)", () => {
   assert.equal(isAbsentRead(""), true);
   assert.equal(isAbsentRead("   "), true);
   assert.equal(isAbsentRead('Error: File "286040-a" not found.'), true);
-  assert.equal(isAbsentRead("base [op-n1-1]"), false);
+  assert.equal(isAbsentRead("(op-n1-1)"), false);
 });
 
 test("isConflictFile matches the (Conflicted copy …) pattern", () => {
