@@ -75,12 +75,21 @@ for (const str of readdirSync(base)) {
   }
 }
 
-const line = (g: Group) =>
-  `reps=${g.reps} pass=${g.pass} fail=${g.fail}  LOST=${g.lost} (server-dropped=${g.serverDropped}, NEVER-REGISTERED=${g.neverRegistered})  ` +
-  `DUPL=${g.duplReps} DIFF=${g.diffReps} UNSYNCED=${g.unsyncedReps}  conflictReps=${g.conflictReps}  syncTimeouts=${g.timeouts}\n  convergenceSec: ${stats(g.conv)}`;
+// Only non-zero fields, lowercase, compact when there's nothing to flag.
+const line = (g: Group) => {
+  const parts = [`reps=${g.reps}`, `pass=${g.pass}`];
+  if (g.fail) parts.push(`fail=${g.fail}`);
+  if (g.lost) parts.push(`lost=${g.lost}(dropped=${g.serverDropped},unreg=${g.neverRegistered})`);
+  if (g.duplReps) parts.push(`dupl=${g.duplReps}`);
+  if (g.diffReps) parts.push(`diff=${g.diffReps}`);
+  if (g.unsyncedReps) parts.push(`unsynced=${g.unsyncedReps}`);
+  if (g.timeouts) parts.push(`timeouts=${g.timeouts}`);
+  if (g.conflictReps) parts.push(`conflicts=${g.conflictReps}`);
+  return parts.join(" ") + `\n  convergenceSec: ${stats(g.conv)}`;
+};
 
 console.log(`Analyzed ${overall.reps} reps from ${base}/ (${skipped} skipped/incomplete)\n`);
-for (const [str, g] of [...groups.entries()].sort((a, b) => b[1].lost - a[1].lost)) {
+for (const [str, g] of [...groups.entries()].sort((a, b) => (b[1].fail - a[1].fail) || (b[1].lost - a[1].lost))) {
   if (g.reps === 0) continue;
   console.log(`### ${str}\n  ${line(g)}`);
 }

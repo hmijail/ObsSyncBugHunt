@@ -18,11 +18,15 @@
 //   REPEAT       reps per history                          (default 10)
 //   CAMPAIGN     number of histories (<=0 = until killed) (default 1)
 //   DURATION_MIN run for N minutes instead of a count
+//   GENERATE     print N generated histories and exit (no nodes touched)
 //   POLL_SEC / MIN_FLOOR_SEC / CAP_SEC / W_SETTLE_SEC / FINAL_SETTLE_SEC   sync-wait tuning
+//
+// Prints a copy-pasteable invocation line, and mirrors all stdout to a timestamped
+// log under runs/.
 //
 //   npm run start
 
-import { existsSync, renameSync, readdirSync, statSync } from "node:fs";
+import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { PodmanExecutor } from "./exec.js";
@@ -57,6 +61,15 @@ const genParams: GenParams = {
   pauseProb: Number(process.env.PAUSE_PROB ?? 0),
   partitionProb: Number(process.env.PARTITION_PROB ?? 0),
 };
+// GENERATE=N: just print N generated histories and exit — no nodes, no host check.
+const generateN = Number(process.env.GENERATE ?? 0);
+if (generateN > 0) {
+  for (let i = 0; i < generateN; i++) {
+    console.log(serialize(scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams)));
+  }
+  process.exit(0);
+}
+
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(process.env.POLL_SEC ?? 1),
   minFloorSec: Number(process.env.MIN_FLOOR_SEC ?? 3),
@@ -69,11 +82,29 @@ const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bi
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
 
-console.log(
-  `nodes=${nodesList.join(",")} isolator=${isolatorKind} scenario=${scenario} ops=${ops.join("-")} ` +
-    `notes=${genParams.notes} turns=${genParams.turns} repeat=${repeat} ` +
-    (historyEnv ? `history=${historyEnv}` : `campaign=${campaign}`),
-);
+// Mirror all stdout to a timestamped log under runs/ so the console output (params
+// line, per-rep results, tally) is recoverable, not just live on the terminal.
+mkdirSync("runs", { recursive: true });
+const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+const slug = historyEnv ? "history" : `${turns}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
+const logPath = path.join("runs", `run-${stamp}-${slug}.log`);
+// Synchronous append so the tail (rep results, tally) survives process.exit().
+const rawLog = console.log.bind(console);
+console.log = (...args: unknown[]) => { const line = args.map(String).join(" "); rawLog(line); appendFileSync(logPath, line + "\n"); };
+
+// A copy-pasteable invocation that reproduces this run.
+const invocation = [
+  `NODES=${nodesList.join(",")}`,
+  isolatorKind !== "network" ? `ISOLATOR=${isolatorKind}` : "",
+  historyEnv ? `HISTORY=${historyEnv}` : `SCENARIO=${scenario} OPS=${ops.join("-")} NOTES=${genParams.notes} TURNS=${turns}`,
+  genParams.pauseProb ? `PAUSE_PROB=${genParams.pauseProb}` : "",
+  genParams.partitionProb ? `PARTITION_PROB=${genParams.partitionProb}` : "",
+  `REPEAT=${repeat}`,
+  durationMin > 0 ? `DURATION_MIN=${durationMin}` : `CAMPAIGN=${campaign}`,
+  "npm run start",
+].filter(Boolean).join(" ");
+console.log(invocation);
+console.log(`log: ${logPath}`);
 
 let pass = 0;
 let fail = 0;
@@ -82,7 +113,7 @@ const failures: string[] = [];
 const startedAt = Date.now();
 
 const tally = () =>
-  `\n=== TALLY: PASS=${pass} FAIL=${fail} run=${pass + fail}  (reps with any conflict: ${conflicts}) ===` +
+  `\n=== TALLY: PASS=${pass} FAIL=${fail} reps=${pass + fail}  (reps with any conflict: ${conflicts}) ===` +
   (failures.length ? "\nfailing reps:\n" + failures.map((f) => "  " + f).join("\n") : "");
 process.on("SIGINT", () => {
   console.log(tally());
@@ -154,7 +185,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   if (verdict.ok && !timings.unsynced && !timings.syncTimedOut) {
     pass++;
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
-    console.log(`  rep ${id}: PASS${tag} conv=${timings.convergenceSec}s`);
+    console.log(`  rep ${id}: PASS${tag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
   } else {
     fail++;
     // Ranked, most-severe-first: never-synced > inconclusive timeout > real loss >
@@ -171,7 +202,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     failures.push(dir);
     const dropped = forensics.filter((f) => f.serverRecoverable).length;
     const unregistered = forensics.length - dropped;
-    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) → ${path.basename(dir)}`);
+    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) total=${timings.totalSec}s → ${path.basename(dir)}`);
   }
 }
 
@@ -203,6 +234,27 @@ function hostOnline(host = "8.8.8.8", port = 53, timeoutMs = 4000): Promise<bool
 
 if (!flag(process.env.SKIP_HOST_CHECK) && !(await hostOnline())) {
   console.error("host appears OFFLINE (can't reach 8.8.8.8:53) — aborting so a host outage isn't mistaken for Sync loss. Set SKIP_HOST_CHECK=1 to override.");
+  process.exit(2);
+}
+
+// Standard pre-run check: log each node's sync state + vault note count, and gate
+// the run on every node being reachable (otherwise the findings are logged and we
+// abort rather than soak against a bad baseline).
+async function preflight(): Promise<boolean> {
+  let ok = true;
+  for (const d of drivers) {
+    const st = await d.syncStatus();
+    const state = st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "unreachable";
+    const files = await d.listFiles();
+    const notes = st.ok && files.ok ? (files.value?.length ?? 0) : -1;
+    console.log(`preflight ${d.node}: status=${state} notes=${notes}`);
+    if (!st.ok) ok = false;
+  }
+  return ok;
+}
+
+if (!(await preflight())) {
+  console.log("preflight FAILED — a node is unreachable (is `make up` done?). Aborting.");
   process.exit(2);
 }
 

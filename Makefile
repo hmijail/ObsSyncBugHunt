@@ -25,7 +25,7 @@ CAMPAIGN   ?= 20
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
-        build net secrets-dir scratch login capture node1 up solo-check run campaign soak analyze clean-notes trial down ps logs health clean
+        build net secrets-dir scratch login capture node1 up solo-check run campaign soak analyze generate clean-notes trial down ps logs health clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -133,6 +133,9 @@ soak: solo-check ## Run histories until stopped (Ctrl-C) for an overnight run; D
 
 analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)
 	npm run analyze
+
+generate: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB/SCENARIO)
+	GENERATE="$(or $(N),20)" npm run start
 
 clean-notes: solo-check ## Delete every note in the vault on all nodes for a clean baseline (nodes must be up)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run clean-notes
