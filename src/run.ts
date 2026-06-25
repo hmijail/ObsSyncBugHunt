@@ -2,33 +2,37 @@
 // against the containerized nodes, and tallies. Each history string is a
 // directory; each repeat is a sub-run named by epoch6. A non-OK rep dir is
 // suffixed -UNSYNCED / -TIMEOUT / -LOST / -DUPL / -DIFF, and a history dir gets
-// -BAD<pct> (share of non-OK reps). Env vars:
+// -BAD<pct> (share of non-OK reps).
 //
-//   NODES        comma-separated container names          (default "n1,n2")
-//   OBSIDIAN_BIN CLI path inside the container            (default "/opt/obsidian/obsidian-cli")
-//   ISOLATOR     "network" | "sync"                       (default "network")
-//   NETWORK      podman network                           (default "obsidian-net")
-//   HISTORY      run a specific DSL string (else generate)
-//   SCENARIO     "random" | "stale"                       (default "random")
-//   OPS          edit-count range "min-max"               (default "6-12")
-//   NOTES        distinct notes per history               (default 1)
-//   TURNS        barrier | paced | concurrent             (default barrier)
-//   PAUSE_PROB   chance of a ~10s pause after an edit      (default 0)
-//   PARTITION_PROB chance per edit of a network partition  (default 0; needs 2+ nodes)
-//   REPEAT       reps per history                          (default 10)
-//   HISTORIES    number of histories to run (<=0 = until killed) (default 1)
-//   DURATION_MIN run for N minutes instead of a count
-//   GENERATE     print N generated histories and exit (no nodes touched)
-//   POLL_SEC / MIN_FLOOR_SEC / CAP_SEC / W_SETTLE_SEC / FINAL_SETTLE_SEC   sync-wait tuning
+// Params are CLI args (args-only — env is not read). Use `make` (which maps
+// `make soak TURNS=paced` to the flags below), or run directly: `npm run start -- <flags>`.
 //
-// Prints a copy-pasteable invocation line, and mirrors all stdout to a timestamped
-// log under runs/.
+//   --nodes          comma-separated container names         (default n1,n2)
+//   --bin            CLI path inside the container           (default /opt/obsidian/obsidian-cli)
+//   --isolator       network | sync                          (default network)
+//   --network        podman network                          (default obsidian-net)
+//   --history        run a specific DSL string (else generate)
+//   --scenario       random | stale                          (default random)
+//   --ops            edit-count range "min-max"              (default 6-12)
+//   --notes          distinct notes per history              (default 1)
+//   --turns          barrier | paced | concurrent            (default barrier)
+//   --pause-prob     chance of a ~10s pause after an edit     (default 0)
+//   --partition-prob chance per edit of a network partition   (default 0; needs 2+ nodes)
+//   --repeat         reps per history                         (default 10)
+//   --histories      number of histories to run (<=0 = until killed) (default 1)
+//   --duration-min   run for N minutes instead of a count
+//   --generate       print N generated histories and exit (no nodes touched)
+//   --skip-host-check  skip the host-online preflight
+//   --poll-sec / --min-floor-sec / --cap-sec / --w-settle-sec / --final-settle-sec  sync-wait tuning
 //
-//   npm run start
+// Mirrors all stdout to a timestamped log under runs/ (invocation as its first line).
+//
+//   npm run start -- --turns paced --partition-prob 0.4
 
 import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { parseArgs } from "node:util";
 import { PodmanExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
@@ -37,46 +41,59 @@ import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, type History } from "./dsl.js";
 
-const flag = (v: string | undefined) => v === "1" || v === "true";
+const { values } = parseArgs({
+  options: {
+    nodes: { type: "string" },
+    bin: { type: "string" },
+    network: { type: "string" },
+    isolator: { type: "string" },
+    scenario: { type: "string" },
+    histories: { type: "string" },
+    repeat: { type: "string" },
+    "duration-min": { type: "string" },
+    history: { type: "string" },
+    ops: { type: "string" },
+    notes: { type: "string" },
+    turns: { type: "string" },
+    "pause-prob": { type: "string" },
+    "partition-prob": { type: "string" },
+    generate: { type: "string" },
+    "poll-sec": { type: "string" },
+    "min-floor-sec": { type: "string" },
+    "cap-sec": { type: "string" },
+    "w-settle-sec": { type: "string" },
+    "final-settle-sec": { type: "string" },
+    "skip-host-check": { type: "boolean" },
+  },
+});
 
-const nodesList = (process.env.NODES ?? "n1,n2").split(",").map((s) => s.trim());
-const bin = process.env.OBSIDIAN_BIN ?? "/opt/obsidian/obsidian-cli";
-const network = process.env.NETWORK ?? "obsidian-net";
-const isolatorKind = process.env.ISOLATOR ?? "network";
-const scenario = process.env.SCENARIO ?? "random";
-const histories = Number(process.env.HISTORIES ?? 1);
-const repeat = Number(process.env.REPEAT ?? 10);
-const durationMin = Number(process.env.DURATION_MIN ?? 0);
-const historyEnv = process.env.HISTORY;
+const nodesList = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
+const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
+const network = values.network ?? "obsidian-net";
+const isolatorKind = values.isolator ?? "network";
+const scenario = values.scenario ?? "random";
+const histories = Number(values.histories ?? 1);
+const repeat = Number(values.repeat ?? 10);
+const durationMin = Number(values["duration-min"] ?? 0);
+const historyArg = values.history;
 
-const opsRange = (process.env.OPS ?? "6-12").split("-").map(Number);
+const opsRange = (values.ops ?? "6-12").split("-").map(Number);
 const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
-const turnsEnv = process.env.TURNS ?? "barrier";
-const turns = (["barrier", "paced", "concurrent"].includes(turnsEnv) ? turnsEnv : "barrier") as Turns;
+const turnsArg = values.turns ?? "barrier";
+const turns = (["barrier", "paced", "concurrent"].includes(turnsArg) ? turnsArg : "barrier") as Turns;
 const genParams: GenParams = {
   nodes: nodesList.length,
   ops,
-  notes: Number(process.env.NOTES ?? 1),
+  notes: Number(values.notes ?? 1),
   turns,
-  pauseProb: Number(process.env.PAUSE_PROB ?? 0),
-  partitionProb: Number(process.env.PARTITION_PROB ?? 0),
+  pauseProb: Number(values["pause-prob"] ?? 0),
+  partitionProb: Number(values["partition-prob"] ?? 0),
 };
-// Copy-pasteable invocation that reproduces this run — includes the env vars make's
-// recipe echo can't show (TURNS, OPS, PARTITION_PROB, …). `tail` is the run-mode segment.
-const invocationLine = (tail: string) => [
-  `NODES=${nodesList.join(",")}`,
-  isolatorKind !== "network" ? `ISOLATOR=${isolatorKind}` : "",
-  historyEnv ? `HISTORY=${historyEnv}` : `SCENARIO=${scenario} OPS=${ops.join("-")} NOTES=${genParams.notes} TURNS=${turns}`,
-  genParams.pauseProb ? `PAUSE_PROB=${genParams.pauseProb}` : "",
-  genParams.partitionProb ? `PARTITION_PROB=${genParams.partitionProb}` : "",
-  tail,
-  "npm run start",
-].filter(Boolean).join(" ");
 
-// GENERATE=N: print the invocation, then N generated histories, and exit — no nodes, no host check.
-const generateN = Number(process.env.GENERATE ?? 0);
+// --generate N: print N generated histories and exit — no nodes, no host check.
+// (make echoes the full command; here we just emit the histories.)
+const generateN = Number(values.generate ?? 0);
 if (generateN > 0) {
-  console.log(invocationLine(`GENERATE=${generateN}`));
   for (let i = 0; i < generateN; i++) {
     console.log(serialize(scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams)));
   }
@@ -84,28 +101,29 @@ if (generateN > 0) {
 }
 
 const execBase: Omit<ExecuteOpts, "noteName"> = {
-  pollSec: Number(process.env.POLL_SEC ?? 1),
-  minFloorSec: Number(process.env.MIN_FLOOR_SEC ?? 3),
-  capSec: Number(process.env.CAP_SEC ?? 120),
-  wSettleSec: Number(process.env.W_SETTLE_SEC ?? 4),
-  finalSettleSec: Number(process.env.FINAL_SETTLE_SEC ?? 6),
+  pollSec: Number(values["poll-sec"] ?? 1),
+  minFloorSec: Number(values["min-floor-sec"] ?? 3),
+  capSec: Number(values["cap-sec"] ?? 120),
+  wSettleSec: Number(values["w-settle-sec"] ?? 4),
+  finalSettleSec: Number(values["final-settle-sec"] ?? 6),
 };
 
 const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
 
-// Mirror all stdout to a timestamped log under runs/ so the console output (params
-// line, per-rep results, tally) is recoverable, not just live on the terminal.
+// Mirror all stdout to a timestamped log under runs/ so the console output (per-rep
+// results, tally) is recoverable. The invocation is the log's first line (written to
+// the file only — make already echoes the same command on the terminal).
 mkdirSync("runs", { recursive: true });
 const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-const slug = historyEnv ? "history" : `${turns}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
+const slug = historyArg ? "history" : `${turns}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
 const logPath = path.join("runs", `run-${stamp}-${slug}.log`);
+appendFileSync(logPath, `npm run start -- ${process.argv.slice(2).join(" ")}\n`);
 // Synchronous append so the tail (rep results, tally) survives process.exit().
 const rawLog = console.log.bind(console);
 console.log = (...args: unknown[]) => { const line = args.map(String).join(" "); rawLog(line); appendFileSync(logPath, line + "\n"); };
 
-console.log(invocationLine(`REPEAT=${repeat} ` + (durationMin > 0 ? `DURATION_MIN=${durationMin}` : `HISTORIES=${histories}`)));
 console.log(`log: ${logPath}`);
 
 let pass = 0;
@@ -220,7 +238,7 @@ const keepGoing = (h: number) =>
   durationMin > 0 ? Date.now() - startedAt < durationMin * 60_000 : histories <= 0 ? true : h < histories;
 
 // Confirm the host itself has connectivity before blaming Sync for anything — a
-// host outage would otherwise masquerade as data loss. SKIP_HOST_CHECK=1 bypasses
+// host outage would otherwise masquerade as data loss. --skip-host-check bypasses
 // (e.g. a sandboxed environment that blocks outbound TCP).
 function hostOnline(host = "8.8.8.8", port = 53, timeoutMs = 4000): Promise<boolean> {
   return new Promise((resolve) => {
@@ -234,8 +252,8 @@ function hostOnline(host = "8.8.8.8", port = 53, timeoutMs = 4000): Promise<bool
   });
 }
 
-if (!flag(process.env.SKIP_HOST_CHECK) && !(await hostOnline())) {
-  console.error("host appears OFFLINE (can't reach 8.8.8.8:53) — aborting so a host outage isn't mistaken for Sync loss. Set SKIP_HOST_CHECK=1 to override.");
+if (!values["skip-host-check"] && !(await hostOnline())) {
+  console.error("host appears OFFLINE (can't reach 8.8.8.8:53) — aborting so a host outage isn't mistaken for Sync loss. Pass --skip-host-check to override.");
   process.exit(2);
 }
 
@@ -260,8 +278,8 @@ if (!(await preflight())) {
   process.exit(2);
 }
 
-if (historyEnv) {
-  await runHistoryReps(parse(historyEnv));
+if (historyArg) {
+  await runHistoryReps(parse(historyArg));
 } else {
   for (let h = 0; keepGoing(h); h++) {
     const history = scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams);

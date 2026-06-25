@@ -20,8 +20,29 @@ SECRETS    := $(CURDIR)/secrets/obsidian
 TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
-# Number of histories for `make campaign` (override: make campaign HISTORIES=50)
-HISTORIES  ?= 20
+
+NODES_CSV := $(shell echo $(NODES) | tr ' ' ',')
+# Knobs forwarded to the CLI. --nodes/--network always (structural); the rest only
+# when you set them — so make's recipe echo is the exact, copy-pasteable command and
+# shows precisely what you overrode (e.g. `make soak TURNS=paced` -> `… --turns paced`).
+RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
+  $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
+  $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
+  $(if $(SCENARIO),--scenario $(SCENARIO)) \
+  $(if $(HISTORY),--history $(HISTORY)) \
+  $(if $(OPS),--ops $(OPS)) \
+  $(if $(NOTES),--notes $(NOTES)) \
+  $(if $(TURNS),--turns $(TURNS)) \
+  $(if $(PAUSE_PROB),--pause-prob $(PAUSE_PROB)) \
+  $(if $(PARTITION_PROB),--partition-prob $(PARTITION_PROB)) \
+  $(if $(REPEAT),--repeat $(REPEAT)) \
+  $(if $(DURATION_MIN),--duration-min $(DURATION_MIN)) \
+  $(if $(SKIP_HOST_CHECK),--skip-host-check) \
+  $(if $(POLL_SEC),--poll-sec $(POLL_SEC)) \
+  $(if $(MIN_FLOOR_SEC),--min-floor-sec $(MIN_FLOOR_SEC)) \
+  $(if $(CAP_SEC),--cap-sec $(CAP_SEC)) \
+  $(if $(W_SETTLE_SEC),--w-settle-sec $(W_SETTLE_SEC)) \
+  $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC))
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
@@ -46,10 +67,10 @@ test: ## Run unit tests (the oracle)
 check: typecheck test ## Type-check + unit tests
 
 smoke: ## Probe the driver against a local throwaway vault (TEST_VAULT=...)
-	TEST_VAULT="$(TEST_VAULT)" npm run smoke
+	npm run smoke -- --vault $(TEST_VAULT)
 
 local: ## Single-node pipeline check against a local throwaway vault
-	TEST_VAULT="$(TEST_VAULT)" npm run local
+	npm run local -- --vault $(TEST_VAULT)
 
 # ---- containers ------------------------------------------------------------
 
@@ -122,25 +143,23 @@ solo-check:
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
-# run/campaign/soak/generate: @-silence make's recipe echo — run.ts prints the full
-# resolved invocation (incl. command-line env like TURNS that make's echo omits).
-run: solo-check ## Run ONE generated history (SCENARIO=random|stale OPS=min-max ISOLATOR=sync|network)
-	@NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run start
+run: solo-check ## Run ONE generated history (TURNS=... OPS=min-max SCENARIO=random|stale ISOLATOR=sync|network)
+	npm run start -- $(RUN_FLAGS)
 
-campaign: solo-check ## Run HISTORIES histories and tally the error rate (HISTORIES=N SCENARIO=... OPS=...)
-	@NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES="$(HISTORIES)" npm run start
+campaign: solo-check ## Run HISTORIES histories and tally the error rate (HISTORIES=N TURNS=... OPS=...)
+	npm run start -- --histories $(or $(HISTORIES),20) $(RUN_FLAGS)
 
 soak: solo-check ## Run histories until stopped (Ctrl-C) for an overnight run; DURATION_MIN=N for a fixed span
-	@NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES=0 npm run start
+	npm run start -- --histories 0 $(RUN_FLAGS)
 
 analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)
 	npm run analyze
 
 generate: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB/SCENARIO)
-	@GENERATE="$(or $(N),20)" npm run start
+	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
 
 clean-notes: solo-check ## Delete every note in the vault on all nodes for a clean baseline (nodes must be up)
-	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run clean-notes
+	npm run clean-notes -- --nodes $(NODES_CSV)
 
 clean-runs: ## Wipe local run results/logs (rm -rf runs/)
 	rm -rf runs

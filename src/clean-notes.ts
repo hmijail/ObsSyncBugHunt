@@ -2,14 +2,16 @@
 // the Obsidian CLI and letting Sync propagate the deletions (server + peers). Run
 // after `make containers-up` for a clean baseline so an accumulated vault doesn't skew a run.
 //
-//   npm run clean-notes        (NODES=n1,n2 by default)
+//   npm run clean-notes -- --nodes n1,n2
 
+import { parseArgs } from "node:util";
 import { PodmanExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { sleep } from "./runner.js";
 
-const nodes = (process.env.NODES ?? "n1,n2").split(",").map((s) => s.trim());
-const bin = process.env.OBSIDIAN_BIN ?? "/opt/obsidian/obsidian-cli";
+const { values } = parseArgs({ options: { nodes: { type: "string" }, bin: { type: "string" } } });
+const nodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
+const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const drivers = nodes.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));
 
 for (const d of drivers) await d.syncResume();

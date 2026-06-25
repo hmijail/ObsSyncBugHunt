@@ -111,7 +111,7 @@ src/
   clean-notes.ts empty the vault on all nodes (npm run clean-notes)
   smoke.ts       driver probe               (npm run smoke)
 containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
-Makefile         podman lifecycle: build -> login -> capture -> up -> run
+Makefile         podman lifecycle: build -> login -> capture -> containers-up -> run
 ```
 
 ## Running
@@ -138,23 +138,30 @@ snapshots), `results.json` (the verdict), and `meta.json`.
 
 ## Parameters
 
-All set via environment variables (`src/run.ts` holds the authoritative list):
+Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
 
-| env | default | meaning |
-|---|---|---|
-| `HISTORY` | *(generate)* | run a specific DSL string instead of generating |
-| `REPEAT` | 10 | repeats per history |
-| `HISTORIES` | 1 | number of histories to run (≤0 = until killed) |
-| `DURATION_MIN` | — | run for N minutes instead of a count — **checked only between histories**, so it finishes the current history's `REPEAT` reps first |
-| `SCENARIO` | `random` | `random` (generator) or `stale` (disconnect-pile-reconnect preset) |
-| `OPS` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer in the string |
-| `NOTES` | 1 | distinct notes per history (1 = max contention) |
-| `TURNS` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
-| `PAUSE_PROB` | 0 | chance of a ~10s pause after an edit |
-| `PARTITION_PROB` | 0 | chance per edit of a `D`…`C` network partition (needs 2+ nodes) |
-| `ISOLATOR` | `network` | `network` (partition) or `sync` (cooperative baseline) |
-| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
-| `POLL_SEC` / `MIN_FLOOR_SEC` / `CAP_SEC` / `W_SETTLE_SEC` / `FINAL_SETTLE_SEC` | 1 / 3 / 120 / 4 / 6 | sync-wait tuning (seconds) |
+- via make as `VAR=value` overrides — `make soak TURNS=paced` (make maps them to the flags
+  below and its recipe echo is the full, copy-pasteable `npm run start -- …` command);
+- directly — `npm run start -- --turns paced --partition-prob 0.4`.
+
+`src/run.ts` holds the defaults.
+
+| make var | CLI flag | default | meaning |
+|---|---|---|---|
+| `HISTORY` | `--history` | *(generate)* | run a specific DSL string instead of generating |
+| `REPEAT` | `--repeat` | 10 | repeats per history |
+| `HISTORIES` | `--histories` | 1 | number of histories to run (≤0 = until killed) |
+| `DURATION_MIN` | `--duration-min` | — | run for N minutes instead of a count — **checked only between histories** |
+| `SCENARIO` | `--scenario` | `random` | `random` (generator) or `stale` (disconnect-pile-reconnect preset) |
+| `OPS` | `--ops` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer |
+| `NOTES` | `--notes` | 1 | distinct notes per history (1 = max contention) |
+| `TURNS` | `--turns` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
+| `PAUSE_PROB` | `--pause-prob` | 0 | chance of a ~10s pause after an edit |
+| `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ nodes) |
+| `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
+| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
+| `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online preflight |
+| `POLL_SEC` … | `--poll-sec` `--min-floor-sec` `--cap-sec` `--w-settle-sec` `--final-settle-sec` | 1/3/120/4/6 | sync-wait tuning (seconds) |
 
 ## Future work
 

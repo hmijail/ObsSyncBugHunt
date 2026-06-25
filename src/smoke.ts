@@ -2,30 +2,32 @@
 // raw CLI output, so we can confirm the real formats of read/files/diff/history
 // before building parsers on them.
 //
-//   OBSIDIAN_BIN=/path/to/Obsidian TEST_VAULT="Throwaway" npm run smoke
+//   npm run smoke -- --vault Throwaway [--bin /path/to/Obsidian] [--settle-ms 10000]
 //
 // Requirements:
-//   - TEST_VAULT names a *throwaway* vault (never a real one).
+//   - --vault names a *throwaway* vault (never a real one).
 //   - Obsidian is running with that vault available (the CLI talks to the app).
 
+import { parseArgs } from "node:util";
 import { LocalExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import type { OpResult } from "./types.js";
 
+const { values } = parseArgs({ options: { vault: { type: "string" }, bin: { type: "string" }, "settle-ms": { type: "string" } } });
 const bin =
-  process.env.OBSIDIAN_BIN ??
+  values.bin ??
   "/Users/mija/Applications/Obsidian.app/Contents/MacOS/Obsidian";
-const vault = process.env.TEST_VAULT;
+const vault = values.vault;
 
 if (!vault) {
   console.error(
-    "Set TEST_VAULT to the name of a throwaway vault (never a real one).",
+    "Pass --vault <name> for a throwaway vault (never a real one).",
   );
   process.exit(2);
 }
 
 // Sync uploads aren't instant; wait before querying sync-version state.
-const settleMs = Number(process.env.SETTLE_MS ?? 10000);
+const settleMs = Number(values["settle-ms"] ?? 10000);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const drv = new ObsidianDriver(new LocalExecutor(bin));
