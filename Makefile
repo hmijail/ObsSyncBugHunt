@@ -122,20 +122,22 @@ solo-check:
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
+# run/campaign/soak/generate: @-silence make's recipe echo — run.ts prints the full
+# resolved invocation (incl. command-line env like TURNS that make's echo omits).
 run: solo-check ## Run ONE generated history (SCENARIO=random|stale OPS=min-max ISOLATOR=sync|network)
-	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run start
+	@NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run start
 
 campaign: solo-check ## Run HISTORIES histories and tally the error rate (HISTORIES=N SCENARIO=... OPS=...)
-	NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES="$(HISTORIES)" npm run start
+	@NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES="$(HISTORIES)" npm run start
 
 soak: solo-check ## Run histories until stopped (Ctrl-C) for an overnight run; DURATION_MIN=N for a fixed span
-	NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES=0 npm run start
+	@NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES=0 npm run start
 
 analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)
 	npm run analyze
 
 generate: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB/SCENARIO)
-	GENERATE="$(or $(N),20)" npm run start
+	@GENERATE="$(or $(N),20)" npm run start
 
 clean-notes: solo-check ## Delete every note in the vault on all nodes for a clean baseline (nodes must be up)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run clean-notes

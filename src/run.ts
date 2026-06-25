@@ -61,9 +61,22 @@ const genParams: GenParams = {
   pauseProb: Number(process.env.PAUSE_PROB ?? 0),
   partitionProb: Number(process.env.PARTITION_PROB ?? 0),
 };
-// GENERATE=N: just print N generated histories and exit — no nodes, no host check.
+// Copy-pasteable invocation that reproduces this run — includes the env vars make's
+// recipe echo can't show (TURNS, OPS, PARTITION_PROB, …). `tail` is the run-mode segment.
+const invocationLine = (tail: string) => [
+  `NODES=${nodesList.join(",")}`,
+  isolatorKind !== "network" ? `ISOLATOR=${isolatorKind}` : "",
+  historyEnv ? `HISTORY=${historyEnv}` : `SCENARIO=${scenario} OPS=${ops.join("-")} NOTES=${genParams.notes} TURNS=${turns}`,
+  genParams.pauseProb ? `PAUSE_PROB=${genParams.pauseProb}` : "",
+  genParams.partitionProb ? `PARTITION_PROB=${genParams.partitionProb}` : "",
+  tail,
+  "npm run start",
+].filter(Boolean).join(" ");
+
+// GENERATE=N: print the invocation, then N generated histories, and exit — no nodes, no host check.
 const generateN = Number(process.env.GENERATE ?? 0);
 if (generateN > 0) {
+  console.log(invocationLine(`GENERATE=${generateN}`));
   for (let i = 0; i < generateN; i++) {
     console.log(serialize(scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams)));
   }
@@ -92,18 +105,7 @@ const logPath = path.join("runs", `run-${stamp}-${slug}.log`);
 const rawLog = console.log.bind(console);
 console.log = (...args: unknown[]) => { const line = args.map(String).join(" "); rawLog(line); appendFileSync(logPath, line + "\n"); };
 
-// A copy-pasteable invocation that reproduces this run.
-const invocation = [
-  `NODES=${nodesList.join(",")}`,
-  isolatorKind !== "network" ? `ISOLATOR=${isolatorKind}` : "",
-  historyEnv ? `HISTORY=${historyEnv}` : `SCENARIO=${scenario} OPS=${ops.join("-")} NOTES=${genParams.notes} TURNS=${turns}`,
-  genParams.pauseProb ? `PAUSE_PROB=${genParams.pauseProb}` : "",
-  genParams.partitionProb ? `PARTITION_PROB=${genParams.partitionProb}` : "",
-  `REPEAT=${repeat}`,
-  durationMin > 0 ? `DURATION_MIN=${durationMin}` : `HISTORIES=${histories}`,
-  "npm run start",
-].filter(Boolean).join(" ");
-console.log(invocation);
+console.log(invocationLine(`REPEAT=${repeat} ` + (durationMin > 0 ? `DURATION_MIN=${durationMin}` : `HISTORIES=${histories}`)));
 console.log(`log: ${logPath}`);
 
 let pass = 0;
