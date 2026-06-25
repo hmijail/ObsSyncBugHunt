@@ -36,7 +36,10 @@ export class ObsidianDriver {
   // --- note mutations -------------------------------------------------------
 
   async createNote(name: string, content = ""): Promise<OpResult> {
-    const p = [`name=${name}`];
+    // The CLI's `name=` rejects "/", so a note inside a folder must be created via
+    // `path=` (with the .md extension). read/append/open/delete take `file=` with the
+    // folder path directly, so only creation needs the special-case.
+    const p = name.includes("/") ? [`path=${name}.md`] : [`name=${name}`];
     if (content) p.push(`content=${content}`);
     return this.wrap(await this.run("create", p));
   }

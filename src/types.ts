@@ -42,6 +42,13 @@ export function formatToken(t: EditToken): string {
   return `[op-${t.node}-${t.seq}]`;
 }
 
+/**
+ * Folder all harness notes live under, so the tester only ever creates/reads/deletes
+ * inside it — it can never disturb (or empty) a real, in-use vault. Cleanup is scoped
+ * to this folder for the same reason.
+ */
+export const NOTE_DIR = "bughunt";
+
 /** A server-side sync version, as listed by `diff filter=sync` (newest = 1). */
 export interface SyncVersion {
   version: number;

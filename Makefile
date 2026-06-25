@@ -158,13 +158,13 @@ analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-tim
 generate: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB/SCENARIO)
 	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
 
-clean-notes: solo-check ## Delete every note in the vault on all nodes for a clean baseline (nodes must be up)
+clean-notes: solo-check ## Delete the harness's notes (the bughunt/ folder only) on all nodes (nodes must be up)
 	npm run clean-notes -- --nodes $(NODES_CSV)
 
 clean-runs: ## Wipe local run results/logs (rm -rf runs/)
 	rm -rf runs
 
-clean-data: clean-notes ## Fresh slate for a soak: empty the vault (clean-notes) + wipe runs/ (nodes must be up)
+clean-data: clean-notes ## Fresh slate for a soak: clear the harness's notes (bughunt/) + wipe runs/ (nodes must be up)
 	rm -rf runs
 
 trial: containers-up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold

@@ -136,6 +136,10 @@ Per-run artifacts live in `runs/<history>/<epoch6>/`: `history.json` (the intend
 ops), `history.jsonl` (the timestamped execution trace, incl. `content-at-wait`
 snapshots), `results.json` (the verdict), and `meta.json`.
 
+**Vault safety:** every note the harness creates lives under a `bughunt/` folder, and
+`clean-notes`/`clean-data` only ever delete *inside* `bughunt/`. So even if pointed at a
+real, in-use vault, the tester never creates, edits, or removes your own notes.
+
 ## Parameters
 
 Params are **CLI args** (args-only — env vars aren't read). Set them two ways:

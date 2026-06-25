@@ -40,6 +40,7 @@ import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, type History } from "./dsl.js";
+import { NOTE_DIR } from "./types.js";
 
 const { values } = parseArgs({
   options: {
@@ -189,7 +190,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     ops: ops.join("-"),
     nodes: nodesList.length,
   });
-  const noteName = (L: string) => `${id}-${str}-${L}`;
+  const noteName = (L: string) => `${NOTE_DIR}/${id}-${str}-${L}`;
   const { verdict, timings, forensics } = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
 
   const lost = verdict.notes.flatMap((n) => n.lost);
