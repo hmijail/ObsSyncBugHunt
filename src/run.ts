@@ -13,7 +13,7 @@
 //   --network        podman network                          (default obsidian-net)
 //   --history        run a specific DSL string (else generate)
 //   --scenario       random | stale                          (default random)
-//   --ops            edit-count range "min-max"              (default 6-12)
+//   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
 //   --turns          barrier | paced | concurrent            (default barrier)
 //   --pause-prob     chance of a ~10s pause after an edit     (default 0)
@@ -30,7 +30,6 @@
 //   npm run start -- --turns paced --partition-prob 0.4
 
 import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync } from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { PodmanExecutor } from "./exec.js";
@@ -40,6 +39,8 @@ import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, type History } from "./dsl.js";
+import { sleep } from "./runner.js";
+import { hostOnline } from "./net.js";
 import { NOTE_DIR } from "./types.js";
 
 const { values } = parseArgs({
@@ -107,6 +108,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   capSec: Number(values["cap-sec"] ?? 120),
   wSettleSec: Number(values["w-settle-sec"] ?? 4),
   finalSettleSec: Number(values["final-settle-sec"] ?? 6),
+  hostCheck: !values["skip-host-check"], // on by default; --skip-host-check turns it off
 };
 
 const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));
@@ -238,61 +240,68 @@ async function runHistoryReps(history: History): Promise<void> {
 const keepGoing = (h: number) =>
   durationMin > 0 ? Date.now() - startedAt < durationMin * 60_000 : histories <= 0 ? true : h < histories;
 
-// Confirm the host itself has connectivity before blaming Sync for anything — a
-// host outage would otherwise masquerade as data loss. --skip-host-check bypasses
-// (e.g. a sandboxed environment that blocks outbound TCP).
-function hostOnline(host = "8.8.8.8", port = 53, timeoutMs = 4000): Promise<boolean> {
-  return new Promise((resolve) => {
-    const sock = new net.Socket();
-    const done = (ok: boolean) => { sock.destroy(); resolve(ok); };
-    sock.setTimeout(timeoutMs);
-    sock.once("connect", () => done(true));
-    sock.once("timeout", () => done(false));
-    sock.once("error", () => done(false));
-    sock.connect(port, host);
-  });
-}
-
+// Confirm the host itself has connectivity before blaming Sync for anything — a host
+// outage would otherwise masquerade as data loss. (`hostOnline` lives in net.ts so the
+// settle loop in execute.ts can reuse it.) --skip-host-check bypasses (e.g. a sandboxed
+// environment that blocks outbound TCP).
 if (!values["skip-host-check"] && !(await hostOnline())) {
   console.error("host appears OFFLINE (can't reach 8.8.8.8:53) — aborting so a host outage isn't mistaken for Sync loss. Pass --skip-host-check to override.");
   process.exit(2);
 }
 
-// Standard pre-run check: log each node's sync state + vault note count, then gate
-// the run on a sane baseline — every node reachable AND agreeing on note count.
-// Otherwise the findings are logged and we abort rather than soak against a bad
-// baseline (which would manufacture false losses/divergence).
+// Standard pre-run check: resume Sync, wait (bounded) for a settled baseline, then
+// gate the run on it being sane — every node reachable, `synced`, and agreeing on
+// note count. Otherwise we abort rather than soak against a bad baseline (which would
+// manufacture false losses/divergence).
+type PreflightRow = { node: string; reachable: boolean; state: string; notes: number };
+async function readState(d: ObsidianDriver): Promise<PreflightRow> {
+  const st = await d.syncStatus();
+  const state = st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "unreachable";
+  const files = await d.listFiles();
+  const notes = st.ok && files.ok ? (files.value?.length ?? 0) : -1;
+  return { node: d.node, reachable: st.ok, state, notes };
+}
+
 async function preflight(): Promise<boolean> {
-  const rows: { node: string; reachable: boolean; state: string; notes: number }[] = [];
-  for (const d of drivers) {
-    const st = await d.syncStatus();
-    const state = st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "unreachable";
-    const files = await d.listFiles();
-    const notes = st.ok && files.ok ? (files.value?.length ?? 0) : -1;
-    console.log(`preflight ${d.node}: status=${state} notes=${notes}`);
-    rows.push({ node: d.node, reachable: st.ok, state, notes });
+  // The harness always runs with Sync ON (network is the only isolation layer), and a
+  // fresh `make containers-up` brings nodes up with Sync PAUSED. Resume first — else a
+  // perfectly normal just-started node reads as "unhealthy" — then wait for it to
+  // settle before judging.
+  for (const d of drivers) await d.syncResume();
+
+  // Wait until every node is `synced` (or something is clearly wrong) before trusting
+  // a count comparison: during the initial sync, note counts legitimately differ.
+  const cap = execBase.capSec ?? 120;
+  const deadline = Date.now() + cap * 1000;
+  let rows = await Promise.all(drivers.map(readState));
+  while (
+    rows.every((r) => r.reachable) &&
+    !rows.some((r) => r.state === "error") &&
+    !rows.every((r) => r.state === "synced") &&
+    Date.now() < deadline
+  ) {
+    await sleep(2000);
+    rows = await Promise.all(drivers.map(readState));
   }
+  for (const r of rows) console.log(`preflight ${r.node}: status=${r.state} notes=${r.notes}`);
+
   // An unreachable node can't be soaked against at all.
   if (rows.some((r) => !r.reachable)) {
     console.log("preflight FAILED — a node is unreachable (is `make containers-up` done?). Aborting.");
     return false;
   }
-  // A node not `synced`/`syncing` (e.g. `error`) is a sick baseline — soaking on it
-  // just burns reps into -TIMEOUTs. Abort so it's recreated/healed first rather than
-  // silently degrading the run. (`syncing` is fine — it's mid-progress, not broken.)
-  const unhealthy = rows.filter((r) => r.state !== "synced" && r.state !== "syncing");
+  // A node that won't reach `synced` (stuck `error`, or still `syncing`/paused past the
+  // cap) is a sick baseline — soaking on it just burns reps into -TIMEOUTs. Abort so
+  // it's recreated/healed first rather than silently degrading the run.
+  const unhealthy = rows.filter((r) => r.state !== "synced");
   if (unhealthy.length > 0) {
-    console.log(`preflight UNHEALTHY: node(s) not synced/syncing (${unhealthy.map((r) => `${r.node}:${r.state}`).join(" ")}) — recreate with 'make containers-up' (or wait for recovery); aborting.`);
+    console.log(`preflight UNHEALTHY: node(s) not synced after ${cap}s (${unhealthy.map((r) => `${r.node}:${r.state}`).join(" ")}) — recreate with 'make containers-up' (or wait for recovery); aborting.`);
     return false;
   }
-  // A clean, synced baseline MUST converge. If reachable nodes disagree on note
-  // count, something is off (leftover conflict cruft, or a node not done syncing) —
-  // abort rather than blame Sync for the resulting phantom divergence. A node not yet
-  // `synced` is the usual cause, so name it.
+  // All synced now, so a note-count disagreement is real divergence, not lag.
   if (new Set(rows.map((r) => r.notes)).size > 1) {
     const detail = rows.map((r) => `${r.node}=${r.notes}`).join(" ");
-    const unsynced = rows.filter((r) => r.state !== "synced").map((r) => `${r.node}:${r.state}`);
-    console.log(`preflight DIVERGENT: nodes disagree on note count (${detail})${unsynced.length ? ` [not synced: ${unsynced.join(" ")}]` : ""} — run 'make clean-data' or wait for sync; aborting.`);
+    console.log(`preflight DIVERGENT: synced nodes disagree on note count (${detail}) — run 'make clean-data' or investigate; aborting.`);
     return false;
   }
   return true;

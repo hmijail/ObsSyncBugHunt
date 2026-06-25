@@ -14,6 +14,7 @@ import type { ObsidianDriver } from "./driver.js";
 import type { Isolator } from "./isolate.js";
 import type { RunLogger } from "./history.js";
 import { sleep, gatherObservation } from "./runner.js";
+import { hostOnline } from "./net.js";
 import {
   checkRun,
   sameConflictSet,
@@ -35,6 +36,12 @@ export interface ExecuteOpts {
   // check (relies entirely on the conflict-set equality to catch a late conflict file).
   wSettleSec?: number; // mid-history W: quiescent-for window (default 4)
   finalSettleSec?: number; // final settle: quiescent-for window (default 6)
+  // When the settle cap elapses, tell a Sync failure apart from a host-internet
+  // outage: if the host itself is offline, wait for connectivity to return and restart
+  // the window instead of recording a false timeout. Disabled by --skip-host-check —
+  // a sandbox with no outbound TCP would otherwise treat the cap as a permanent outage
+  // and wait forever. Default on.
+  hostCheck?: boolean;
 }
 
 export interface LostForensic {
@@ -115,7 +122,7 @@ async function waitForSynced(
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
-  const start = Date.now();
+  let start = Date.now();
   if (notes.length === 0 || drivers.length === 0) return { seconds: 0, timedOut: false, unsynced: false };
 
   const baseline = await readTotals(drivers, notes);
@@ -135,6 +142,19 @@ async function waitForSynced(
     const quietMs = now - lastChange;
     const elapsed = now - start;
     const done = converged && allSynced && quietMs >= settleMs && elapsed >= floorMs;
+    // Cap elapsed without quiescence. Before recording a Sync timeout, rule out a HOST
+    // outage: if the host can't reach the internet, the container can't sync for
+    // reasons that aren't Obsidian's. Wait for connectivity to return, then restart the
+    // settle window and keep waiting rather than logging a false timeout.
+    if (!done && elapsed > capMs && opts.hostCheck !== false && !(await hostOnline())) {
+      logger.log({ kind: "host-offline", waitingForHost: true, ...context });
+      while (!(await hostOnline())) await sleep(Math.max(pollMs, 2000));
+      logger.log({ kind: "host-online", resumed: true, ...context });
+      start = Date.now();
+      lastChange = start;
+      lastSig = null;
+      continue;
+    }
     const timedOut = !done && elapsed > capMs;
     if (done || timedOut) {
       const totals = await readTotals(drivers, notes);

@@ -72,7 +72,7 @@ Per repeat (a non-OK repeat's directory is suffixed):
 | `-DUPL` | a token is duplicated (nodes still converged) |
 | `-DIFF` | nodes disagree after settling |
 | `-UNSYNCED` | a note never reached the server (`sync:history total < 1`) |
-| `-TIMEOUT` | never reached quiescence — inconclusive |
+| `-TIMEOUT` | never reached quiescence within the cap — inconclusive (a host-internet outage doesn't count: the settle pauses until the host is back, then resumes) |
 
 A history directory is suffixed `-BAD<pct>` with the percentage of non-OK repeats,
 so a soak is eyeball-scannable for where to dig. `npm run analyze` aggregates it all.
@@ -177,14 +177,14 @@ Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
 | `HISTORIES` | `--histories` | 1 | number of histories to run (≤0 = until killed) |
 | `DURATION_MIN` | `--duration-min` | — | run for N minutes instead of a count — **checked only between histories** |
 | `SCENARIO` | `--scenario` | `random` | `random` (generator) or `stale` (disconnect-pile-reconnect preset) |
-| `OPS` | `--ops` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer |
+| `OPS` | `--ops` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer. A single number (`9`) fixes the count (same as `9-9`) |
 | `NOTES` | `--notes` | 1 | distinct notes per history (1 = max contention) |
 | `TURNS` | `--turns` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
 | `PAUSE_PROB` | `--pause-prob` | 0 | chance of a ~10s pause after an edit |
 | `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ nodes) |
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
 | `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
-| `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online preflight |
+| `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online checks: the startup preflight *and* the in-settle host-outage wait (set it where outbound TCP is blocked, else a stalled settle would wait forever) |
 | `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
 | `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
 | `CAP_SEC` | `--cap-sec` | 120 | hard ceiling on any single wait; exceeding it is a `-TIMEOUT` (inconclusive) |
