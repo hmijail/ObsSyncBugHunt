@@ -11,6 +11,7 @@
 import { parseArgs } from "node:util";
 import { LocalExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
+import { NOTE_DIR } from "./types.js";
 import type { OpResult } from "./types.js";
 
 const { values } = parseArgs({ options: { vault: { type: "string" }, bin: { type: "string" }, "settle-ms": { type: "string" } } });
@@ -31,7 +32,9 @@ const settleMs = Number(values["settle-ms"] ?? 10000);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const drv = new ObsidianDriver(new LocalExecutor(bin));
-const note = `smoke-${Date.now()}`;
+// Under bughunt/ like every other harness note, so a throwaway vault's own notes
+// are never touched (the final `delete permanent` only ever removes this one).
+const note = `${NOTE_DIR}/smoke-${Date.now()}`;
 
 function show(label: string, r: OpResult<unknown>) {
   console.log(`\n=== ${label}  (code=${r.raw.code}, ok=${r.ok}) ===`);

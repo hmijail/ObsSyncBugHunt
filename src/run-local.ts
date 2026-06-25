@@ -18,6 +18,7 @@ import { ObsidianDriver } from "./driver.js";
 import { NoopIsolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runDivergenceRound } from "./runner.js";
+import { NOTE_DIR } from "./types.js";
 
 const { values } = parseArgs({ options: { vault: { type: "string" }, bin: { type: "string" } } });
 const bin =
@@ -34,7 +35,7 @@ const driver = new ObsidianDriver(new LocalExecutor(bin, "local"));
 const logger = new RunLogger();
 
 const verdict = await runDivergenceRound([driver], new NoopIsolator(), logger, {
-  note: `local-${Date.now()}`,
+  note: `${NOTE_DIR}/local-${Date.now()}`,
   isolatedNode: "local",
   basePropagationMs: 30_000,
   quiescenceMs: 60_000,
