@@ -124,11 +124,11 @@ make install && make check        # install + typecheck + unit tests
 # two-node containers:
 make build && make login          # VNC in: enable CLI, link a TEST vault, "create conflict file"
 make capture                      # copy the login into ./secrets (git-ignored), not an image
-make up                           # launch n1 + n2 fresh
-make clean-notes                  # empty the vault for a clean baseline
+make containers-up                # launch n1 + n2 fresh
+make clean-data                   # fresh slate: empty the vault + wipe runs/
 
 make run HISTORY=N1EaAWN2A REPEAT=3      # one specific history
-make soak                                # generate + run until Ctrl-C (overnight)
+make soak TURNS=paced                    # generate + run until Ctrl-C (overnight)
 make analyze                             # aggregate runs/ into a report
 ```
 
@@ -144,7 +144,7 @@ All set via environment variables (`src/run.ts` holds the authoritative list):
 |---|---|---|
 | `HISTORY` | *(generate)* | run a specific DSL string instead of generating |
 | `REPEAT` | 10 | repeats per history |
-| `CAMPAIGN` | 1 | number of histories (≤0 = until killed) |
+| `HISTORIES` | 1 | number of histories to run (≤0 = until killed) |
 | `DURATION_MIN` | — | run for N minutes instead of a count — **checked only between histories**, so it finishes the current history's `REPEAT` reps first |
 | `SCENARIO` | `random` | `random` (generator) or `stale` (disconnect-pile-reconnect preset) |
 | `OPS` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer in the string |

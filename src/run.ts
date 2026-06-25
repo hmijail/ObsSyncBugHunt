@@ -16,7 +16,7 @@
 //   PAUSE_PROB   chance of a ~10s pause after an edit      (default 0)
 //   PARTITION_PROB chance per edit of a network partition  (default 0; needs 2+ nodes)
 //   REPEAT       reps per history                          (default 10)
-//   CAMPAIGN     number of histories (<=0 = until killed) (default 1)
+//   HISTORIES    number of histories to run (<=0 = until killed) (default 1)
 //   DURATION_MIN run for N minutes instead of a count
 //   GENERATE     print N generated histories and exit (no nodes touched)
 //   POLL_SEC / MIN_FLOOR_SEC / CAP_SEC / W_SETTLE_SEC / FINAL_SETTLE_SEC   sync-wait tuning
@@ -44,7 +44,7 @@ const bin = process.env.OBSIDIAN_BIN ?? "/opt/obsidian/obsidian-cli";
 const network = process.env.NETWORK ?? "obsidian-net";
 const isolatorKind = process.env.ISOLATOR ?? "network";
 const scenario = process.env.SCENARIO ?? "random";
-const campaign = Number(process.env.CAMPAIGN ?? 1);
+const histories = Number(process.env.HISTORIES ?? 1);
 const repeat = Number(process.env.REPEAT ?? 10);
 const durationMin = Number(process.env.DURATION_MIN ?? 0);
 const historyEnv = process.env.HISTORY;
@@ -100,7 +100,7 @@ const invocation = [
   genParams.pauseProb ? `PAUSE_PROB=${genParams.pauseProb}` : "",
   genParams.partitionProb ? `PARTITION_PROB=${genParams.partitionProb}` : "",
   `REPEAT=${repeat}`,
-  durationMin > 0 ? `DURATION_MIN=${durationMin}` : `CAMPAIGN=${campaign}`,
+  durationMin > 0 ? `DURATION_MIN=${durationMin}` : `HISTORIES=${histories}`,
   "npm run start",
 ].filter(Boolean).join(" ");
 console.log(invocation);
@@ -215,7 +215,7 @@ async function runHistoryReps(history: History): Promise<void> {
 }
 
 const keepGoing = (h: number) =>
-  durationMin > 0 ? Date.now() - startedAt < durationMin * 60_000 : campaign <= 0 ? true : h < campaign;
+  durationMin > 0 ? Date.now() - startedAt < durationMin * 60_000 : histories <= 0 ? true : h < histories;
 
 // Confirm the host itself has connectivity before blaming Sync for anything — a
 // host outage would otherwise masquerade as data loss. SKIP_HOST_CHECK=1 bypasses
@@ -254,7 +254,7 @@ async function preflight(): Promise<boolean> {
 }
 
 if (!(await preflight())) {
-  console.log("preflight FAILED — a node is unreachable (is `make up` done?). Aborting.");
+  console.log("preflight FAILED — a node is unreachable (is `make containers-up` done?). Aborting.");
   process.exit(2);
 }
 

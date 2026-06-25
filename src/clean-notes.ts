@@ -1,6 +1,6 @@
 // Maintenance one-off: empty the vault on every node by deleting all notes through
 // the Obsidian CLI and letting Sync propagate the deletions (server + peers). Run
-// after `make up` for a clean baseline so an accumulated vault doesn't skew a run.
+// after `make containers-up` for a clean baseline so an accumulated vault doesn't skew a run.
 //
 //   npm run clean-notes        (NODES=n1,n2 by default)
 

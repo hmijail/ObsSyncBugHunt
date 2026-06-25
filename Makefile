@@ -1,8 +1,8 @@
 # Single entry point for the Obsidian Sync tester.
 #
 #   Dev:        make install | typecheck | test | check | smoke | local
-#   Containers: make scratch -> (VNC login) -> capture -> up -> run   (then: down)
-#               (scratch wipes any prior login; or use build -> login directly)
+#   Containers: make login -> (VNC login) -> capture -> containers-up -> run  (then: containers-down)
+#               (clean-secrets wipes a prior login first; or use build -> login directly)
 #
 # Credentials are captured into ./secrets (git-ignored) and mounted into nodes
 # read-only — never baked into an image. Both nodes seed from the same login
@@ -20,12 +20,13 @@ SECRETS    := $(CURDIR)/secrets/obsidian
 TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
-# Number of histories for `make campaign` (override: make campaign CAMPAIGN=50)
-CAMPAIGN   ?= 20
+# Number of histories for `make campaign` (override: make campaign HISTORIES=50)
+HISTORIES  ?= 20
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
-        build net secrets-dir scratch login capture node1 up solo-check run campaign soak analyze generate clean-notes trial down ps logs health clean
+        build net secrets-dir clean-secrets login capture node1 containers-up solo-check run campaign soak analyze generate \
+        clean-runs clean-notes clean-data clean-images trial containers-down ps logs health
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -61,11 +62,10 @@ net:
 secrets-dir:
 	mkdir -p $(SECRETS)
 
-scratch: down ## Discard the captured login + all containers, then start a fresh Sync login
+clean-secrets: containers-down ## Wipe the captured login (./secrets) + login container (then: make login -> capture)
 	-podman rm -f $(LOGIN) 2>/dev/null || true
 	rm -rf $(SECRETS)
-	@echo "Wiped $(SECRETS) and all nodes. Starting a fresh login container…"
-	$(MAKE) login
+	@echo "Wiped $(SECRETS) and the login container. Next: make login && make capture"
 
 login: build net secrets-dir ## Start a VNC container for the one-time Sync login
 	-podman rm -f $(LOGIN) 2>/dev/null || true
@@ -85,7 +85,7 @@ capture: ## Copy the login out of the container into ./secrets, then stop it
 	  cp -a /root/.config/obsidian/. /secrets/config/ && \
 	  cp -a /root/vaults/TestVault/.obsidian/. /secrets/vault/'
 	podman rm -f $(LOGIN)
-	@echo "Captured login into $(SECRETS) (git-ignored). Next: make up"
+	@echo "Captured login into $(SECRETS) (git-ignored). Next: make containers-up"
 
 node1: build net ## Run a single node (n1) with VNC published, for inspection/debugging
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
@@ -95,7 +95,7 @@ node1: build net ## Run a single node (n1) with VNC published, for inspection/de
 	@scripts/wait-node.sh n1
 	@echo "n1 ready. Inspect via VNC: vnc://localhost:$(VNC_PORT) (password: obsidian)."
 
-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC published per node)
+containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC published per node)
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
 	@port=$(VNC_PORT); for n in $(NODES); do \
 	  podman rm -f $$n 2>/dev/null || true; \
@@ -113,23 +113,23 @@ solo-check:
 	@# running isn't one of the intended NODES.
 	@for c in $$(podman ps --filter network=$(NET) --format '{{.Names}}'); do \
 	  echo " $(NODES) " | grep -q " $$c " || { \
-	    echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make down')"; exit 1; }; \
+	    echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make containers-down')"; exit 1; }; \
 	done
 	@# Warn when reusing long-lived nodes (accumulated vault/conflict cruft can
-	@# skew a run); 'make up' recreates them fresh from the captured login.
+	@# skew a run); 'make containers-up' recreates them fresh from the captured login.
 	@for n in $(NODES); do \
 	  up=$$(podman ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
-	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make up' for a fresh start" || true; \
+	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
 run: solo-check ## Run ONE generated history (SCENARIO=random|stale OPS=min-max ISOLATOR=sync|network)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run start
 
-campaign: solo-check ## Run CAMPAIGN histories and tally the error rate (CAMPAIGN=N SCENARIO=... OPS=...)
-	NODES="$(shell echo $(NODES) | tr ' ' ',')" CAMPAIGN="$(CAMPAIGN)" npm run start
+campaign: solo-check ## Run HISTORIES histories and tally the error rate (HISTORIES=N SCENARIO=... OPS=...)
+	NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES="$(HISTORIES)" npm run start
 
 soak: solo-check ## Run histories until stopped (Ctrl-C) for an overnight run; DURATION_MIN=N for a fixed span
-	NODES="$(shell echo $(NODES) | tr ' ' ',')" CAMPAIGN=0 npm run start
+	NODES="$(shell echo $(NODES) | tr ' ' ',')" HISTORIES=0 npm run start
 
 analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)
 	npm run analyze
@@ -140,9 +140,15 @@ generate: ## Print N generated histories without running them (N=20; honours TUR
 clean-notes: solo-check ## Delete every note in the vault on all nodes for a clean baseline (nodes must be up)
 	NODES="$(shell echo $(NODES) | tr ' ' ',')" npm run clean-notes
 
-trial: up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
+clean-runs: ## Wipe local run results/logs (rm -rf runs/)
+	rm -rf runs
 
-down: ## Stop + remove n1/n2
+clean-data: clean-notes ## Fresh slate for a soak: empty the vault (clean-notes) + wipe runs/ (nodes must be up)
+	rm -rf runs
+
+trial: containers-up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
+
+containers-down: ## Stop + remove n1/n2
 	-@for n in $(NODES); do podman rm -f $$n 2>/dev/null || true; done
 
 ps: ## List containers on the test network
@@ -155,8 +161,8 @@ health: ## Print a node's liveness report + save its screenshot to ./_shot.png (
 	@podman exec $(NODE) /usr/local/bin/obsidian-healthcheck
 	@podman cp $(NODE):/var/log/obsidian-shot.png ./_shot.png && echo "screenshot -> ./_shot.png"
 
-clean: down ## Remove containers, image, network (keeps ./secrets)
+clean-images: containers-down ## Remove the node image + podman network (keeps ./secrets; use clean-secrets for that)
 	-podman rm -f $(LOGIN) 2>/dev/null || true
 	-podman rmi $(IMAGE) 2>/dev/null || true
 	-podman network rm $(NET) 2>/dev/null || true
-	@echo "Note: ./secrets kept. Remove it manually to discard the captured login."
+	@echo "Note: ./secrets kept. Run clean-secrets to discard the captured login."

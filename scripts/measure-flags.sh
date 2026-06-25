@@ -27,7 +27,7 @@ podman rm -f "$name" >/dev/null 2>&1 || true
 running=$(podman ps --filter "network=$net" --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
 if [ -n "$(echo "$running" | tr -d ' ')" ]; then
   echo "measure-flags: other node(s) running on $net: $running" >&2
-  echo "  stop them first (e.g. 'make down') so they can't confound the measurement." >&2
+  echo "  stop them first (e.g. 'make containers-down') so they can't confound the measurement." >&2
   exit 1
 fi
 
