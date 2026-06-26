@@ -122,7 +122,12 @@ const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId
 // results, tally) is recoverable. The invocation is the log's first line (written to
 // the file only — make already echoes the same command on the terminal).
 mkdirSync("runs", { recursive: true });
-const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+// Local-time stamp `YYYY-MM-DDTHH-MM-SS` — same clock as the local DDTHHMMSS used for
+// run dirs (see tsStamp), so the log name and dir names agree. (toISOString would be
+// UTC and drift from the dirs by the machine's offset.)
+const now = new Date();
+const z2 = (n: number) => String(n).padStart(2, "0");
+const stamp = `${now.getFullYear()}-${z2(now.getMonth() + 1)}-${z2(now.getDate())}T${z2(now.getHours())}-${z2(now.getMinutes())}-${z2(now.getSeconds())}`;
 const slug = historyArg ? "history" : `${turns}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
 const logPath = path.join("runs", `run-${stamp}-${slug}.log`);
 appendFileSync(logPath, `npm run start -- ${process.argv.slice(2).join(" ")}\n`);
@@ -141,7 +146,38 @@ const startedAt = Date.now();
 const tally = () =>
   `\n=== TALLY: PASS=${pass} FAIL=${fail} reps=${pass + fail}  (reps with any conflict: ${conflicts}) ===` +
   (failures.length ? "\nfailing reps:\n" + failures.map((f) => "  " + f).join("\n") : "");
+
+// Permanent bottom status bar, TTY only. We reserve the last terminal row with a VT100
+// scroll region (DECSTBM) so the scrolling trace never overwrites it, and repaint the
+// row with the running tally as it changes. Escapes go straight to stdout (not through
+// the console.log override) so they never reach the run-log file. All no-ops when stdout
+// isn't a terminal (piped / background), leaving only the per-rep tally line.
+const isTTY = process.stdout.isTTY === true;
+const statusLine = () =>
+  `soak: ${pass + fail} reps · ${fail} failed · ${pass} passed` +
+  (failures.length ? ` · last ${path.basename(failures[failures.length - 1])}` : "");
+function drawStatus(): void {
+  const rows = process.stdout.rows ?? 0;
+  if (!isTTY || rows < 2) return;
+  // save cursor, go to last row, clear it, reverse-video line, restore cursor
+  process.stdout.write(`\x1b7\x1b[${rows};1H\x1b[2K\x1b[7m ${statusLine()} \x1b[0m\x1b8`);
+}
+function statusBarOn(): void {
+  const rows = process.stdout.rows ?? 0;
+  if (!isTTY || rows < 2) return;
+  process.stdout.write(`\x1b[1;${rows - 1}r\x1b[${rows - 1};1H`); // reserve last row, cursor above it
+  drawStatus();
+}
+function statusBarOff(): void {
+  const rows = process.stdout.rows ?? 0;
+  if (!isTTY || rows < 2) return;
+  process.stdout.write(`\x1b[r\x1b[${rows};1H\x1b[2K`); // release scroll region, clear the bar
+}
+if (isTTY) process.stdout.on("resize", statusBarOn); // re-reserve on terminal resize
+process.on("exit", statusBarOff);
+
 process.on("SIGINT", () => {
+  statusBarOff();
   console.log(tally());
   process.exit(fail === 0 ? 0 : 1);
 });
@@ -180,6 +216,8 @@ function tagHistoryDir(strDir: string, groupName: string): void {
 
 async function runRep(history: History, str: string, strDir: string): Promise<void> {
   const id = uniqueRepId(strDir);
+  console.log(`  rep ${id}  (running: ${fail}/${pass + fail} failed)`);
+  drawStatus();
   const logger = new RunLogger(strDir, id);
   logger.artifact("meta.json", {
     history: str,
@@ -226,6 +264,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     const unregistered = forensics.length - dropped;
     console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) total=${timings.totalSec}s → ${path.basename(dir)}`);
   }
+  drawStatus(); // refresh the bar with the updated tally
 }
 
 async function runHistoryReps(history: History): Promise<void> {
@@ -311,15 +350,23 @@ async function preflight(): Promise<boolean> {
 
 if (!(await preflight())) process.exit(2);
 
+statusBarOn(); // reserve the bottom status row (TTY only) now that the trace starts in earnest
+
 if (historyArg) {
-  // A given history runs once by default, or loops under the same keepGoing gate as
-  // the generator (so `make soak HISTORY=X` runs it forever, `DURATION_MIN=N` for a
-  // span). `--steps N` truncates it to its first N ops — a prefix, for shrinking a
-  // finding one step at a time (the final settle still reconnects any node left
-  // partitioned by the cut).
+  // A given history accrues ALL its reps in ONE group dir. `make run` does REPEAT reps;
+  // `make soak HISTORY=X` (histories<=0) or DURATION_MIN loops reps INTO THAT SAME dir
+  // until stopped — not a fresh dir per batch. `--steps N` truncates the history to its
+  // first N ops (a prefix, for shrinking a finding); the final settle still reconnects
+  // any node left partitioned by the cut.
   let hist = parse(historyArg);
   if (steps > 0) hist = hist.slice(0, steps);
-  for (let h = 0; keepGoing(h); h++) await runHistoryReps(hist);
+  const str = serialize(hist);
+  const groupName = `${tsStamp()}-${str}`;
+  const strDir = path.join("runs", groupName);
+  const soaking = histories <= 0 || durationMin > 0;
+  console.log(`\n=== history ${str}  ${soaking ? "(soaking — stop to end)" : `(×${repeat})`} ===`);
+  for (let r = 0; soaking ? keepGoing(r) : r < repeat; r++) await runRep(hist, str, strDir);
+  tagHistoryDir(strDir, groupName);
 } else {
   for (let h = 0; keepGoing(h); h++) {
     const history = scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams);
