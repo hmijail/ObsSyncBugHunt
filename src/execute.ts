@@ -29,11 +29,11 @@ export interface ExecuteOpts {
   pollSec?: number; // observation poll cadence (default 1)
   minFloorSec?: number; // observe at least this long (catches slow-to-start syncs after C; default 3)
   capSec?: number; // soft cap on a wait (default 120)
-  // Done = every node reports `synced` AND the full observed state (canonical +
-  // conflict-file set) is converged AND has held for the settle window. The `synced`
-  // gate means the window only has to absorb a just-lagging conflict file, not stand
-  // in for "Sync is idle", so it can be short. Set to 0 for a pure synced+converged
-  // check (relies entirely on the conflict-set equality to catch a late conflict file).
+  // Settled = every node reports `synced` AND the observed state has been unchanged
+  // for this window. Convergence is judged separately by the oracle, so a stable but
+  // divergent state finishes here (as `-DIFF`) instead of waiting out the cap. The
+  // window absorbs a just-lagging conflict file; keep it short since `synced` already
+  // means "Sync is idle".
   wSettleSec?: number; // mid-history W: quiescent-for window (default 4)
   finalSettleSec?: number; // final settle: quiescent-for window (default 6)
   // When the settle cap elapses, tell a Sync failure apart from a host-internet
@@ -57,20 +57,6 @@ export interface RunResult {
   observations: NodeObservation[];
   timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean };
   forensics: LostForensic[];
-}
-
-/** Every node agrees (canonical + conflict set) on every note → converged. */
-function notesConverged(notes: string[], obs: NodeObservation[]): boolean {
-  for (const note of notes) {
-    const o = obs.filter((x) => x.note === note);
-    const first = o[0];
-    if (!first) continue;
-    for (const x of o.slice(1)) {
-      if ((x.canonical ?? null) !== (first.canonical ?? null)) return false;
-      if (!sameConflictSet(x.conflicts, first.conflicts)) return false;
-    }
-  }
-  return true;
 }
 
 async function readTotals(drivers: ObsidianDriver[], notes: string[]): Promise<Record<string, number>> {
@@ -102,13 +88,17 @@ async function syncState(d: ObsidianDriver): Promise<string> {
 }
 
 /**
- * Wait until the vault is genuinely quiescent for `notes` across `drivers`: every
- * node reports `synced` (Sync's own "idle" signal), the full observed state (each
- * node's canonical content AND conflict-file set) is converged across nodes, and
- * that has held for `settleSec`. The `synced` gate lets the window stay short while
- * still not judging mid-sync; a late conflict file is a content change that resets
- * the window. `minFloorSec` guards the just-after-connect case where a sync hasn't
- * started yet. No blind dwell — this is the explicit wait.
+ * Wait until the vault has SETTLED for `notes` across `drivers`: every node reports
+ * `synced` (Sync's own "idle" signal) AND the full observed state (each node's
+ * canonical content AND conflict-file set) has been unchanged for `settleSec`.
+ * Crucially, settling does NOT require the nodes to AGREE — a stable disagreement
+ * (e.g. a conflict file that only ever lands on one node, both nodes calling
+ * themselves synced) is a real divergence for the oracle to judge as `-DIFF`, not
+ * something to wait out to the cap (which would mislabel it `-TIMEOUT`). The quiet
+ * window means we never stop mid-propagation; `minFloorSec` guards the just-after-
+ * connect case where a sync hasn't started yet. No blind dwell — this is the explicit
+ * wait. Only a node that never reaches `synced`, or content that never stops changing,
+ * actually times out.
  */
 async function waitForSynced(
   drivers: ObsidianDriver[],
@@ -134,14 +124,15 @@ async function waitForSynced(
     const now = Date.now();
     if (sig !== lastSig) { lastSig = sig; lastChange = now; }
 
-    const converged = notesConverged(notes, obs);
-    // Only consult Sync's own signal once content agrees, to avoid polling status
-    // during active propagation: finish when every node reports `synced` AND the
-    // converged state has held for the (now short) window.
-    const allSynced = converged && (await Promise.all(drivers.map(syncState))).every((s) => s === "synced");
+    // Settled = every node reports `synced` AND the observed state (canonical +
+    // conflict sets) has been quiet for the window. Convergence is NOT required —
+    // a stable, synced disagreement is a real `-DIFF` the oracle should judge, not
+    // something to wait out to the cap. The quiet window means we never stop mid-
+    // propagation; floorMs covers the just-after-connect gap before a sync starts.
+    const everySynced = (await Promise.all(drivers.map(syncState))).every((s) => s === "synced");
     const quietMs = now - lastChange;
     const elapsed = now - start;
-    const done = converged && allSynced && quietMs >= settleMs && elapsed >= floorMs;
+    const done = everySynced && quietMs >= settleMs && elapsed >= floorMs;
     // Cap elapsed without quiescence. Before recording a Sync timeout, rule out a HOST
     // outage: if the host can't reach the internet, the container can't sync for
     // reasons that aren't Obsidian's. Wait for connectivity to return, then restart the

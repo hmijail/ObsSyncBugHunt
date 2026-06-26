@@ -12,6 +12,7 @@
 //   --isolator       network | sync                          (default network)
 //   --network        podman network                          (default obsidian-net)
 //   --history        run a specific DSL string (else generate)
+//   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --scenario       random | stale                          (default random)
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
@@ -54,6 +55,7 @@ const { values } = parseArgs({
     repeat: { type: "string" },
     "duration-min": { type: "string" },
     history: { type: "string" },
+    steps: { type: "string" },
     ops: { type: "string" },
     notes: { type: "string" },
     turns: { type: "string" },
@@ -78,6 +80,7 @@ const histories = Number(values.histories ?? 1);
 const repeat = Number(values.repeat ?? 10);
 const durationMin = Number(values["duration-min"] ?? 0);
 const historyArg = values.history;
+const steps = Number(values.steps ?? 0); // with --history: run only its first N ops (0 = all)
 
 const opsRange = (values.ops ?? "6-12").split("-").map(Number);
 const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
@@ -309,7 +312,14 @@ async function preflight(): Promise<boolean> {
 if (!(await preflight())) process.exit(2);
 
 if (historyArg) {
-  await runHistoryReps(parse(historyArg));
+  // A given history runs once by default, or loops under the same keepGoing gate as
+  // the generator (so `make soak HISTORY=X` runs it forever, `DURATION_MIN=N` for a
+  // span). `--steps N` truncates it to its first N ops — a prefix, for shrinking a
+  // finding one step at a time (the final settle still reconnects any node left
+  // partitioned by the cut).
+  let hist = parse(historyArg);
+  if (steps > 0) hist = hist.slice(0, steps);
+  for (let h = 0; keepGoing(h); h++) await runHistoryReps(hist);
 } else {
   for (let h = 0; keepGoing(h); h++) {
     const history = scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams);

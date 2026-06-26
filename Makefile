@@ -37,6 +37,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
   $(if $(SCENARIO),--scenario $(SCENARIO)) \
   $(if $(HISTORY),--history $(HISTORY)) \
+  $(if $(STEPS),--steps $(STEPS)) \
   $(if $(OPS),--ops $(OPS)) \
   $(if $(NOTES),--notes $(NOTES)) \
   $(if $(TURNS),--turns $(TURNS)) \
@@ -157,13 +158,13 @@ solo-check:
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
-run: solo-check ## Run ONE generated history (TURNS=... OPS=min-max SCENARIO=random|stale ISOLATOR=sync|network)
+run: solo-check ## Run ONE history: generated, or HISTORY=<dsl> (REPEAT=N; STEPS=K runs only its first K ops)
 	npm run start -- $(RUN_FLAGS)
 
 campaign: solo-check ## Run HISTORIES histories and tally the error rate (HISTORIES=N TURNS=... OPS=...)
 	npm run start -- --histories $(or $(HISTORIES),20) $(RUN_FLAGS)
 
-soak: solo-check ## Run histories until stopped (Ctrl-C) for an overnight run; DURATION_MIN=N for a fixed span
+soak: solo-check ## Run until stopped (Ctrl-C); DURATION_MIN=N for a fixed span. HISTORY=<dsl> soaks that one history
 	npm run start -- --histories 0 $(RUN_FLAGS)
 
 analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)

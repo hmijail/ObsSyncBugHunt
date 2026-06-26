@@ -70,9 +70,9 @@ Per repeat (a non-OK repeat's directory is suffixed):
 | *(none)* | PASS |
 | `-LOST` | an acknowledged edit is gone |
 | `-DUPL` | a token is duplicated (nodes still converged) |
-| `-DIFF` | nodes disagree after settling |
+| `-DIFF` | nodes **settled** (all `synced`, state quiet) but disagree — different canonical, or a conflict file only one node holds |
 | `-UNSYNCED` | a note never reached the server (`sync:history total < 1`) |
-| `-TIMEOUT` | never reached quiescence within the cap — inconclusive (a host-internet outage doesn't count: the settle pauses until the host is back, then resumes) |
+| `-TIMEOUT` | never even settled within the cap — a node never reached `synced`, or content kept changing; inconclusive (a host-internet outage doesn't count: the settle pauses until the host is back, then resumes) |
 
 A history directory is suffixed `-BAD<pct>` with the percentage of non-OK repeats,
 so a soak is eyeball-scannable for where to dig. `npm run analyze` aggregates it all.
@@ -141,6 +141,7 @@ make containers-up                # launch n1 + n2 fresh
 make clean-data                   # fresh slate: empty the vault + wipe runs/
 
 make run HISTORY=N1EaAWN2A REPEAT=3      # one specific history
+make soak HISTORY=N1EaAWN2A              # soak ONE history forever (Ctrl-C); add STEPS=K for a prefix
 make soak TURNS=paced                    # generate + run until Ctrl-C (overnight)
 make analyze                             # aggregate runs/ into a report
 ```
@@ -176,6 +177,7 @@ Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
 | make var | CLI flag | default | meaning |
 |---|---|---|---|
 | `HISTORY` | `--history` | *(generate)* | run a specific DSL string instead of generating |
+| `STEPS` | `--steps` | — | with `HISTORY`: run only its first N **ops** (a prefix — for shrinking a finding one step at a time) |
 | `REPEAT` | `--repeat` | 10 | repeats per history |
 | `HISTORIES` | `--histories` | 1 | number of histories to run (≤0 = until killed) |
 | `DURATION_MIN` | `--duration-min` | — | run for N minutes instead of a count — **checked only between histories** |
