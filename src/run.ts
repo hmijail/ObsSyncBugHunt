@@ -143,9 +143,16 @@ process.on("SIGINT", () => {
   process.exit(fail === 0 ? 0 : 1);
 });
 
-const epoch6 = () => String(Math.floor(Date.now() / 1000)).slice(-6);
+// Human-readable wall-clock stamp DDTHHMMSS (local time), e.g. 25T181530 — used for
+// the history group dir (start ts) and each rep dir (its own ts). Day-of-month is
+// enough granularity for a soak; collisions within a dir get a -k suffix.
+const tsStamp = () => {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+};
 function uniqueRepId(strDir: string): string {
-  const base = epoch6();
+  const base = tsStamp();
   let name = base;
   for (let k = 2; existsSync(path.join(strDir, name)); k++) name = `${base}-${k}`;
   return name;
@@ -156,26 +163,15 @@ const FAIL_SUFFIXES = ["-UNSYNCED", "-TIMEOUT", "-LOST", "-DUPL", "-DIFF", "-FAI
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(s));
 
-/** Re-runs fold an existing `runs/<str>-BAD<pct>` back to the clean `runs/<str>`
- *  so new reps accumulate and the percentage is recomputed over the full set. */
-function cleanStrDir(str: string): string {
-  const clean = path.join("runs", str);
-  if (!existsSync(clean) && existsSync("runs")) {
-    const re = new RegExp(`^${str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-BAD\\d+$`);
-    const prev = readdirSync("runs").find((d) => re.test(d) && isDir(path.join("runs", d)));
-    if (prev) renameSync(path.join("runs", prev), clean);
-  }
-  return clean;
-}
-
 /** After a history's reps, suffix the history dir with `-BAD<pct>` (percentage of
- *  non-OK reps) so it's eyeball-obvious where to dig; leave it clean if all passed. */
-function tagHistoryDir(strDir: string, str: string): void {
+ *  non-OK reps) so it's eyeball-obvious where to dig; leave it clean if all passed.
+ *  `groupName` is the dir's base name (`<ts0>-<history>`) so the suffix lands on it. */
+function tagHistoryDir(strDir: string, groupName: string): void {
   if (!isDir(strDir)) return;
   const reps = readdirSync(strDir).filter((d) => isDir(path.join(strDir, d)));
   if (reps.length === 0) return;
   const bad = reps.filter(isBadRep).length;
-  const target = bad > 0 ? path.join("runs", `${str}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
+  const target = bad > 0 ? path.join("runs", `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
   if (target !== strDir) { try { renameSync(strDir, target); } catch { /* keep */ } }
 }
 
@@ -192,7 +188,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     ops: ops.join("-"),
     nodes: nodesList.length,
   });
-  const noteName = (L: string) => `${NOTE_DIR}/${id}-${str}-${L}`;
+  const noteName = (L: string) => `${NOTE_DIR}/${id}-${L}-${str}`;
   const { verdict, timings, forensics } = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
 
   const lost = verdict.notes.flatMap((n) => n.lost);
@@ -231,10 +227,13 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
 
 async function runHistoryReps(history: History): Promise<void> {
   const str = serialize(history);
-  const strDir = cleanStrDir(str);
+  // Group dir carries the history's start ts, so each invocation is its own timestamped
+  // dir (re-runs don't merge); rep subdirs inside carry their own ts.
+  const groupName = `${tsStamp()}-${str}`;
+  const strDir = path.join("runs", groupName);
   console.log(`\n=== history ${str}  (×${repeat}) ===`);
   for (let r = 0; r < repeat; r++) await runRep(history, str, strDir);
-  tagHistoryDir(strDir, str);
+  tagHistoryDir(strDir, groupName);
 }
 
 const keepGoing = (h: number) =>

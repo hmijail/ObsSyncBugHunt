@@ -145,16 +145,19 @@ make soak TURNS=paced                    # generate + run until Ctrl-C (overnigh
 make analyze                             # aggregate runs/ into a report
 ```
 
-Per-run artifacts live in `runs/<history>/<epoch6>/`: `history.json` (the intended
+Per-run artifacts live in `runs/<ts>-<history>/<repTs>/`: `history.json` (the intended
 ops), `history.jsonl` (the timestamped execution trace, incl. `content-at-wait`
-snapshots), `results.json` (the verdict), and `meta.json`.
+snapshots), `results.json` (the verdict), and `meta.json`. The group dir's `<ts>` is
+when that history *started*; each repeat is a `<repTs>` subdir.
 
-The notes a run creates are named `bughunt/<epoch6>-<history>-<letter>` — e.g.
-`bughunt/393937-N1EaAN2WA-a.md`. `<epoch6>` is the last 6 digits of the Unix second:
-the per-repeat id that keeps each repeat's notes distinct (a `-2` is appended on the
-rare same-second collision). `<history>` is the DSL string, and the trailing
-`-<letter>` is the DSL note letter the concrete note maps to (the target of `Ea`), so
-a multi-note history (`NOTES>1`) yields `…-a`, `…-b`, … side by side.
+Timestamps are `DDTHHMMSS` — day-of-month, `T`, then hours/minutes/seconds, local time
+(e.g. `26T181530`); a `-2` is appended on the rare same-second collision within a dir.
+
+The notes a run creates are named `bughunt/<repTs>-<letter>-<history>` — e.g.
+`bughunt/26T181530-a-N1EaAN2WA.md`. `<repTs>` is the repeat's timestamp (keeps each
+repeat's notes distinct), the trailing `-<history>` is the DSL string, and `-<letter>`
+is the DSL note letter the concrete note maps to (the target of `Ea`), so a multi-note
+history (`NOTES>1`) yields `…-a-…`, `…-b-…`, … side by side.
 
 **Vault safety:** every note the harness creates lives under a `bughunt/` folder, and
 `clean-notes`/`clean-data` only ever delete *inside* `bughunt/`. So even if pointed at a

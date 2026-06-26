@@ -21,6 +21,13 @@ TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
 
+# Bound podman calls in solo-check so a wedged podman API fails fast with a hint
+# instead of hanging silently. Uses `timeout` (or `gtimeout` from coreutils on macOS)
+# when available; the guard is a no-op otherwise. Override the budget: PODMAN_TIMEOUT=20
+PODMAN_TIMEOUT ?= 10
+TIMEOUT_BIN := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
+PODMAN_GUARD := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) $(PODMAN_TIMEOUT))
+
 NODES_CSV := $(shell echo $(NODES) | tr ' ' ',')
 # Knobs forwarded to the CLI. --nodes/--network always (structural); the rest only
 # when you set them — so make's recipe echo is the exact, copy-pasteable command and
@@ -129,17 +136,24 @@ containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC publi
 	@echo "nodes ready: $(NODES). VNC from localhost:$(VNC_PORT) (password: obsidian). Then: make run"
 
 solo-check:
+	@echo "solo-check: inspecting containers on $(NET)…$(if $(PODMAN_GUARD),, (no 'timeout' found — install coreutils for a hang guard))"
 	@# Isolation guard: every node shares the same cloned Sync login, so a stray
-	@# container on the test network would confound the run. Abort if anything
-	@# running isn't one of the intended NODES.
-	@for c in $$(podman ps --filter network=$(NET) --format '{{.Names}}'); do \
-	  echo " $(NODES) " | grep -q " $$c " || { \
-	    echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make containers-down')"; exit 1; }; \
-	done
+	@# container on the test network would confound the run. Abort if anything running
+	@# isn't one of the intended NODES. The podman call is time-bounded ($(PODMAN_GUARD))
+	@# so a wedged podman API fails fast with a hint instead of hanging silently.
+	@names=$$($(PODMAN_GUARD) podman ps --filter network=$(NET) --format '{{.Names}}'); rc=$$?; \
+	  if [ $$rc -eq 124 ]; then \
+	    echo "podman unresponsive (timed out after $(PODMAN_TIMEOUT)s) — the machine may be wedged; try: podman machine stop && podman machine start"; exit 1; fi; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "podman ps failed (rc=$$rc) — is the podman machine running? ('podman machine start')"; exit 1; fi; \
+	  for c in $$names; do \
+	    echo " $(NODES) " | grep -q " $$c " || { \
+	      echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make containers-down')"; exit 1; }; \
+	  done
 	@# Warn when reusing long-lived nodes (accumulated vault/conflict cruft can
 	@# skew a run); 'make containers-up' recreates them fresh from the captured login.
 	@for n in $(NODES); do \
-	  up=$$(podman ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
+	  up=$$($(PODMAN_GUARD) podman ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
