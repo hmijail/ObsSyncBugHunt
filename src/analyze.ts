@@ -226,21 +226,19 @@ export function main(base: string): void {
     if (!isDir(strDir)) continue;
     if (!groups.has(str)) groups.set(str, newGroup());
     const g = groups.get(str)!;
-    for (const rep of readdirSync(strDir)) {
-      const repDir = path.join(strDir, rep);
-      if (!isDir(repDir)) continue;
-      const rf = path.join(repDir, "results.json");
-      const mf = path.join(repDir, "meta.json");
-      if (existsSync(rf) && existsSync(mf)) {
-        let r: Results;
-        try { r = JSON.parse(readFileSync(rf, "utf8")); } catch { skipped++; continue; }
-        tally(g, r, rep);
-        continue;
-      }
-      // No verdict on disk: a thrown outcome (by suffix), else genuinely incomplete.
-      if (rep.endsWith("-OBSFAIL")) tallyThrown(g, "obsfail");
-      else if (rep.endsWith("-UNKNOWN")) tallyThrown(g, "unknown");
-      else skipped++;
+    for (const repFile of readdirSync(strDir)) {
+      if (!repFile.endsWith(".jsonl")) continue;
+      const rep = repFile.slice(0, -".jsonl".length);
+      // A rep's file always ENDS with exactly one results/obsfail/unknown event (the success
+      // path's last logger.log call, or the alarm path's — nothing is ever logged after it), so
+      // the last line alone carries the verdict; no need to scan the whole file.
+      const lines = readFileSync(path.join(strDir, repFile), "utf8").split("\n").filter(Boolean);
+      let last: Record<string, unknown>;
+      try { last = JSON.parse(lines[lines.length - 1]); } catch { skipped++; continue; }
+      if (last.kind === "results") { tally(g, last as unknown as Results, rep); continue; }
+      if (last.kind === "obsfail") { tallyThrown(g, "obsfail"); continue; }
+      if (last.kind === "unknown") { tallyThrown(g, "unknown"); continue; }
+      skipped++; // genuinely incomplete — crashed before any verdict was ever logged
     }
   }
 

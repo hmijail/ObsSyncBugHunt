@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ObsidianDriver } from "./driver.js";
-import { crossCheckFs, waitForSynced } from "./execute.js";
+import { crossCheckFs, waitForSynced, runHistory } from "./execute.js";
 import { AlarmError } from "./alarm.js";
 import { sameConflictSet } from "./oracle.js";
+import { parse } from "./dsl.js";
+import { NoopIsolator } from "./isolate.js";
 import type { RunLogger } from "./history.js";
 import type { Executor } from "./exec.js";
 import type { ExecResult } from "./types.js";
@@ -99,4 +101,64 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
   const byNode = (n: string) => observations.find((o) => o.node === n)!;
   assert.ok(sameConflictSet(byNode("n1").conflicts, byNode("n2").conflicts), "both nodes' conflict sets agree at the settle");
   assert.equal(byNode("n2").conflicts.length, 1, "the lagging node caught up before the settle returned");
+});
+
+// --- W's scope: the active node + active note only, not every online driver -------------
+// A trivial always-synced fake CLI backed by a shared in-memory "vault" — both nodes read
+// from the same Map, so content is always identical/converged. That makes timing/convergence
+// uninteresting here; what's under test is which DRIVERS a mid-history `W` hands to
+// waitForSynced, observable via the `states` array length on the settle-poll events it logs.
+class SharedVaultExecutor implements Executor {
+  constructor(readonly id: string, private readonly vault: Map<string, string>) {}
+  async exec(args: string[]): Promise<ExecResult> {
+    const r = (stdout: string): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
+    const params = Object.fromEntries(args.slice(1).map((a) => {
+      const i = a.indexOf("=");
+      return i < 0 ? [a, ""] : [a.slice(0, i), a.slice(i + 1)];
+    }));
+    const notFound = (file: string) => r(`Error: File "${file}" not found.`);
+    switch (args[0]) {
+      case "sync:status": return r("status: synced");
+      case "sync:history": return this.vault.has(params.file) ? r("1") : notFound(params.file);
+      case "files": return r([...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
+      case "read": return this.vault.has(params.file) ? r(this.vault.get(params.file)!) : notFound(params.file);
+      case "create": {
+        const file = params.path ? params.path.replace(/\.md$/, "") : params.name;
+        this.vault.set(file, params.content ?? "");
+        return r(`Created: ${file}`);
+      }
+      case "append": {
+        const prev = this.vault.get(params.file) ?? "";
+        this.vault.set(params.file, prev ? `${prev}\n${params.content}` : params.content);
+        return r(`Appended to: ${params.file}`);
+      }
+      case "open": return r(`Opened: ${params.file}`);
+      default: return r("");
+    }
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+test("W only waits on the active node's own driver, not every online driver (final settle still waits on all of them)", async () => {
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+
+  await runHistory([n1, n2], new NoopIsolator(), logger, parse("AaW"), {
+    noteName: (l) => `bughunt/${l}`,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, wSettleSec: 0.02, finalSettleSec: 0.02, probeSec: 1,
+    hostCheck: false,
+  });
+
+  const polls = events.filter((e) => e.kind === "settle-poll");
+  const midWait = polls.filter((e) => "wait" in e);
+  const final = polls.filter((e) => e.final === true);
+  assert.ok(midWait.length > 0, "the mid-history W logged at least one settle-poll");
+  assert.ok(final.length > 0, "the final settle logged at least one settle-poll");
+  assert.ok(midWait.every((e) => (e.states as unknown[]).length === 1), "W only probed the active node's own driver");
+  assert.ok(final.every((e) => (e.states as unknown[]).length === 2), "the final settle probed every driver");
 });

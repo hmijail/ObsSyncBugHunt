@@ -39,7 +39,7 @@ import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSyn
 import assert from "node:assert/strict";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { PodmanExecutor } from "./exec.js";
+import { PodmanExecutor, runProcess } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
@@ -135,6 +135,14 @@ if (generateN > 0) {
   process.exit(0);
 }
 
+// The CLI's own self-report (`<bin> version`), not a build-time assumption — reflects
+// whatever's actually installed, queried once so every rep's `history` event can record
+// exactly which Obsidian build produced its result (a bug can appear/vanish across releases).
+async function obsidianVersion(): Promise<string> {
+  const r = await runProcess("podman", ["exec", nodesList[0], bin, "version"]);
+  return r.stdout.trim() || "?";
+}
+
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
   minFloorSec: Number(values["min-floor-sec"] ?? 3),
@@ -144,6 +152,8 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   probeSec: Number(values["probe-sec"] ?? 5),
   hostCheck: !values["skip-host-check"], // on by default; --skip-host-check turns it off
   snapshotTiming: !values["skip-snapshot-timing"], // on by default; --skip-snapshot-timing turns it off
+  isolator: isolatorKind,
+  obsidianVersion: await obsidianVersion(),
 };
 
 // Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
@@ -235,21 +245,28 @@ process.on("SIGINT", () => {
 function uniqueRepId(strDir: string): string {
   const base = tsStamp();
   let name = base;
-  for (let k = 2; existsSync(path.join(strDir, name)); k++) name = `${base}-${k}`;
+  for (let k = 2; existsSync(path.join(strDir, `${name}.jsonl`)); k++) name = `${base}-${k}`;
   return name;
 }
 
-// Any rep dir carrying one of these suffixes is a non-OK rep.
+// Any rep file carrying one of these suffixes (just before .jsonl) is a non-OK rep.
 const FAIL_SUFFIXES = ["-NOUPLOAD", "-TIMEOUT", "-LOST", "-DUPL", "-SYNCBAD", "-OBSFAIL", "-UNKNOWN"];
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
-const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(s));
+const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(`${s}.jsonl`));
+
+/** Rename a rep's `.jsonl` file to carry an outcome suffix (e.g. `-LOST`), inserted just
+ *  before the extension. Returns the new path, or the original if the rename failed. */
+function tagRep(repPath: string, suffix: string): string {
+  const tagged = repPath.replace(/\.jsonl$/, `${suffix}.jsonl`);
+  try { renameSync(repPath, tagged); return tagged; } catch { return repPath; }
+}
 
 /** After a history's reps, suffix the history dir with `-BAD<pct>` (percentage of
  *  non-OK reps) so it's eyeball-obvious where to dig; leave it clean if all passed.
  *  `groupName` is the dir's base name (`<ts0>-<history>`) so the suffix lands on it. */
 function tagHistoryDir(strDir: string, groupName: string): void {
   if (!isDir(strDir)) return;
-  const reps = readdirSync(strDir).filter((d) => isDir(path.join(strDir, d)));
+  const reps = readdirSync(strDir).filter((f) => f.endsWith(".jsonl"));
   if (reps.length === 0) return;
   const bad = reps.filter(isBadRep).length;
   const target = bad > 0 ? path.join(runsRoot, `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
@@ -261,16 +278,6 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   console.log(`  rep ${id}  (running: ${nonOk()}/${pass + nonOk()} failed)`);
   drawStatus();
   const logger = new RunLogger(strDir, id);
-  logger.artifact("meta.json", {
-    history: str,
-    scenario,
-    isolator: isolatorKind,
-    turns: genParams.turns,
-    partitionProb: genParams.partitionProb,
-    notes: genParams.notes,
-    ops: ops.join("-"),
-    nodes: nodesList.length,
-  });
   const noteName = (L: string) => `${NOTE_DIR}/${id}-${L}-${str}`;
 
   // A correctness-assumption violation (unparseable CLI output, a wedged CLI, or a client
@@ -284,15 +291,14 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     if (!(err instanceof AlarmError || err instanceof CliUnrecognizedOutput)) throw err; // a real crash
     const d = describeAlarm(err);
     recordAlarm(d, runsRoot);
-    logger.artifact(`${d.category}.json`, d);
-    let dir = logger.dir;
-    try { renameSync(logger.dir, logger.dir + d.suffix); dir = logger.dir + d.suffix; } catch { /* keep original */ }
-    failures.push(dir);
+    logger.log({ kind: d.category, ...d });
+    const repPath = tagRep(logger.path, d.suffix);
+    failures.push(repPath);
     if (d.category === "obsfail") obsfail++; else unknown++;
     console.log(
       `  rep ${id}: *** ${d.suffix.slice(1)} *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}` +
       `${d.command ? `\n    cmd: ${d.command}` : ""}${d.stdout !== undefined ? `\n    out: ${JSON.stringify(d.stdout)}` : ""}` +
-      ` → ${path.basename(dir)}`,
+      ` → ${path.basename(repPath)}`,
     );
     drawStatus();
     return;
@@ -326,12 +332,11 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
       : "-UNKNOWN";
     assert(FAIL_SUFFIXES.includes(suffix), `verdict suffix ${suffix} is a known outcome`);
     if (suffix === "-UNKNOWN") unknown++; else fail++;
-    let dir = logger.dir;
-    try { renameSync(logger.dir, logger.dir + suffix); dir = logger.dir + suffix; } catch { /* keep original */ }
-    failures.push(dir);
+    const repPath = tagRep(logger.path, suffix);
+    failures.push(repPath);
     const dropped = forensics.filter((f) => f.serverRecoverable).length;
     const unregistered = forensics.length - dropped;
-    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) total=${timings.totalSec}s → ${path.basename(dir)}`);
+    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) total=${timings.totalSec}s → ${path.basename(repPath)}`);
   }
   drawStatus(); // refresh the bar with the updated tally
 }

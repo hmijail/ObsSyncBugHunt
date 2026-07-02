@@ -1,187 +1,65 @@
 # Obsidian Sync Tester
 
-A small TypeScript harness that hunts for **data loss in Obsidian Sync** when the
-same note is edited on multiple devices. Every edit goes through the **Obsidian CLI**, so Sync hopefully works as it would for a human.
+A TypeScript test harness that hunts for **data loss in Obsidian Sync** when the
+same notes are edited on multiple devices, simulated in containers. Kind of a poor-man's semantic fuzzer for a distributed system.
 
-## Generating sequences of edits with a tiny DSL
+Inspired by the amazing [Jepsen](https://jepsen.io/), which was far too much for this case.
 
-A test is a **history** — a string of user actions replayed against
-containerized nodes. Commands are uppercase, parameters lowercase/digits. The
-**active node** is a cursor that persists until changed; each append names its own note.
+## Attribution
 
-| Command | meaning |
-|---|---|
-| `N<d>` | set the active node (`N1`, `N2`) |
-| `A<x>` | append a uniquely-tagged line to note `x` (`Aa`), by the active node (first touch creates it; also opens it in the GUI) |
-| `D` / `C` | disconnect / connect the active node from the network |
-| `W`    | wait until the active node reports that the last-edited note is synced |
-| `P<n>` | pause ~`n` seconds (default 10) |
+The code is 100% Claude's. In fact, I barely know TypeScript; I just hope that the Obsidian devs will be more receptive to TS.
 
-Example: `N1AaWN2Aa` → node 1 appends to note `a`, waits for sync; node 2
-appends to the same note.
+However, while writing all that code, Claude also tried making all the mistakes a beginner would have, and then some. So the design / functional spec and docs are 100% mine, based on the lessons learnt while building [DARUM](https://hmijailblog.blogspot.com/2025/04/Introducing-DARUM-DAfny-Resource-Usage-Measurement.html), which (in its own way) also plays with randomness to make a black box reveal a bit of its inner workings.
 
-Every history (generated or typed) is run through a `normalize` pass first, so the
-**printed string is exactly what executes**: a pause not adjacent to an action (`D`/`C`/`A`)
-floats forward to the next action (`N1PN2Aa` → `N2PAa`), redundant node-sets vanish, and
-adjacent same-note appends collapse.
+Blog post with details and lessons learned coming soon.
 
-At the end of the history, the harness waits for all nodes to report synced (reconnecting them to the network if necessary).
-The thing varying across repeats is timing, as it depends on how fast the Obsidian CLI processes commands. Most importantly, Obsidian Sync itself will take its time, and the simulated user might wait for it to finish (command `W`).
+## General usage
 
-**Execution model (and its limits).** A history runs **strictly sequentially** — one
-awaited op loop — so any `P`/`W`/`D`/`C` blocks the *whole* harness from issuing the
-next command (background Sync keeps running during a pause; only new *edits* are
-serialized). This is deliberate: it models one human moving between their own devices,
-not two devices typing into the same note at the same instant. The bug we're after —
-logically-concurrent edits on a shared base — still arises, just not from wall-clock
-simultaneity: a partition (`D … C`) has both sides edit the same base unaware of each
-other, and `concurrent` turns race edits against the live sync window. True
-sub-second-simultaneous edits with no partition are out of scope — both rare for a
-single user and barely well-defined.
+`make help` lists every command. Make is the easy entry point, which maps to other tools as needed.
 
-Edits are append-only for now, since that is a case supported by the CLI, and the bug reports in the forum seem to hint that this should be enough to cause trouble.
-
-A history can be hand-written (`HISTORY=N1AaWN2Aa`) or generated (see below), and
-each is **repeated** `REPEAT` times (default 10) to cope with Sync's nondeterminism.
-
-## Judging whether there was a bug: token survival
-
-Each command `A` appends a unique token `(<node>-<seq>-<note>)` to the
-note. At the end of the history, the oracle (`src/oracle.ts`) checks that those tokens exist, either in the notes created during that history, or in any corresponding "Conflicted copy". It can detect 3 types of problems:
-
-- **loss** — a token was introduced but at the end of the history it's been lost;
-- **duplication** — a token repeated within a file;
-- **divergence** — nodes disagree on final content or conflict-file set.
-
-> The token is parenthesized so one can't be a substring of another (`(n1-1-a)` vs
-> `(n1-10-a)`); matching is also boundary-aware. Parens (not `[ ]`/`[[ ]]`, which
-> read as a checkbox/wikilink in the editor) keep it inert plain text in the GUI. An
-> edit is only *acknowledged* after its token is read back locally — because
-> **`obsidian-cli` always exits 0** (a known upstream bug), success is judged by
-> content, never by the exit code; a write that doesn't read back is retried.
-
-Nodes run in **"create conflict file"** mode. A present conflict file is checked for
-a well-formed `(Conflicted copy <device> <ts>)` name attributable to a node (each
-node's Sync device name is its hostname, `n1`/`n2`); auto-merge with no conflict
-file is a documented-legal outcome, so the oracle does not require one.
-
-## Outcomes
-
-Per repeat (a non-OK repeat's directory is suffixed):
-
-| suffix | meaning |
-|---|---|
-| *(none)* | PASS |
-| `-LOST` | an acknowledged edit is gone |
-| `-DUPL` | a token is duplicated (nodes still converged) |
-| `-SYNCBAD` | nodes **settled** (all `synced`, state quiet) but disagree — different canonical, or a conflict file only one node holds |
-| `-NOUPLOAD` | a note never reached the server (`sync:history total < 1`) |
-| `-TIMEOUT` | never even settled within the cap — a node never reached `synced`, or content kept changing; inconclusive (a host-internet outage doesn't count: the settle pauses until the host is back, then resumes) |
-| `-OBSFAIL` | a client **misreports its own vault** — obsidian-cli's `files` listing contradicts a direct `ls` of the vault, or its own `read` (a note reads as present but is missing from `files`). A real finding, not a Sync convergence issue. Logged to `runs/OBSFAIL.log` with the offending CLI line + throw site |
-| `-UNKNOWN` | couldn't judge — obsidian-cli returned output no recognizer matched (a format change → update the parser), or the CLI never answered within the retry budget. Logged to `runs/UNKNOWN.log` with the copy-paste CLI line + throw site |
-
-A history directory is suffixed `-BAD<pct>` with the percentage of non-OK repeats,
-so a soak is eyeball-scannable for where to dig. `npm run analyze` aggregates it all into
-`runs/analysis.md`: per history string, a markdown table of every rep's whole final state
-(every touched note, plus any conflict file, as `(node-seq-note)` tokens), grouped first by
-outcome (`PASS`/`LOST`/`DUPL`/...) so a recurring shape is visible at a glance — non-`PASS`
-tables also list which reps (by dir name) produced each shape. Never merged across different
-histories (note letters/tokens from unrelated DSL structures aren't comparable).
-
-## Faults
-
-A node must be **running but unable to sync** to diverge. Two primitives, via
-`ISOLATOR`:
-
-- `network` — detach the container from its Podman network (the bug hunt, default).
-  `D`/`C` block until a TCP probe to a numeric address confirms the change, so a
-  half-applied partition can't leak an in-flight sync.
-- `sync` — Obsidian's own `sync off` / `sync on`; cooperative, the **control baseline**.
-
-## Generation
-
-`generateHistory` builds random histories. Cross-node edits to the same note are
-coordinated by **`TURNS`** — a spectrum of synchronization strength:
-
-- **`barrier`** (default) — a `W` before each cross-node edit: strict turns, edits
-  never overlap (append-contention on a propagated base);
-- **`paced`** — a `P` (~10s) instead of the wait: edits *sometimes* race the sync window;
-- **`concurrent`** — nothing: maximum overlap.
-
-**`PARTITION_PROB`** independently injects network partitions: a node — or several, up
-to all — goes offline, edits diverge across the gap, then it heals (the
-`SCENARIO=stale` preset is just a biased corner of this). Coordination is suppressed
-across a partition (you can't take a turn with a disconnected node), so `TURNS`
-governs *online* edits and `PARTITION_PROB` governs *offline* divergence,
-independently. Consecutive same-kind ops are collapsed in generated histories — and
-consecutive pauses summed — since back-to-back local edits add no contention.
-
-## Layout
-
-```
-src/
-  dsl.ts         the history DSL: parse / serialize           (dsl.test.ts)
-  generator.ts   random history generation                   (generator.test.ts)
-  execute.ts     run one DSL history against the nodes, then judge
-  oracle.ts      token-survival / convergence verdict         (oracle.test.ts)
-  driver.ts      Obsidian CLI wrapper                         (driver.test.ts)
-  exec.ts        Local / Podman executors
-  isolate.ts     fault primitives (network partition / sync toggle)
-  history.ts     per-run JSONL trace + results.json
-  runner.ts      single divergence-round (used by run-local)
-  run.ts         containerized entrypoint   (npm run start)
-  run-local.ts   single-node pipeline check (npm run local)
-  analyze.ts     offline soak aggregator    (npm run analyze)
-  clean-notes.ts delete the harness's notes (bughunt/) on all nodes (npm run clean-notes)
-  smoke.ts       driver probe               (npm run smoke)
-containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
-Makefile         podman lifecycle: build -> login -> capture -> containers-up -> run
-```
-
-## Running
-
-`make help` lists every command. Common flows:
+Common flow:
 
 ```sh
-make install && make check        # install + typecheck + unit tests
+make install && make check        # install (npm ci) + typecheck + unit tests
 
-# two-node containers:
-make build && make login          # VNC in: enable CLI, link a TEST vault, "create conflict file"
-make capture                      # copy the login into ./secrets (git-ignored), not an image
-make containers-up                # launch n1 + n2 fresh
-make clean-data                   # fresh slate: empty the vault + wipe runs/
+# Create two node containers:
+make build && make login
+# Connect through VNC to the container (localhost:5900). A pristine Obsidian is waiting. Configure it to Sync to a vault and "create conflict file". Enable the Obsidian CLI.
+make capture                      # extracts the login credentials into ./secrets (git-ignored)
+make containers-up                # launch n1 + n2 fresh with the captured credentials
+make clean-data                   # OPTIONAL clean slate: empty the vault + wipe runs/
 
-make run HISTORY=N1AaWN2Aa REPEAT=3      # one specific history
-make soak HISTORY=N1AaWN2Aa              # soak ONE history forever (Ctrl-C); add STEPS=K for a prefix
-make soak TURNS=paced                    # generate + run until Ctrl-C (overnight)
+make run HISTORY=N1AaWN2Aa REPEAT=3      # run one specific history
+make soak HISTORY=N1AaWN2Aa              # soak one history until Ctrl-C
+make soak TURNS=paced                    # generate histories and run them until Ctrl-C
 make analyze                             # aggregate runs/ into a report
 ```
 
-Per-run artifacts live in `runs/<ts>-<history>/<repTs>/`: `history.json` (the intended
-ops), `history.jsonl` (the timestamped execution trace, incl. `content-at-wait`
-snapshots), `results.json` (the verdict), and `meta.json`. The group dir's `<ts>` is
-when that history *started*; each repeat is a `<repTs>` subdir.
+Each repeat generates one result file, `runs/<ts>-<history>/<repTs>.jsonl`. It contains the timestamped execution
+trace, opening with a `history` event (the DSL string + parsed ops) and closing with a
+`results` event (the verdict), or `obsfail`/`unknown`. A failing repeat's file is renamed with its outcome suffix
+(`<repTs>-LOST.jsonl`, etc.). The group dir's `<ts>` is when that
+history started executing.
 
-Timestamps are `DDTHHMMSS` — day-of-month, `T`, then hours/minutes/seconds, local time
-(e.g. `26T181530`); a `-2` is appended on the rare same-second collision within a dir.
+Timestamps are `DD**T**HHMMSS` for easier eyeballing. A `-2` is appended on the rare same-second collision within a dir.
 
-The notes a run creates are named `bughunt/<repTs>-<letter>-<history>` — e.g.
+The notes that are created by a run creates in Obsidian are named `bughunt/<repTs>-<letter>-<history>`, e.g.
 `bughunt/26T181530-a-N1AaN2WAa.md`. `<repTs>` is the repeat's timestamp (keeps each
-repeat's notes distinct), the trailing `-<history>` is the DSL string, and `-<letter>`
+repeat's notes distinct and easy to refer to), the trailing `-<history>` is the DSL string, and `-<letter>`
 is the DSL note letter the concrete note maps to (the `x` in `Ax`), so a multi-note
 history (`NOTES>1`) yields `…-a-…`, `…-b-…`, … side by side.
 
-**Vault safety:** every note the harness creates lives under a `bughunt/` folder, and
+**Vault safety:** every note the harness creates lives under the `bughunt/` folder, and
 `clean-notes`/`clean-data` only ever delete *inside* `bughunt/`. So even if pointed at a
-real, in-use vault, the tester never creates, edits, or removes your own notes.
+real, in-use vault, the tester should keep your own notes safe.
+
+**Better make backups, though.**
+
 
 ## Parameters
 
-Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
-
-- via make as `VAR=value` overrides — `make soak TURNS=paced` (make maps them to the flags
-  below and its recipe echo is the full, copy-pasteable `npm run start -- …` command);
-- directly — `npm run start -- --turns paced --partition-prob 0.4`.
+- Use in make as `VAR=value`: `make soak TURNS=paced`. Make maps them to the flags below and prints the resulting CLI line.
+- Use directly in npm: `npm run start -- --turns paced`.
 
 `src/run.ts` holds the defaults.
 
@@ -204,23 +82,167 @@ Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
 | `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
 | `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
 | `CAP_SEC` | `--cap-sec` | 120 | hard ceiling on any single wait; exceeding it is a `-TIMEOUT` (inconclusive) |
-| `W_SETTLE_SEC` | `--w-settle-sec` | 4 | mid-history `W`: how long the converged + `synced` state must hold |
-| `FINAL_SETTLE_SEC` | `--final-settle-sec` | 15 | end-of-history settle window; longer than `W`'s — `W` only ever needs one node's own view (or, when a peer happens to be online too, one note's worth of cross-node convergence), while the final settle is the one point that judges the *whole* multi-node system across every note, so it needs more margin against a late second-hop sync |
+| `W_SETTLE_SEC` | `--w-settle-sec` | 4 | for the `W` command: how long the `synced` state must hold |
+| `FINAL_SETTLE_SEC` | `--final-settle-sec` | 15 | end-of-history settle window; needs to cover a potential round-trip sync |
 | `PROBE_SEC` | `--probe-sec` | 5 | per-call cap on the settle's `sync:status` probe — it blocks until synced, so this bounds it into a pollable "synced yet?" (a timeout reads as *still syncing*) |
-| `RUNS_PREFIX` | `--runs-prefix` | *(cwd)* | parent dir for the whole `runs/` tree, so a soak's artifacts (logs, rep dirs, `analysis.md`) can live somewhere other than the working directory |
+| `RUNS_PREFIX` | `--runs-prefix` | *(cwd)* | parent dir for the whole `runs/` tree, so a soak's artifacts (logs, rep `.jsonl` files, `analysis.md`) can live somewhere other than the working directory |
 | `SKIP_SNAPSHOT_TIMING` | `--skip-snapshot-timing` | off | omit the pause-snapshot's per-call `ms` fields (a debug aid for diagnosing a slow snapshot, on by default) |
+
+# How it all works
+
+## Generating sequences of edits with a tiny DSL
+
+A test is a **history**: a string of user actions replayed against
+containerized nodes. Commands are uppercase, parameters lowercase/digits.
+
+| Command | meaning |
+|---|---|
+| `N<d>` | set the active node (`N1`, `N2`) |
+| `A<x>` | append a uniquely-tagged line to note `x` (`Aa`), by the active node (first touch creates it; also opens it in the GUI so you can watch the history unfold) |
+| `D` / `C` | disconnect / connect the active node from the network |
+| `W`    | wait until the active node reports that the last-edited note is synced |
+| `P<n>` | pause ~`n` seconds (default 10) |
+
+Example: `N1AaWN2Aa` → node 1 appends to note `a`, waits for sync; node 2
+appends to the same note.
+
+Histories can be auto-generated or typed manually. They are run through a `normalize` pass so that histories that would be very similar in practice also look similar as a string:
+- For clarity, a pause not adjacent to an action (`D`/`C`/`A`) floats forward to the next action (`N1PN2AaAa` → `N1N2PAaAa`)
+- Redundant node selections vanish (`N1N2PAaAa` → `N2PAaAa`)
+- Adjacent appends to the same note collapse into a single append. (`N2PAaAa` → `N2PAa`)
+
+Timings are necessarily variable between repetitions of a history, since we don't have control of the Sync server, timing of the client's retries, network state, etc. This can cause results to change every time you repeat the history. Therefore histories are run `REPEAT` times to sample the distribution of end results. Also, to minimize variability in a given history, command W waits until Obsidian itself reports the node is synced.
+
+Note that the harness models a single user using Obsidian across `NODES` devices, so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing, while Obsidian might be doing its thing. Similarly, W waits for the current node to report it's synced, but this also implies that the other nodes wait until that happens.
+
+At the end of the history, the harness reconnects all nodes to the network,  waits for them all to report synced, and still waits for a settling window to ensure that no further changes happen. Only then the end result is judged.
+
+Edits are append-only for now, since that is a case supported by the CLI, and the bug reports in the forum hint that this should be enough to cause trouble.
+
+### A practical example
+
+Here's is a simple history string that already surfaces an Obsidian Sync bug in Obsidian 1.12.7: **N2DN1AaWN2AaCW**
+
+- N2: selects N2 as the current node
+- D : disconnects the current node. (See below for different ways of disconnecting: disable network, disable sync)
+- N1: selects N1 as the current node
+- Aa: appends a token to note "a" in node 1 (this is a "logical name"; see below for actual naming of notes)
+- W : wait until the current note in the current node is reported as synced by Obsidian
+- N2: selects N2
+- Aa: appends a new token to note "a" in node 2 (same "logical note" as before)
+- C : connect the current node
+- W : wait for sync
+
+Interestingly, this results in data loss only with `ISOLATOR=network`, not `ISOLATOR=sync`.
+
+
+### Pacing between cross-node edits to the same note
+
+A history can edit the same note in different nodes. This can be done conservatively (waiting for Obsidian to report it is synced) or aggressively (like typing into that note at your desktop and immediately typing into that same note on your phone). This is controlled via **`TURNS`**:
+
+- **`barrier`** (default) : there is a `W` before each cross-node edit. As far as the user can see, the node is synced.
+- **`paced`** : a `P`ause command (default 10s) happens before each cross-node edit. This might or might not be enough for the sync to settle.
+- **`concurrent`** : cross-node edits can happen immediately.
+
+### Exercising sync recovery after disconnections
+
+The main expected source of bugs is synchronization across nodes, particularly when the nodes get disconnected and reconnected to the network while the notes change.
+
+`PARTITION_PROB` defines the probability of 'D'/'C' appearing in the history, causing a node going offline / online again.
+
+The exact way in which nodes go offline is selected via `ISOLATOR`:
+
+- `network`: Default. Detach/attach the container from/to a Podman network. Each of the `D`/`C` commands block until a TCP probe to a numeric address confirms the network is actually dis/connected, to avoid the possibility of Sync squeezing through. Fixed IP and MAC are used to minimize the network disruption. (Ping is not used because of complexities of rootless container vs ICMP access.)
+- `sync`: Obsidian-cli `sync off` / `sync on` commands.
+
+`SCENARIO=stale` is a separate, more fixed mode: one node disconnects early and stays offline for a long (30s) window while the
+other node(s) keep editing the same note, then the stale node reconnects at the end. It mirrors the bug report of a device that connects after a long time offline and somehow causes a flood of conflicts .
+
+## Outcomes
+
+Results of a run are recorded in a directory named after the start timestamp and the history: "DD**T**HHMMSS-HISTORY". If any of the history repetitions ended up in a non-OK state, the directory name has a suffix `-BAD<pct>` indicating the % of repetitions that ended badly.
+
+The result of each repetition of the history is recorded in a JSONL file under the history's directory, with the rep start timestamp. This file contains the history execution details: any config parameters, the execution trace and end result. If the repetition ended in a not-OK state, its name gets a suffix:
+
+| suffix | meaning |
+|---|---|
+| *(none)* | PASS |
+| `-LOST` | a token was writen but is gone |
+| `-DUPL` | a token is duplicated (nodes still converged) |
+| `-SYNCBAD` | nodes synced and settled but disagree |
+| `-NOUPLOAD` | a token was writen in a node but never reached the server |
+| `-TIMEOUT` | some node never finished syncing within the allowed time |
+| `-OBSFAIL` | obsidian-cli reports something but the filesystem disagrees |
+| `-UNKNOWN` | some situation couldn't be recognised |
+
+
+OBSFAIL and UNKNOWN mean that something is seriously wrong and needs special handling, so they are additionally logged to runs/OBSFAIL.log and runs/UNKNOWN.log, with data to reproduce the error.
+
+`make analyze` aggregates all the runs' information into tables in `runs/analysis.md`, to ease eyeballing of failure patterns across many repetitions.
+
+### Judging whether there was a bug: token survival
+
+Each command `Ax` appends a unique token `(<node>-<seq>-<note>)` to the
+note `x`. At the end of the history, the oracle (`src/oracle.ts`) checks that those tokens exist, either in the notes created during that history, or in any corresponding "Conflicted copy". It can detect 3 types of problems:
+
+- **loss** : a token was introduced but at the end of the history it's been lost;
+- **duplication** : a token repeated within a file;
+- **divergence** : nodes disagree on final content or conflict-file set.
+
+An appended token is read back locally; a write that doesn't read back is retried.
+
+
+Nodes run with Obsidian Sync in **"create conflict file"** mode. A present conflict file is checked for
+a well-formed `(Conflicted copy <device> <ts>)` name attributable to a node.
+
+## Layout
+
+```
+src/
+  dsl.ts         the history DSL: parse / serialize           (dsl.test.ts)
+  generator.ts   random history generation                   (generator.test.ts)
+  execute.ts     run one DSL history against the nodes, then judge
+  oracle.ts      token-survival / convergence verdict         (oracle.test.ts)
+  driver.ts      Obsidian CLI wrapper                         (driver.test.ts)
+  cli-parse.ts   positively-recognized-output-only CLI parsers (cli-parse.test.ts; see docs/cli-trust.md)
+  alarm.ts       classify + log a correctness-assumption violation (-OBSFAIL/-UNKNOWN) (alarm.test.ts)
+  exec.ts        Local / Podman executors
+  isolate.ts     fault primitives (network partition / sync toggle)
+  net.ts         host-internet connectivity probe (tells a Sync stall apart from a host outage)
+  types.ts       shared types (NodeId, ExecResult, token format, NOTE_DIR)
+  history.ts     per-rep JSONL trace (one file, opens with `history`, closes with `results`)
+  runner.ts      single divergence-round (used by run-local)
+  run.ts         containerized entrypoint   (npm run start)
+  run-local.ts   single-node pipeline check (npm run local)
+  analyze.ts     offline soak aggregator    (npm run analyze)
+  clean-notes.ts delete the harness's notes (bughunt/) on all nodes (npm run clean-notes)
+  smoke.ts       driver probe               (npm run smoke)
+containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
+docs/
+  cli-trust.md   why/how the harness never judges from CLI output it didn't positively recognize
+Makefile         podman lifecycle: build -> login -> capture -> containers-up -> run
+```
+
+
 
 ## Future work
 
-Schedule-aware **conflict expectation**: from the offline trace, a node that made
-disconnected edits while another synced *should* yield a conflict file — flagging a
-missing one needs reasoning over the schedule, not just the end state. Worth a look
-as prior art / lit review (verify before relying on any of these): Jepsen's
-consistency-testing methodology (the project's namesake), CRDT / operational-
-transformation theory, and academic studies of file-sync conflict handling.
-FIXME XXX
+- Obsidian Sync's auto-merge mode is not tested yet. This is because I didn't expect to find bugs so early; conflict file mode is supposed to be the safe one, in part because it's the official recommendation in the Obsidian forums. Go figure.
+- Outcome judgment is very lenient: as long as the input tokens are stored *somewhere*, the result is considered OK. However, a real user surely wouldn't be happy if their inputs keep getting moved into Conflict files randomly. So judgment should probably be made more... judgmental.
+- Both auto-merge and stricter judgment of conflict files would probably require keeping an internal model of what result to expect from Obsidian Sync. That would probably be a bit of a can of worms, given the closed-source nature of the beast.
+- It would be interesting to force network failures or slowness, once Sync is solid enough over a normal network.
+- The Obsidian Sync driving code could be made generic to work on other sync backends. Would e.g. Obsidian-on-iCloud lose more or less data? What about Syncthing, etc?
+- In fact, the very Obsidian driving could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *lossy* it was.
+- I started this project inspired by Jepsen, which turned out to be overkill for something like Obsidian. Plus, there is a lot of research on fuzzing a black box with semantics, surely including internal models too. Something to look into, I guess.
+
 
 ## Tooling
 
 Node is pinned in `.nvmrc`, enforced by `engines` + `engine-strict`; use `npm ci`
 for lockfile-exact installs.
+
+Obsidian is driven through its CLI, hoping that it behaves just like it would when driven through the GUI.
+
+Podman on macOS. Built the images with a view to be easy to run in AWS-EC2, but didn't try.
+
+Developed using Claude Code, with Claude Opus 4.8 and Claude Sonnet 5, on a Claude Pro Claude subscription and no extra Claude credits.

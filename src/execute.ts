@@ -51,6 +51,12 @@ export interface ExecuteOpts {
   // case). Default ON (this round's diagnosis of a slow snapshot); --skip-snapshot-timing
   // turns it off later without touching the snapshot logic itself.
   snapshotTiming?: boolean;
+  // Recorded into the `history` event only — neither changes execution here. A rep's
+  // outcome can depend on which of these governed it (confirmed: the isolator choice alone
+  // flips whether a concurrent-create collision produces a conflict file), so both need to
+  // travel WITH the rep's own trace, not just live in the invocation's separate run log.
+  isolator?: string; // "network" | "sync" — which fault primitive drove this run's D/C
+  obsidianVersion?: string; // the CLI's own self-reported version, queried once at startup
 }
 
 export interface LostForensic {
@@ -291,7 +297,11 @@ async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, logger
   const deadline = Date.now() + capSec * 1000;
   for (;;) {
     const states = await Promise.all(drivers.map(async (d) => (await d.syncStatus()).value ?? "?"));
-    if (states.every((s) => s === "synced")) { logger.log({ kind: "baseline-synced", states }); return; }
+    if (states.every((s) => s === "synced")) {
+      const notes = await Promise.all(drivers.map(async (d) => (await d.listFiles()).value?.length ?? 0));
+      logger.log({ kind: "baseline-synced", states, notes });
+      return;
+    }
     if (Date.now() > deadline) { logger.log({ kind: "baseline-sync-timeout", states }); return; }
     await sleep(1000);
   }
@@ -306,7 +316,13 @@ export async function runHistory(
 ): Promise<RunResult> {
   const startedAt = Date.now();
   const str = serialize(history);
-  logger.artifact("history.json", { string: str, ops: history });
+  logger.log({
+    kind: "history", string: str, ops: history,
+    isolator: opts.isolator, obsidianVersion: opts.obsidianVersion,
+    wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
+    pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
+    capSec: opts.capSec ?? 120, probeSec: opts.probeSec ?? 5,
+  });
 
   // Route the driver's cli-unresponsive (wait-for-recovery) events, and the isolator's own
   // internal network-reachability retries, into this rep's trace.
@@ -321,7 +337,6 @@ export async function runHistory(
   await waitNodesSynced(drivers, opts.capSec ?? 120, logger);
 
   const driverOf = (num: number) => drivers[num - 1];
-  const online = () => drivers.filter((_, idx) => !offline.has(idx + 1));
 
   let activeNode = 1;
   let activeNote: string | undefined;
@@ -340,10 +355,11 @@ export async function runHistory(
         activeNode = op.node!;
         break;
       case "pause": {
-        // Logged at FINISH (after the sleep), like every other event kind — consistent with
-        // disconnect/connect/pause-snapshot/etc., none of which log their intent before starting.
+        // Logged at START: a pause has no result to report beyond "I did the thing" (just the
+        // requested duration, echoed — no measured outcome), unlike pause-snapshot below, which
+        // DOES carry a real result and stays logged at its own finish.
+        logger.log({ kind: "pausing", seconds: op.seconds });
         await sleep((op.seconds ?? DEFAULT_PAUSE_SEC) * 1000);
-        logger.log({ kind: "pause", seconds: op.seconds });
         // Snapshot every node (not just the active one — the whole point is seeing what a
         // DISCONNECTED node's own local state looks like during a D…P…C window, invisible
         // otherwise until the final settle). A snapshot is a LOOK, not a judgment: every call
@@ -401,26 +417,29 @@ export async function runHistory(
         break;
       }
       case "disconnect":
+        // Logged at START: no result of its own beyond "I did the thing" — the actual outcome
+        // (each reachability attempt, and how long it took) is network-probe's job, at ITS finish.
+        logger.log({ kind: "disconnecting", node: driverOf(activeNode).node });
         await isolator.disconnect(driverOf(activeNode).node);
         offline.add(activeNode);
-        logger.log({ kind: "disconnect", node: driverOf(activeNode).node });
         break;
       case "connect":
+        logger.log({ kind: "connecting", node: driverOf(activeNode).node });
         await isolator.connect(driverOf(activeNode).node);
         offline.delete(activeNode);
-        logger.log({ kind: "connect", node: driverOf(activeNode).node });
         break;
       case "wait": {
         if (!activeNote) break; // nothing selected to wait on
-        // A W on a disconnected node (or with no online peer to sync with) can't
-        // make progress — NOP it rather than block. (waitForSynced is also hard-
-        // bounded by capSec, so a W never hangs even in the online case.)
-        if (offline.has(activeNode) || online().length === 0) {
-          const reason = offline.has(activeNode) ? "offline" : "no-online-peers";
-          logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason });
+        // W is the active node's OWN view — a user at that node only knows what their own
+        // client reports, not what other nodes/the network are seeing (that whole-system
+        // "god's-eye" check is what the FINAL settle is for, across every node and note).
+        // A W on a disconnected node can't make progress — NOP it rather than block.
+        // (waitForSynced is also hard-bounded by capSec, so a W never hangs even online.)
+        if (offline.has(activeNode)) {
+          logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
           break;
         }
-        await waitForSynced(online(), [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
+        await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
         break;
       }
       case "append": {
@@ -458,9 +477,9 @@ export async function runHistory(
           if (!landed) logger.log({ kind: "edit-unconfirmed", node: d.node, note: noteLetter, token, attempt, fullname: activeNote });
         }
         if (landed) {
-          // Always `append` so the log mirrors the history; `created` marks a create-create
+          // Always `appended` so the log mirrors the history; `created` marks a create-create
           // (conflict genesis). The noisy exploded name trails as `fullname`.
-          logger.log({ kind: "append", node: d.node, note: noteLetter, token, created, fullname: activeNote });
+          logger.log({ kind: "appended", node: d.node, note: noteLetter, token, created, fullname: activeNote });
           acked.push({ note: activeNote, node: d.node, token });
         } else {
           logger.log({ kind: "edit-failed", node: d.node, note: noteLetter, token, attempts: MAX_ATTEMPTS, fullname: activeNote });
@@ -474,8 +493,8 @@ export async function runHistory(
   // network isolator never turns sync off, so there's nothing to resume), wait until all
   // agree, then dwell (conflict files lag) before observing.
   for (const num of offline) {
+    logger.log({ kind: "connecting", node: driverOf(num).node });
     await isolator.connect(driverOf(num).node);
-    logger.log({ kind: "connect", node: driverOf(num).node });
   }
   offline.clear();
   const noteList = [...touched];
@@ -515,6 +534,6 @@ export async function runHistory(
     unsynced: stab.unsynced,
   };
   logger.log({ kind: "timings", ...timings });
-  logger.results({ history: str, timings, acked, observations, verdict, forensics, noteLetters: Object.fromEntries(noteLetters) });
+  logger.log({ kind: "results", history: str, timings, acked, observations, verdict, forensics, noteLetters: Object.fromEntries(noteLetters) });
   return { verdict, acked, observations, timings, forensics };
 }
