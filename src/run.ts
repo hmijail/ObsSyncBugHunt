@@ -1,8 +1,9 @@
 // Test entrypoint: generates (or takes) a DSL history, runs it REPEAT times
 // against the containerized nodes, and tallies. Each history string is a
 // directory; each repeat is a sub-run named by epoch6. A non-OK rep dir is
-// suffixed -UNSYNCED / -TIMEOUT / -LOST / -DUPL / -DIFF, and a history dir gets
-// -BAD<pct> (share of non-OK reps).
+// suffixed -NOUPLOAD / -TIMEOUT / -LOST / -DUPL / -SYNCBAD (verdict outcomes) or
+// -OBSFAIL / -UNKNOWN (a caught alarm-class condition — see alarm.ts), and a
+// history dir gets -BAD<pct> (share of non-OK reps).
 //
 // Params are CLI args (args-only — env is not read). Use `make` (which maps
 // `make soak TURNS=paced` to the flags below), or run directly: `npm run start -- <flags>`.
@@ -24,13 +25,18 @@
 //   --duration-min   run for N minutes instead of a count
 //   --generate       print N generated histories and exit (no nodes touched)
 //   --skip-host-check  skip the host-online preflight
+//   --vault-path     vault's on-disk root for the FS cross-check (default /root/vaults/TestVault)
 //   --poll-sec / --min-floor-sec / --cap-sec / --w-settle-sec / --final-settle-sec  sync-wait tuning
+//   --probe-sec      per-call cap on the settle's sync:status probe (default 5; it blocks until synced)
+//   --runs-prefix    parent dir for runs/ (default: cwd, i.e. plain ./runs)
+//   --skip-snapshot-timing  omit the pause-snapshot's per-call `ms` fields (debug aid, on by default)
 //
 // Mirrors all stdout to a timestamped log under runs/ (invocation as its first line).
 //
 //   npm run start -- --turns paced --partition-prob 0.4
 
 import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync } from "node:fs";
+import assert from "node:assert/strict";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { PodmanExecutor } from "./exec.js";
@@ -39,10 +45,30 @@ import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js"
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
-import { parse, serialize, type History } from "./dsl.js";
+import { parse, serialize, normalize, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
+import { CliUnrecognizedOutput } from "./cli-parse.js";
+import { AlarmError, describeAlarm, recordAlarm } from "./alarm.js";
 import { NOTE_DIR } from "./types.js";
+
+// Correctness-assumption violations are thrown deep in the driver/oracle; they're handled
+// per-rep in `runRep` (tagged -OBSFAIL/-UNKNOWN, soak continues). One that still escapes the
+// rep loop — e.g. preflight against an unparseable baseline — has no rep to attach to, so we
+// record it durably, print the compact diagnostic (copy-paste command + file:line), and exit.
+// Other errors keep the normal crash behavior.
+for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
+  process.on(ev, (err: unknown) => {
+    if (err instanceof AlarmError || err instanceof CliUnrecognizedOutput) {
+      const d = describeAlarm(err);
+      recordAlarm(d, runsRoot);
+      console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}${d.command ? `\n  cmd: ${d.command}` : ""}`);
+    } else {
+      console.error(err);
+    }
+    process.exit(1);
+  });
+}
 
 const { values } = parseArgs({
   options: {
@@ -67,7 +93,11 @@ const { values } = parseArgs({
     "cap-sec": { type: "string" },
     "w-settle-sec": { type: "string" },
     "final-settle-sec": { type: "string" },
+    "probe-sec": { type: "string" },
     "skip-host-check": { type: "boolean" },
+    "vault-path": { type: "string" },
+    "runs-prefix": { type: "string" },
+    "skip-snapshot-timing": { type: "boolean" },
   },
 });
 
@@ -110,26 +140,39 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   minFloorSec: Number(values["min-floor-sec"] ?? 3),
   capSec: Number(values["cap-sec"] ?? 120),
   wSettleSec: Number(values["w-settle-sec"] ?? 4),
-  finalSettleSec: Number(values["final-settle-sec"] ?? 6),
+  finalSettleSec: Number(values["final-settle-sec"] ?? 15),
+  probeSec: Number(values["probe-sec"] ?? 5),
   hostCheck: !values["skip-host-check"], // on by default; --skip-host-check turns it off
+  snapshotTiming: !values["skip-snapshot-timing"], // on by default; --skip-snapshot-timing turns it off
 };
 
-const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));
+// Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
+// cwd (e.g. a bigger disk). Default (no flag) keeps today's behavior: plain "runs".
+const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs") : "runs";
+
+// Vault's on-disk root in the container — enables the filesystem second-source / CLI-vs-FS
+// cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.
+const vaultPath = values["vault-path"] ?? "/root/vaults/TestVault";
+const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vaultPath));
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
+
+// Human-readable wall-clock stamp DDTHHMMSS (local time), e.g. 25T181530 — used for both the
+// run log filename below and each rep/history-group dir (see uniqueRepId), so they share one
+// timestamp convention. Day-of-month is enough granularity for a soak; collisions within a dir
+// get a -k suffix (see uniqueRepId).
+const tsStamp = () => {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+};
 
 // Mirror all stdout to a timestamped log under runs/ so the console output (per-rep
 // results, tally) is recoverable. The invocation is the log's first line (written to
 // the file only — make already echoes the same command on the terminal).
-mkdirSync("runs", { recursive: true });
-// Local-time stamp `YYYY-MM-DDTHH-MM-SS` — same clock as the local DDTHHMMSS used for
-// run dirs (see tsStamp), so the log name and dir names agree. (toISOString would be
-// UTC and drift from the dirs by the machine's offset.)
-const now = new Date();
-const z2 = (n: number) => String(n).padStart(2, "0");
-const stamp = `${now.getFullYear()}-${z2(now.getMonth() + 1)}-${z2(now.getDate())}T${z2(now.getHours())}-${z2(now.getMinutes())}-${z2(now.getSeconds())}`;
+mkdirSync(runsRoot, { recursive: true });
 const slug = historyArg ? "history" : `${turns}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
-const logPath = path.join("runs", `run-${stamp}-${slug}.log`);
+const logPath = path.join(runsRoot, `${tsStamp()}-${slug}.log`);
 appendFileSync(logPath, `npm run start -- ${process.argv.slice(2).join(" ")}\n`);
 // Synchronous append so the tail (rep results, tally) survives process.exit().
 const rawLog = console.log.bind(console);
@@ -138,13 +181,19 @@ console.log = (...args: unknown[]) => { const line = args.map(String).join(" ");
 console.log(`log: ${logPath}`);
 
 let pass = 0;
-let fail = 0;
+let fail = 0; // real oracle failures (NOUPLOAD/TIMEOUT/LOST/DUPL/SYNCBAD)
+let obsfail = 0; // client misreported its vault (-OBSFAIL)
+let unknown = 0; // couldn't judge — unparseable/unresponsive CLI, or ladder catch-all (-UNKNOWN)
 let conflicts = 0;
 const failures: string[] = [];
 const startedAt = Date.now();
+// The group dir currently accruing reps, so a Ctrl-C mid-soak can still tag it with -BAD<pct>
+// (tagHistoryDir is normally only called after a reps loop finishes on its own).
+let activeGroup: { strDir: string; groupName: string } | null = null;
 
+const nonOk = () => fail + obsfail + unknown;
 const tally = () =>
-  `\n=== TALLY: PASS=${pass} FAIL=${fail} reps=${pass + fail}  (reps with any conflict: ${conflicts}) ===` +
+  `\n=== TALLY: PASS=${pass} FAIL=${fail} OBSFAIL=${obsfail} UNKNOWN=${unknown} reps=${pass + nonOk()}  (reps with any conflict: ${conflicts}) ===` +
   (failures.length ? "\nfailing reps:\n" + failures.map((f) => "  " + f).join("\n") : "");
 
 // Permanent bottom status bar, TTY only. We reserve the last terminal row with a VT100
@@ -154,7 +203,7 @@ const tally = () =>
 // isn't a terminal (piped / background), leaving only the per-rep tally line.
 const isTTY = process.stdout.isTTY === true;
 const statusLine = () =>
-  `soak: ${pass + fail} reps · ${fail} failed · ${pass} passed` +
+  `soak: ${pass + nonOk()} reps · ${pass} passed · ${fail} failed · ${obsfail} obsfail · ${unknown} unknown` +
   (failures.length ? ` · last ${path.basename(failures[failures.length - 1])}` : "");
 function drawStatus(): void {
   const rows = process.stdout.rows ?? 0;
@@ -178,18 +227,11 @@ process.on("exit", statusBarOff);
 
 process.on("SIGINT", () => {
   statusBarOff();
+  if (activeGroup) tagHistoryDir(activeGroup.strDir, activeGroup.groupName);
   console.log(tally());
-  process.exit(fail === 0 ? 0 : 1);
+  process.exit(nonOk() === 0 ? 0 : 1);
 });
 
-// Human-readable wall-clock stamp DDTHHMMSS (local time), e.g. 25T181530 — used for
-// the history group dir (start ts) and each rep dir (its own ts). Day-of-month is
-// enough granularity for a soak; collisions within a dir get a -k suffix.
-const tsStamp = () => {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-};
 function uniqueRepId(strDir: string): string {
   const base = tsStamp();
   let name = base;
@@ -198,7 +240,7 @@ function uniqueRepId(strDir: string): string {
 }
 
 // Any rep dir carrying one of these suffixes is a non-OK rep.
-const FAIL_SUFFIXES = ["-UNSYNCED", "-TIMEOUT", "-LOST", "-DUPL", "-DIFF", "-FAIL"];
+const FAIL_SUFFIXES = ["-NOUPLOAD", "-TIMEOUT", "-LOST", "-DUPL", "-SYNCBAD", "-OBSFAIL", "-UNKNOWN"];
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(s));
 
@@ -210,13 +252,13 @@ function tagHistoryDir(strDir: string, groupName: string): void {
   const reps = readdirSync(strDir).filter((d) => isDir(path.join(strDir, d)));
   if (reps.length === 0) return;
   const bad = reps.filter(isBadRep).length;
-  const target = bad > 0 ? path.join("runs", `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
+  const target = bad > 0 ? path.join(runsRoot, `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
   if (target !== strDir) { try { renameSync(strDir, target); } catch { /* keep */ } }
 }
 
 async function runRep(history: History, str: string, strDir: string): Promise<void> {
   const id = uniqueRepId(strDir);
-  console.log(`  rep ${id}  (running: ${fail}/${pass + fail} failed)`);
+  console.log(`  rep ${id}  (running: ${nonOk()}/${pass + nonOk()} failed)`);
   drawStatus();
   const logger = new RunLogger(strDir, id);
   logger.artifact("meta.json", {
@@ -230,7 +272,32 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     nodes: nodesList.length,
   });
   const noteName = (L: string) => `${NOTE_DIR}/${id}-${L}-${str}`;
-  const { verdict, timings, forensics } = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
+
+  // A correctness-assumption violation (unparseable CLI output, a wedged CLI, or a client
+  // that misreports its own vault) is thrown deep in the driver/oracle. Catch it HERE — the
+  // single place every rep funnels through — so it becomes just another rep outcome
+  // (-UNKNOWN / -OBSFAIL) and the soak keeps running, with enough logged to iterate on it.
+  let outcome: Awaited<ReturnType<typeof runHistory>>;
+  try {
+    outcome = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
+  } catch (err) {
+    if (!(err instanceof AlarmError || err instanceof CliUnrecognizedOutput)) throw err; // a real crash
+    const d = describeAlarm(err);
+    recordAlarm(d, runsRoot);
+    logger.artifact(`${d.category}.json`, d);
+    let dir = logger.dir;
+    try { renameSync(logger.dir, logger.dir + d.suffix); dir = logger.dir + d.suffix; } catch { /* keep original */ }
+    failures.push(dir);
+    if (d.category === "obsfail") obsfail++; else unknown++;
+    console.log(
+      `  rep ${id}: *** ${d.suffix.slice(1)} *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}` +
+      `${d.command ? `\n    cmd: ${d.command}` : ""}${d.stdout !== undefined ? `\n    out: ${JSON.stringify(d.stdout)}` : ""}` +
+      ` → ${path.basename(dir)}`,
+    );
+    drawStatus();
+    return;
+  }
+  const { verdict, timings, forensics } = outcome;
 
   const lost = verdict.notes.flatMap((n) => n.lost);
   const duplicated = verdict.notes.flatMap((n) => n.duplicated);
@@ -247,16 +314,18 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
     console.log(`  rep ${id}: PASS${tag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
   } else {
-    fail++;
-    // Ranked, most-severe-first: never-synced > inconclusive timeout > real loss >
-    // duplication > divergence. -FAIL is a catch-all that should never fire.
+    // Ranked, most-severe-first: never-uploaded > inconclusive timeout > real loss >
+    // duplication > divergence. -UNKNOWN is a catch-all that should never fire here (a true
+    // "couldn't judge"); it's counted as `unknown`, the rest as real oracle failures.
     const suffix =
-      timings.unsynced ? "-UNSYNCED"
+      timings.unsynced ? "-NOUPLOAD"
       : timings.syncTimedOut ? "-TIMEOUT"
       : lost.length ? "-LOST"
       : duplicated.length ? "-DUPL"
-      : diverged ? "-DIFF"
-      : "-FAIL";
+      : diverged ? "-SYNCBAD"
+      : "-UNKNOWN";
+    assert(FAIL_SUFFIXES.includes(suffix), `verdict suffix ${suffix} is a known outcome`);
+    if (suffix === "-UNKNOWN") unknown++; else fail++;
     let dir = logger.dir;
     try { renameSync(logger.dir, logger.dir + suffix); dir = logger.dir + suffix; } catch { /* keep original */ }
     failures.push(dir);
@@ -272,7 +341,8 @@ async function runHistoryReps(history: History): Promise<void> {
   // Group dir carries the history's start ts, so each invocation is its own timestamped
   // dir (re-runs don't merge); rep subdirs inside carry their own ts.
   const groupName = `${tsStamp()}-${str}`;
-  const strDir = path.join("runs", groupName);
+  const strDir = path.join(runsRoot, groupName);
+  activeGroup = { strDir, groupName };
   console.log(`\n=== history ${str}  (×${repeat}) ===`);
   for (let r = 0; r < repeat; r++) await runRep(history, str, strDir);
   tagHistoryDir(strDir, groupName);
@@ -296,11 +366,19 @@ if (!values["skip-host-check"] && !(await hostOnline())) {
 // manufacture false losses/divergence).
 type PreflightRow = { node: string; reachable: boolean; state: string; notes: number };
 async function readState(d: ObsidianDriver): Promise<PreflightRow> {
-  const st = await d.syncStatus();
-  const state = st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "unreachable";
-  const files = await d.listFiles();
-  const notes = st.ok && files.ok ? (files.value?.length ?? 0) : -1;
-  return { node: d.node, reachable: st.ok, state, notes };
+  try {
+    const st = await d.syncStatus(); // validated status word (throws on unknown)
+    const files = await d.listFiles();
+    return { node: d.node, reachable: true, state: st.value ?? "?", notes: files.value?.length ?? 0 };
+  } catch (e) {
+    // A down/absent container fails at the exec layer (podman exit ≠ 0, empty stdout) →
+    // report unreachable so preflight aborts with a friendly message. A *code-0* unknown
+    // output is a real format problem, not a down node — let it propagate to the ALARM.
+    if (e instanceof CliUnrecognizedOutput && e.raw.code !== 0) {
+      return { node: d.node, reachable: false, state: "unreachable", notes: -1 };
+    }
+    throw e;
+  }
 }
 
 async function preflight(): Promise<boolean> {
@@ -358,11 +436,14 @@ if (historyArg) {
   // until stopped — not a fresh dir per batch. `--steps N` truncates the history to its
   // first N ops (a prefix, for shrinking a finding); the final settle still reconnects
   // any node left partitioned by the cut.
-  let hist = parse(historyArg);
+  // Normalize so the printed/dir string is exactly what executes (same as generated histories);
+  // then `--steps` truncates the canonical form to its first N ops.
+  let hist = normalize(parse(historyArg));
   if (steps > 0) hist = hist.slice(0, steps);
   const str = serialize(hist);
   const groupName = `${tsStamp()}-${str}`;
-  const strDir = path.join("runs", groupName);
+  const strDir = path.join(runsRoot, groupName);
+  activeGroup = { strDir, groupName };
   const soaking = histories <= 0 || durationMin > 0;
   console.log(`\n=== history ${str}  ${soaking ? "(soaking — stop to end)" : `(×${repeat})`} ===`);
   for (let r = 0; soaking ? keepGoing(r) : r < repeat; r++) await runRep(hist, str, strDir);
@@ -375,4 +456,4 @@ if (historyArg) {
 }
 
 console.log(tally());
-process.exit(fail === 0 ? 0 : 1);
+process.exit(nonOk() === 0 ? 0 : 1);

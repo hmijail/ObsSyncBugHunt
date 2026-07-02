@@ -12,7 +12,8 @@
 // oracle it calls is already unit-tested (src/oracle.test.ts).
 
 import { formatToken, type NodeId } from "./types.js";
-import { ObsidianDriver, isConflictFile, isAbsentRead } from "./driver.js";
+import { ObsidianDriver, isConflictFile } from "./driver.js";
+import { AlarmError } from "./alarm.js";
 import type { Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import {
@@ -36,9 +37,9 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function readCanonical(d: ObsidianDriver, note: string): Promise<string | null> {
   const r = await d.read(note);
-  // `read` exits 0 even when the note is absent (printing `Error: …not found.`);
-  // normalize that to null so it can't masquerade as canonical content.
-  return isAbsentRead(r.value) ? null : (r.value ?? null);
+  // read() positively distinguishes present (ok) from absent; normalize absent to null so
+  // it can't masquerade as canonical content.
+  return r.ok ? (r.value ?? null) : null;
 }
 
 /** Wait until every node's canonical content contains `marker`, or timeout. */
@@ -56,12 +57,6 @@ async function waitForPropagation(
     if (Date.now() > deadline) return false;
     await sleep(pollMs);
   }
-}
-
-// `sync:status` prints "key: value" lines for the active vault, e.g.
-// "status: synced". The `status:` line is our quiescence signal.
-function parseSyncState(out: string): string | null {
-  return /^status:\s*(.+)$/m.exec(out)?.[1]?.trim().toLowerCase() ?? null;
 }
 
 export interface QuiescenceResult {
@@ -87,17 +82,15 @@ async function waitForQuiescence(
   for (;;) {
     const probes = await Promise.all(
       drivers.map(async (d) => {
+        // syncStatus() returns the validated status word (or has already aborted on an
+        // unrecognized one), so res.value is authoritative.
         const res = await d.syncStatus();
-        const state = res.ok ? parseSyncState(res.value ?? "") : null;
-        return { node: d.node, raw: res.value ?? res.error ?? "", state };
+        return { node: d.node, state: res.value ?? null };
       }),
     );
 
-    // sync:status is the only signal — it must be understandable, or we stop.
     for (const p of probes) {
-      if (p.state === null) {
-        throw new Error(`sync:status on ${p.node} is unreadable (got: ${JSON.stringify(p.raw)})`);
-      }
+      if (p.state === null) throw new Error(`sync:status on ${p.node} returned no status`);
     }
 
     consecutiveSynced = probes.every((p) => p.state === "synced") ? consecutiveSynced + 1 : 0;
@@ -109,14 +102,22 @@ async function waitForQuiescence(
 
 export async function gatherObservation(d: ObsidianDriver, note: string): Promise<NodeObservation> {
   const canonical = await readCanonical(d, note);
+  const files = (await d.listFiles()).value ?? [];
+  // Anchor (positive identification of the listing): if the note reads as PRESENT, the
+  // folder listing MUST contain it. A listing that omits a note we just read is self-
+  // inconsistent — exactly the 2026-06-26 shape (an empty `files` while the read succeeded)
+  // that fabricated a "loss". Don't trust such a listing; raise a loud ALARM instead.
+  if (canonical !== null && !files.includes(`${note}.md`)) {
+    throw new AlarmError("cli-listing-inconsistent", {
+      node: d.node, note, listedCount: files.length,
+      detail: "note read as present but absent from `files` listing — listing untrustworthy",
+    });
+  }
   const conflicts: ConflictFile[] = [];
-  const files = await d.listFiles();
-  if (files.ok) {
-    for (const f of files.value ?? []) {
-      if (isConflictFile(f) && f.startsWith(`${note} (Conflicted copy`)) {
-        const c = await d.readByPath(f);
-        conflicts.push({ file: f, content: c.ok ? (c.value ?? "") : "" });
-      }
+  for (const f of files) {
+    if (isConflictFile(f) && f.startsWith(`${note} (Conflicted copy`)) {
+      const c = await d.readByPath(f);
+      conflicts.push({ file: f, content: c.ok ? (c.value ?? "") : "" });
     }
   }
   return { node: d.node, note, canonical, conflicts };
@@ -170,7 +171,7 @@ export async function runDivergenceRound(
   let seq = 0;
   for (const d of drivers) {
     seq += 1;
-    const token = formatToken({ node: d.node, seq });
+    const token = formatToken({ node: d.node, seq, note });
     const r = await d.appendLine(note, `edit ${token}`);
     logger.log({ kind: "append", node: d.node, note, token, ok: r.ok, code: r.raw.code });
     if (r.ok) acked.push({ note, node: d.node, token });

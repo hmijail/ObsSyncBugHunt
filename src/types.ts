@@ -10,6 +10,7 @@ export interface ExecResult {
   stderr: string;
   startedAt: string; // ISO 8601
   durationMs: number;
+  killed: boolean; // true if the process was killed by the timeout (untimely)
 }
 
 /** Structured outcome of a driver method. `raw` is kept for the audit trail. */
@@ -24,12 +25,12 @@ export interface OpResult<T = string> {
  * A uniquely-identifiable edit. We embed `formatToken(...)` into note content so
  * the oracle can locate each acknowledged edit by exact string match in the
  * canonical file OR any "(Conflicted copy ...)" file. `seq` is a per-run
- * monotonic counter and note names are unique per history, so `op-<node>-<seq>`
+ * monotonic counter and note names are unique per history, so `<node>-<seq>-<note>`
  * is already unique — no UUID needed.
  *
- * The token is wrapped in parens — `(op-<node>-<seq>)` — so it is
- * **self-delimiting**: without the closing `)`, `op-n1-1` would be a substring of
- * `op-n1-10`, making the oracle miscount occurrences (false-positive duplication,
+ * The token is wrapped in parens — `(<node>-<seq>-<note>)` — so it is
+ * **self-delimiting**: without the closing `)`, `n1-1-a` would be a substring of
+ * `n1-10-a`, making the oracle miscount occurrences (false-positive duplication,
  * and masked loss). Parens (not brackets) because `[ ]` reads as a task checkbox and
  * `[[ ]]` as a wikilink in Obsidian's editor — they render awkwardly in the GUI —
  * whereas parens are inert plain text. The CLI stores/returns raw markdown, so the
@@ -38,10 +39,11 @@ export interface OpResult<T = string> {
 export interface EditToken {
   node: NodeId;
   seq: number;
+  note: string; // logical note letter/name the edit was inserted into
 }
 
 export function formatToken(t: EditToken): string {
-  return `(op-${t.node}-${t.seq})`;
+  return `(${t.node}-${t.seq}-${t.note})`;
 }
 
 /**

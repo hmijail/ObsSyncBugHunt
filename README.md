@@ -6,20 +6,24 @@ same note is edited on multiple devices. Every edit goes through the **Obsidian 
 ## Generating sequences of edits with a tiny DSL
 
 A test is a **history** — a string of user actions replayed against
-containerized nodes. Commands are uppercase, parameters lowercase/digits. An
-**active node** and **active note** are cursors that persist until changed.
+containerized nodes. Commands are uppercase, parameters lowercase/digits. The
+**active node** is a cursor that persists until changed; each append names its own note.
 
 | Command | meaning |
 |---|---|
 | `N<d>` | set the active node (`N1`, `N2`) |
-| `E<x>` | select the active note (`Ea`); also opens it in the GUI |
-| `A`    | append a uniquely-tagged line to the active note, by the active node |
+| `A<x>` | append a uniquely-tagged line to note `x` (`Aa`), by the active node (first touch creates it; also opens it in the GUI) |
 | `D` / `C` | disconnect / connect the active node from the network |
-| `W`    | wait until the active node reports that the active note is synced |
+| `W`    | wait until the active node reports that the last-edited note is synced |
 | `P<n>` | pause ~`n` seconds (default 10) |
 
-Example: `N1EaAWN2A` → node 1 selects note `a`, appends, waits for sync; node 2
+Example: `N1AaWN2Aa` → node 1 appends to note `a`, waits for sync; node 2
 appends to the same note.
+
+Every history (generated or typed) is run through a `normalize` pass first, so the
+**printed string is exactly what executes**: a pause not adjacent to an action (`D`/`C`/`A`)
+floats forward to the next action (`N1PN2Aa` → `N2PAa`), redundant node-sets vanish, and
+adjacent same-note appends collapse.
 
 At the end of the history, the harness waits for all nodes to report synced (reconnecting them to the network if necessary).
 The thing varying across repeats is timing, as it depends on how fast the Obsidian CLI processes commands. Most importantly, Obsidian Sync itself will take its time, and the simulated user might wait for it to finish (command `W`).
@@ -37,20 +41,20 @@ single user and barely well-defined.
 
 Edits are append-only for now, since that is a case supported by the CLI, and the bug reports in the forum seem to hint that this should be enough to cause trouble.
 
-A history can be hand-written (`HISTORY=N1EaAWN2A`) or generated (see below), and
+A history can be hand-written (`HISTORY=N1AaWN2Aa`) or generated (see below), and
 each is **repeated** `REPEAT` times (default 10) to cope with Sync's nondeterminism.
 
 ## Judging whether there was a bug: token survival
 
-Each command `A` appends a unique token `(op-<node>-<seq>)` to the
+Each command `A` appends a unique token `(<node>-<seq>-<note>)` to the
 note. At the end of the history, the oracle (`src/oracle.ts`) checks that those tokens exist, either in the notes created during that history, or in any corresponding "Conflicted copy". It can detect 3 types of problems:
 
 - **loss** — a token was introduced but at the end of the history it's been lost;
 - **duplication** — a token repeated within a file;
 - **divergence** — nodes disagree on final content or conflict-file set.
 
-> The token is parenthesized so one can't be a substring of another (`(op-n1-1)` vs
-> `(op-n1-10)`); matching is also boundary-aware. Parens (not `[ ]`/`[[ ]]`, which
+> The token is parenthesized so one can't be a substring of another (`(n1-1-a)` vs
+> `(n1-10-a)`); matching is also boundary-aware. Parens (not `[ ]`/`[[ ]]`, which
 > read as a checkbox/wikilink in the editor) keep it inert plain text in the GUI. An
 > edit is only *acknowledged* after its token is read back locally — because
 > **`obsidian-cli` always exits 0** (a known upstream bug), success is judged by
@@ -70,12 +74,19 @@ Per repeat (a non-OK repeat's directory is suffixed):
 | *(none)* | PASS |
 | `-LOST` | an acknowledged edit is gone |
 | `-DUPL` | a token is duplicated (nodes still converged) |
-| `-DIFF` | nodes **settled** (all `synced`, state quiet) but disagree — different canonical, or a conflict file only one node holds |
-| `-UNSYNCED` | a note never reached the server (`sync:history total < 1`) |
+| `-SYNCBAD` | nodes **settled** (all `synced`, state quiet) but disagree — different canonical, or a conflict file only one node holds |
+| `-NOUPLOAD` | a note never reached the server (`sync:history total < 1`) |
 | `-TIMEOUT` | never even settled within the cap — a node never reached `synced`, or content kept changing; inconclusive (a host-internet outage doesn't count: the settle pauses until the host is back, then resumes) |
+| `-OBSFAIL` | a client **misreports its own vault** — obsidian-cli's `files` listing contradicts a direct `ls` of the vault, or its own `read` (a note reads as present but is missing from `files`). A real finding, not a Sync convergence issue. Logged to `runs/OBSFAIL.log` with the offending CLI line + throw site |
+| `-UNKNOWN` | couldn't judge — obsidian-cli returned output no recognizer matched (a format change → update the parser), or the CLI never answered within the retry budget. Logged to `runs/UNKNOWN.log` with the copy-paste CLI line + throw site |
 
 A history directory is suffixed `-BAD<pct>` with the percentage of non-OK repeats,
-so a soak is eyeball-scannable for where to dig. `npm run analyze` aggregates it all.
+so a soak is eyeball-scannable for where to dig. `npm run analyze` aggregates it all into
+`runs/analysis.md`: per history string, a markdown table of every rep's whole final state
+(every touched note, plus any conflict file, as `(node-seq-note)` tokens), grouped first by
+outcome (`PASS`/`LOST`/`DUPL`/...) so a recurring shape is visible at a glance — non-`PASS`
+tables also list which reps (by dir name) produced each shape. Never merged across different
+histories (note letters/tokens from unrelated DSL structures aren't comparable).
 
 ## Faults
 
@@ -140,8 +151,8 @@ make capture                      # copy the login into ./secrets (git-ignored),
 make containers-up                # launch n1 + n2 fresh
 make clean-data                   # fresh slate: empty the vault + wipe runs/
 
-make run HISTORY=N1EaAWN2A REPEAT=3      # one specific history
-make soak HISTORY=N1EaAWN2A              # soak ONE history forever (Ctrl-C); add STEPS=K for a prefix
+make run HISTORY=N1AaWN2Aa REPEAT=3      # one specific history
+make soak HISTORY=N1AaWN2Aa              # soak ONE history forever (Ctrl-C); add STEPS=K for a prefix
 make soak TURNS=paced                    # generate + run until Ctrl-C (overnight)
 make analyze                             # aggregate runs/ into a report
 ```
@@ -155,9 +166,9 @@ Timestamps are `DDTHHMMSS` — day-of-month, `T`, then hours/minutes/seconds, lo
 (e.g. `26T181530`); a `-2` is appended on the rare same-second collision within a dir.
 
 The notes a run creates are named `bughunt/<repTs>-<letter>-<history>` — e.g.
-`bughunt/26T181530-a-N1EaAN2WA.md`. `<repTs>` is the repeat's timestamp (keeps each
+`bughunt/26T181530-a-N1AaN2WAa.md`. `<repTs>` is the repeat's timestamp (keeps each
 repeat's notes distinct), the trailing `-<history>` is the DSL string, and `-<letter>`
-is the DSL note letter the concrete note maps to (the target of `Ea`), so a multi-note
+is the DSL note letter the concrete note maps to (the `x` in `Ax`), so a multi-note
 history (`NOTES>1`) yields `…-a-…`, `…-b-…`, … side by side.
 
 **Vault safety:** every note the harness creates lives under a `bughunt/` folder, and
@@ -194,7 +205,10 @@ Params are **CLI args** (args-only — env vars aren't read). Set them two ways:
 | `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
 | `CAP_SEC` | `--cap-sec` | 120 | hard ceiling on any single wait; exceeding it is a `-TIMEOUT` (inconclusive) |
 | `W_SETTLE_SEC` | `--w-settle-sec` | 4 | mid-history `W`: how long the converged + `synced` state must hold |
-| `FINAL_SETTLE_SEC` | `--final-settle-sec` | 6 | end-of-history settle window; longer than `W`'s, to absorb a lagging conflict file |
+| `FINAL_SETTLE_SEC` | `--final-settle-sec` | 15 | end-of-history settle window; longer than `W`'s — `W` only ever needs one node's own view (or, when a peer happens to be online too, one note's worth of cross-node convergence), while the final settle is the one point that judges the *whole* multi-node system across every note, so it needs more margin against a late second-hop sync |
+| `PROBE_SEC` | `--probe-sec` | 5 | per-call cap on the settle's `sync:status` probe — it blocks until synced, so this bounds it into a pollable "synced yet?" (a timeout reads as *still syncing*) |
+| `RUNS_PREFIX` | `--runs-prefix` | *(cwd)* | parent dir for the whole `runs/` tree, so a soak's artifacts (logs, rep dirs, `analysis.md`) can live somewhere other than the working directory |
+| `SKIP_SNAPSHOT_TIMING` | `--skip-snapshot-timing` | off | omit the pause-snapshot's per-call `ms` fields (a debug aid for diagnosing a slow snapshot, on by default) |
 
 ## Future work
 

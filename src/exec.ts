@@ -8,7 +8,14 @@ import type { ExecResult } from "./types.js";
 export interface Executor {
   /** A short label used as the NodeId in history (e.g. "local", "n1"). */
   readonly id: string;
-  exec(args: string[]): Promise<ExecResult>;
+  /** `opts.timeoutMs` bounds THIS call (default 120s). Used by the settle's bounded
+   *  `sync:status` probe: that command blocks until synced, so a short cap turns it into a
+   *  pollable "synced yet?" — a timeout (killed) means "still syncing". */
+  exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>;
+  /** Run a raw command in the node's environment (e.g. `ls`/`cat` on the vault FS).
+   *  Used as the independent second source when the CLI can't positively answer.
+   *  `opts.timeoutMs` bounds THIS call (default 120s), same as `exec`. */
+  shell(argv: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>;
 }
 
 /**
@@ -30,11 +37,15 @@ export function runProcess(
     execFile(
       file,
       args,
-      { maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs },
+      // killSignal SIGKILL: the default SIGTERM is ignored by a wedged `podman`, so the
+      // timeout wouldn't actually fire (a real 763s hang was seen). SIGKILL makes the
+      // cap real, so `killed` is a trustworthy "untimely" signal for the retry loop.
+      { maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs, killSignal: "SIGKILL" },
       (err, stdout, stderr) => {
         const e = err as (NodeJS.ErrnoException & { code?: number; killed?: boolean }) | null;
         const code = e && typeof e.code === "number" ? e.code : err ? 1 : 0;
-        const extra = e?.killed ? ` [killed after ${timeoutMs}ms]` : "";
+        const killed = e?.killed === true;
+        const extra = killed ? ` [killed after ${timeoutMs}ms]` : "";
         resolve({
           argv: [file, ...args],
           code,
@@ -42,6 +53,7 @@ export function runProcess(
           stderr: (stderr ?? "") + extra,
           startedAt: startedAt.toISOString(),
           durationMs: Date.now() - startedAt.getTime(),
+          killed,
         });
       },
     );
@@ -54,8 +66,11 @@ export class LocalExecutor implements Executor {
     private readonly obsidianBin: string,
     readonly id = "local",
   ) {}
-  exec(args: string[]) {
-    return runProcess(this.obsidianBin, args);
+  exec(args: string[], opts?: { timeoutMs?: number }) {
+    return runProcess(this.obsidianBin, args, opts?.timeoutMs);
+  }
+  shell(argv: string[], opts?: { timeoutMs?: number }) {
+    return runProcess(argv[0], argv.slice(1), opts?.timeoutMs);
   }
 }
 
@@ -66,7 +81,10 @@ export class PodmanExecutor implements Executor {
     private readonly obsidianBin: string,
     readonly id = container,
   ) {}
-  exec(args: string[]) {
-    return runProcess("podman", ["exec", this.container, this.obsidianBin, ...args]);
+  exec(args: string[], opts?: { timeoutMs?: number }) {
+    return runProcess("podman", ["exec", this.container, this.obsidianBin, ...args], opts?.timeoutMs);
+  }
+  shell(argv: string[], opts?: { timeoutMs?: number }) {
+    return runProcess("podman", ["exec", this.container, ...argv], opts?.timeoutMs);
   }
 }

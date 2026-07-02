@@ -52,9 +52,13 @@ test("generateHistory: edit count bounded, valid ops, serializable", () => {
 
 test("collapse: no two adjacent collapsible ops of the same kind", () => {
   for (let s = 1; s <= 25; s++) {
-    const h = generateHistory({ nodes: 3, ops: [4, 12], turns: "paced", partitionProb: 0.3, pauseProb: 0.2, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 3, ops: [4, 12], turns: "paced", partitionProb: 0.3, pauseProb: 0.2, notes: 2, rng: mulberry32(s) });
     for (let i = 1; i < h.length; i++) {
-      assert.ok(!(h[i].cmd === h[i - 1].cmd && COLLAPSIBLE.includes(h[i].cmd)), `adjacent ${h[i].cmd}: ${serialize(h)}`);
+      // Adjacent appends are only redundant when they target the SAME note (different
+      // notes back-to-back are legitimate); the rest of COLLAPSIBLE never repeats adjacently.
+      const redundant = h[i].cmd === h[i - 1].cmd && COLLAPSIBLE.includes(h[i].cmd) &&
+        (h[i].cmd !== "append" || h[i].note === h[i - 1].note);
+      assert.ok(!redundant, `adjacent ${h[i].cmd}: ${serialize(h)}`);
     }
   }
 });

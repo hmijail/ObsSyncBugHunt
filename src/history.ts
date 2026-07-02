@@ -6,15 +6,18 @@ import path from "node:path";
 
 export class RunLogger {
   readonly dir: string;
+  private readonly start = Date.now(); // rep start, for relative timestamps
 
   constructor(base = "runs", name = new Date().toISOString().replace(/[:.]/g, "-")) {
     this.dir = path.join(base, name);
     mkdirSync(this.dir, { recursive: true });
   }
 
-  /** Append one timestamped event (op, fault, milestone) to history.jsonl. */
+  /** Append one event to history.jsonl. Relative time `t` (seconds since rep start) leads so
+   *  a plain-text read is easy to eyeball; the noisy absolute `ts` trails at the end. */
   log(event: Record<string, unknown>): void {
-    const line = JSON.stringify({ ts: new Date().toISOString(), ...event });
+    const t = Number(((Date.now() - this.start) / 1000).toFixed(3));
+    const line = JSON.stringify({ t, ...event, ts: new Date().toISOString() });
     appendFileSync(path.join(this.dir, "history.jsonl"), line + "\n");
     console.log(`· ${line}`);
   }

@@ -8,9 +8,10 @@
 // an acked edit absent from the vault after settling; sync:read is recorded only
 // as a severity witness.
 
-import { formatToken, type NodeId } from "./types.js";
-import { isAbsentRead } from "./driver.js";
-import type { ObsidianDriver } from "./driver.js";
+import assert from "node:assert/strict";
+import { formatToken, NOTE_DIR, type NodeId } from "./types.js";
+import { isConflictFile, type ObsidianDriver } from "./driver.js";
+import { AlarmError } from "./alarm.js";
 import type { Isolator } from "./isolate.js";
 import type { RunLogger } from "./history.js";
 import { sleep, gatherObservation } from "./runner.js";
@@ -31,17 +32,25 @@ export interface ExecuteOpts {
   capSec?: number; // soft cap on a wait (default 120)
   // Settled = every node reports `synced` AND the observed state has been unchanged
   // for this window. Convergence is judged separately by the oracle, so a stable but
-  // divergent state finishes here (as `-DIFF`) instead of waiting out the cap. The
+  // divergent state finishes here (as `-SYNCBAD`) instead of waiting out the cap. The
   // window absorbs a just-lagging conflict file; keep it short since `synced` already
   // means "Sync is idle".
   wSettleSec?: number; // mid-history W: quiescent-for window (default 4)
-  finalSettleSec?: number; // final settle: quiescent-for window (default 6)
+  finalSettleSec?: number; // final settle: quiescent-for window (default 15)
+  // Per-call cap on the settle's `sync:status` probe (default 5). `sync:status` blocks until
+  // synced, so this bounds it into a pollable "synced yet?" — a timeout means "still syncing".
+  // Must stay comfortably above a synced node's instant reply, well below the settle window.
+  probeSec?: number;
   // When the settle cap elapses, tell a Sync failure apart from a host-internet
   // outage: if the host itself is offline, wait for connectivity to return and restart
   // the window instead of recording a false timeout. Disabled by --skip-host-check —
   // a sandbox with no outbound TCP would otherwise treat the cap as a permanent outage
   // and wait forever. Default on.
   hostCheck?: boolean;
+  // Per-call `ms` timing on the pause-snapshot (debug/observability aid — see the "pause"
+  // case). Default ON (this round's diagnosis of a slow snapshot); --skip-snapshot-timing
+  // turns it off later without touching the snapshot logic itself.
+  snapshotTiming?: boolean;
 }
 
 export interface LostForensic {
@@ -81,10 +90,12 @@ function signature(notes: string[], obs: NodeObservation[]): string {
   return parts.join("\n");
 }
 
-/** A node's own sync state, e.g. "synced" / "syncing" (or "error"/"?" if unreadable). */
-async function syncState(d: ObsidianDriver): Promise<string> {
-  const st = await d.syncStatus();
-  return st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "error";
+/** A node's own sync state via the BOUNDED probe, e.g. "synced" / "syncing" / "timeout" (killed
+ *  before a reply came back — not positively confirmed as any specific state) / "?" (unreadable).
+ *  Bounded so the settle loop polls instead of blocking ~70s on `sync:status` (which would
+ *  straddle the quiescence window and fabricate a `-SYNCBAD` — see waitForSynced). */
+async function syncState(d: ObsidianDriver, probeMs: number): Promise<string> {
+  return d.syncStateProbe(probeMs);
 }
 
 /**
@@ -93,46 +104,75 @@ async function syncState(d: ObsidianDriver): Promise<string> {
  * canonical content AND conflict-file set) has been unchanged for `settleSec`.
  * Crucially, settling does NOT require the nodes to AGREE — a stable disagreement
  * (e.g. a conflict file that only ever lands on one node, both nodes calling
- * themselves synced) is a real divergence for the oracle to judge as `-DIFF`, not
+ * themselves synced) is a real divergence for the oracle to judge as `-SYNCBAD`, not
  * something to wait out to the cap (which would mislabel it `-TIMEOUT`). The quiet
  * window means we never stop mid-propagation; `minFloorSec` guards the just-after-
  * connect case where a sync hasn't started yet. No blind dwell — this is the explicit
  * wait. Only a node that never reaches `synced`, or content that never stops changing,
  * actually times out.
  */
-async function waitForSynced(
+export async function waitForSynced(
   drivers: ObsidianDriver[],
   notes: string[],
   settleSec: number,
   opts: ExecuteOpts,
   logger: RunLogger,
   context: Record<string, unknown> = {},
-): Promise<{ seconds: number; timedOut: boolean; unsynced: boolean }> {
+): Promise<{ seconds: number; timedOut: boolean; unsynced: boolean; observations: NodeObservation[] }> {
   const pollMs = (opts.pollSec ?? 1) * 1000;
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
-  let start = Date.now();
-  if (notes.length === 0 || drivers.length === 0) return { seconds: 0, timedOut: false, unsynced: false };
+  const probeMs = (opts.probeSec ?? 5) * 1000;
+  if (notes.length === 0 || drivers.length === 0) return { seconds: 0, timedOut: false, unsynced: false, observations: [] };
 
-  const baseline = await readTotals(drivers, notes);
+  // Baseline server-version counts (the `from` reference) are read LAZILY, the first time
+  // every node is synced — NOT up front. `sync:history total` blocks until the queried node has
+  // caught up, so reading it on a just-reconnected, still-syncing node would stall the whole
+  // settle (~64s) before the bounded-probe loop even starts. Gate on the probe instead.
+  let baseline: Record<string, number> | null = null;
+  let start = Date.now();
   let lastSig: string | null = null;
   let lastChange = start;
+  let obs: NodeObservation[] = []; // last SYNCED snapshot; the verdict reuses it
   for (;;) {
-    const obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
-    const sig = signature(notes, obs);
-    const now = Date.now();
-    if (sig !== lastSig) { lastSig = sig; lastChange = now; }
+    // 1. Bounded sync-state probe FIRST. We must NOT read content from a still-syncing node:
+    //    the read blocks (~70s) AND returns mid-flux content, which fabricated a -SYNCBAD. The
+    //    probe is bounded (≤ probeMs), so a not-yet-synced node reads "timeout" instead of
+    //    blocking (or a genuine other status word, if the CLI actually replied with one in time).
+    const tProbe = Date.now();
+    const states = await Promise.all(drivers.map((d) => syncState(d, probeMs)));
+    const everySynced = states.every((s) => s === "synced");
+    const probeWallMs = Date.now() - tProbe;
 
-    // Settled = every node reports `synced` AND the observed state (canonical +
-    // conflict sets) has been quiet for the window. Convergence is NOT required —
-    // a stable, synced disagreement is a real `-DIFF` the oracle should judge, not
-    // something to wait out to the cap. The quiet window means we never stop mid-
-    // propagation; floorMs covers the just-after-connect gap before a sync starts.
-    const everySynced = (await Promise.all(drivers.map(syncState))).every((s) => s === "synced");
-    const quietMs = now - lastChange;
+    // 2. Only once every node is synced do we read content and re-sample the signature, so the
+    //    quiet window is measured over synced, genuinely re-sampled snapshots (not a stale one).
+    let sigChanged = false;
+    let gatherWallMs = 0;
+    if (everySynced) {
+      const tGather = Date.now();
+      if (baseline === null) baseline = await readTotals(drivers, notes); // synced now → fast
+      obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
+      assert.equal(obs.length, drivers.length * notes.length, "settle samples every (node, note)");
+      const sig = signature(notes, obs);
+      if (sig !== lastSig) { lastSig = sig; lastChange = Date.now(); sigChanged = true; }
+      gatherWallMs = Date.now() - tGather;
+    }
+
+    const now = Date.now();
+    const quietMs = everySynced ? now - lastChange : 0;
     const elapsed = now - start;
-    const done = everySynced && quietMs >= settleMs && elapsed >= floorMs;
+    // Settled = every node `synced` AND the observed state (canonical + conflict sets) quiet for
+    // the window. Convergence is NOT required — a stable, synced disagreement is a real `-SYNCBAD`
+    // for the oracle, not something to wait out to the cap. floorMs covers the just-after-connect
+    // gap before a sync starts.
+    const done = everySynced && obs.length > 0 && quietMs >= settleMs && elapsed >= floorMs;
+
+    // Per-poll trace so the settle's time-spend is visible: repeated states with probeMs≈cap and a
+    // node reading "timeout" is genuine sync latency (the probe keeps getting killed at the cap
+    // because the node genuinely isn't synced yet); a large gatherMs means a content read blocked.
+    logger.log({ kind: "settle-poll", elapsedSec: Math.round(elapsed / 1000), states, everySynced, sigChanged, quietSec: Math.round(quietMs / 1000), probeMs: probeWallMs, gatherMs: gatherWallMs, ...context });
+
     // Cap elapsed without quiescence. Before recording a Sync timeout, rule out a HOST
     // outage: if the host can't reach the internet, the container can't sync for
     // reasons that aren't Obsidian's. Wait for connectivity to return, then restart the
@@ -144,11 +184,20 @@ async function waitForSynced(
       start = Date.now();
       lastChange = start;
       lastSig = null;
+      obs = [];
       continue;
     }
     const timedOut = !done && elapsed > capMs;
     if (done || timedOut) {
+      // On a timeout before any synced snapshot, take one best-effort observation so the verdict
+      // and forensics aren't empty-handed (the one place we read a node that isn't synced).
+      if (obs.length === 0) obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
+      // State-machine invariants: a clean settle means every node is synced AND its signature
+      // held for the whole window; anything else can only exit here by hitting the cap.
+      assert(everySynced || timedOut, "settle finishes only when every node is synced, or the cap elapsed");
+      assert(!done || quietMs >= settleMs, "a clean settle held its signature for the full window");
       const totals = await readTotals(drivers, notes);
+      baseline ??= totals; // straight-to-timeout (never synced) → no earlier baseline; use these
       const seconds = Math.round(elapsed / 1000);
       // A note with no server-side history (total < 1) never reached the server —
       // it is NOT synced however quiescent the local vault looks. Distinct from a
@@ -158,7 +207,7 @@ async function waitForSynced(
         // Capture each node's own sync state — a wedged node (e.g. stuck "syncing"
         // after a network reconnect) is the usual cause and is worth seeing later.
         for (const d of drivers) {
-          logger.log({ kind: "status-at-timeout", node: d.node, state: await syncState(d) });
+          logger.log({ kind: "status-at-timeout", node: d.node, state: await syncState(d, probeMs) });
         }
       }
       // Snapshot the settled content for the audit trail — a time series across the
@@ -181,9 +230,39 @@ async function waitForSynced(
         const kind = timedOut ? "sync-timeout" : totals[n] < 1 ? "unsynced" : "synced";
         logger.log({ kind, note: n, from: baseline[n], to: totals[n], seconds, ...context });
       }
-      return { seconds, timedOut, unsynced };
+      // Return THIS observation (the one that satisfied `done`): its signature held
+      // unchanged across the whole settle window, so it's confirmed across many reads.
+      // Callers must use it rather than a fresh re-read — a single `files` listing can
+      // transiently drop a conflict file and fabricate a "loss".
+      return { seconds, timedOut, unsynced, observations: obs };
     }
     await sleep(pollMs);
+  }
+}
+
+/**
+ * Independent FS second-source check at the SETTLED verdict: the set of `.md` files the CLI
+ * reports in `folder` must EXACTLY match what's actually on disk (`ls`). A file the CLI
+ * reports that the FS lacks is the forum "conflict file was never really created" bug; a file
+ * on disk the CLI omits is the 2026-06-26 empty-listing bug. Either way → ALARM. Skipped when
+ * the driver has no vault path (local/dev). Run only once settled, so a mid-sync difference
+ * can't fire.
+ */
+export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): Promise<void> {
+  for (const d of drivers) {
+    const fs = await d.listDirFs(folder);
+    if (!fs.ok && fs.reason === "unavailable") return; // no FS path configured → skip
+    const cli = new Set((await d.listFiles(folder)).value ?? []);
+    const onDisk = new Set((fs.ok ? fs.entries : []).map((e) => `${folder}/${e}`));
+    const cliReportedButNotOnDisk = [...cli].filter((x) => !onDisk.has(x));
+    const onDiskButNotReported = [...onDisk].filter((x) => !cli.has(x));
+    if (cliReportedButNotOnDisk.length || onDiskButNotReported.length) {
+      throw new AlarmError("cli-fs-disagreement", {
+        node: d.node, folder,
+        cliReportedButNotOnDisk: cliReportedButNotOnDisk.slice(0, 10), cliOnlyCount: cliReportedButNotOnDisk.length,
+        onDiskButNotReported: onDiskButNotReported.slice(0, 10), fsOnlyCount: onDiskButNotReported.length,
+      });
+    }
   }
 }
 
@@ -211,10 +290,7 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
 async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, logger: RunLogger): Promise<void> {
   const deadline = Date.now() + capSec * 1000;
   for (;;) {
-    const states = await Promise.all(drivers.map(async (d) => {
-      const st = await d.syncStatus();
-      return st.ok ? (/^status:\s*(\S+)/m.exec(st.value ?? "")?.[1] ?? "?") : "error";
-    }));
+    const states = await Promise.all(drivers.map(async (d) => (await d.syncStatus()).value ?? "?"));
     if (states.every((s) => s === "synced")) { logger.log({ kind: "baseline-synced", states }); return; }
     if (Date.now() > deadline) { logger.log({ kind: "baseline-sync-timeout", states }); return; }
     await sleep(1000);
@@ -232,11 +308,15 @@ export async function runHistory(
   const str = serialize(history);
   logger.artifact("history.json", { string: str, ops: history });
 
-  // Network is the only isolation layer, so sync stays on the whole run.
-  for (const d of drivers) {
-    const r = await d.syncResume();
-    logger.log({ kind: "resume", node: d.node, ok: r.ok });
-  }
+  // Route the driver's cli-unresponsive (wait-for-recovery) events, and the isolator's own
+  // internal network-reachability retries, into this rep's trace.
+  for (const d of drivers) d.onEvent = (e) => logger.log(e);
+  isolator.onEvent = (e) => logger.log(e);
+
+  // No `sync on` here: the network isolator (the default fault primitive) never calls `sync
+  // off`, so resuming would be an unforced call with nothing to undo. `preflight()` already
+  // resumed once at harness startup (the real one-time paused state after `make containers-up`);
+  // Sync stays on for the whole session from there.
   // Start from a known-clean baseline: don't begin editing until every node is synced.
   await waitNodesSynced(drivers, opts.capSec ?? 120, logger);
 
@@ -247,23 +327,79 @@ export async function runHistory(
   let activeNote: string | undefined;
   const offline = new Set<number>(); // node numbers currently network-disconnected
   const touched = new Set<string>(); // concrete note names seen this run
+  const noteLetters = new Map<string, string>(); // concrete note name -> its logical DSL letter
   const acked: AckedEdit[] = [];
   let seq = 0;
+  // Per-call cap for any mid-history bounded sync-state probe (pause snapshots), same knob and
+  // rationale as the settle's own probe: never block on a not-yet-synced node.
+  const probeMs = (opts.probeSec ?? 5) * 1000;
 
   for (const op of history) {
     switch (op.cmd) {
       case "node":
         activeNode = op.node!;
         break;
-      case "select":
-        activeNote = opts.noteName(op.note!);
-        touched.add(activeNote);
-        await driverOf(activeNode).open(activeNote); // foreground in the GUI (no-op if not yet created)
-        break;
-      case "pause":
-        logger.log({ kind: "pause", node: activeNode, seconds: op.seconds });
+      case "pause": {
+        // Logged at FINISH (after the sleep), like every other event kind — consistent with
+        // disconnect/connect/pause-snapshot/etc., none of which log their intent before starting.
         await sleep((op.seconds ?? DEFAULT_PAUSE_SEC) * 1000);
+        logger.log({ kind: "pause", seconds: op.seconds });
+        // Snapshot every node (not just the active one — the whole point is seeing what a
+        // DISCONNECTED node's own local state looks like during a D…P…C window, invisible
+        // otherwise until the final settle). A snapshot is a LOOK, not a judgment: every call
+        // is a single bounded attempt via the driver's snapshot* methods — never the paranoid,
+        // retrying read()/files()/listDirFs() the oracle uses. A wedged or unrecognized reply
+        // is recorded as-is, never chased, so a snapshot can never itself stall the harness.
+        //
+        // `NOTE_DIR` accumulates every rep of a soak, so a bare folder listing is mostly
+        // OTHER reps' notes. Scope both listings down to files that belong to THIS rep: an
+        // entry is relevant iff it's exactly one of our touched notes, or a "(Conflicted
+        // copy ...)" of one. `fs` entries are bare filenames (a raw `ls` inside the folder);
+        // `files` entries carry the NOTE_DIR/ prefix (the CLI's own vault-relative paths).
+        const touchedList = [...touched];
+        const noteBase = (fullname: string) => fullname.slice(NOTE_DIR.length + 1); // strip "bughunt/"
+        const isRelevant = (entry: string, base: string) => entry === `${base}.md` || entry.startsWith(`${base} (Conflicted copy`);
+        // A synced node's sync:status replies in well under a second (live-measured: 0.24-0.46s);
+        // an unsynced one blocks for the WHOLE budget regardless (it never returns early with a
+        // "syncing" word — see syncStateProbe), so a short cap here just makes that wasted wait
+        // cheap. Separate from the settle's own probeMs (unchanged, different concern).
+        const SNAPSHOT_SYNC_PROBE_MS = 1000;
+        // Debug/observability aid (this round's ~15s-snapshot investigation): time each call
+        // individually, without affecting their concurrency. Default on; --skip-snapshot-timing
+        // (opts.snapshotTiming === false) drops the `ms` fields with no other code change.
+        const mkTimed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms?: number }> => {
+          const t0 = Date.now();
+          const value = await fn();
+          return { value, ms: opts.snapshotTiming === false ? undefined : Date.now() - t0 };
+        };
+        const nodesSnapshot = await Promise.all(
+          drivers.map(async (d) => {
+            const [syncT, fsT, filesT, notesT] = await Promise.all([
+              mkTimed(() => syncState(d, SNAPSHOT_SYNC_PROBE_MS)),
+              mkTimed(() => d.snapshotFs(NOTE_DIR, probeMs)),
+              mkTimed(() => d.snapshotFiles(NOTE_DIR, probeMs)),
+              Promise.all(touchedList.map(async (fullname) => {
+                const { value: r, ms } = await mkTimed(() => d.snapshotRead(fullname, probeMs));
+                return [noteLetters.get(fullname) ?? fullname, ms !== undefined ? { ...r, ms } : r] as const;
+              })),
+            ]);
+            const fsRelevant = (fsT.value.entries ?? []).filter((e) => touchedList.some((f) => isRelevant(e, noteBase(f))));
+            const filesRelevant = (filesT.value.entries ?? []).filter((e) => touchedList.some((f) => isRelevant(e, f)));
+            // Conflict-file NAMES only (from the one `files` call — cheap, bounded, no
+            // per-file follow-up reads); their content is what the settle-time oracle judges.
+            const conflicts = filesRelevant.filter(isConflictFile);
+            return {
+              node: d.node,
+              sync: syncT.ms !== undefined ? { state: syncT.value, ms: syncT.ms } : syncT.value,
+              fs: { status: fsT.value.status, entries: fsRelevant, ...(fsT.ms !== undefined ? { ms: fsT.ms } : {}) },
+              files: { status: filesT.value.status, conflicts, ...(filesT.ms !== undefined ? { ms: filesT.ms } : {}) },
+              notes: Object.fromEntries(notesT),
+            };
+          }),
+        );
+        logger.log({ kind: "pause-snapshot", seconds: op.seconds, nodes: nodesSnapshot });
         break;
+      }
       case "disconnect":
         await isolator.disconnect(driverOf(activeNode).node);
         offline.add(activeNode);
@@ -272,7 +408,7 @@ export async function runHistory(
       case "connect":
         await isolator.connect(driverOf(activeNode).node);
         offline.delete(activeNode);
-        logger.log({ kind: "reconnect", node: driverOf(activeNode).node });
+        logger.log({ kind: "connect", node: driverOf(activeNode).node });
         break;
       case "wait": {
         if (!activeNote) break; // nothing selected to wait on
@@ -288,9 +424,12 @@ export async function runHistory(
         break;
       }
       case "append": {
-        if (!activeNote) break;
+        const noteLetter = op.note!;
+        activeNote = opts.noteName(noteLetter); // logical letter -> concrete vault note (also the W target)
+        touched.add(activeNote);
+        noteLetters.set(activeNote, noteLetter);
         const d = driverOf(activeNode);
-        const token = formatToken({ node: d.node, seq: ++seq });
+        const token = formatToken({ node: d.node, seq: ++seq, note: noteLetter });
         // Exit codes are meaningless (the CLI always exits 0) and append-to-missing
         // silently no-ops, so an edit is only acked after its token is read back
         // locally. If it doesn't land, retry a few times (logging each miss as
@@ -303,11 +442,11 @@ export async function runHistory(
         let created = false;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS && !landed; attempt++) {
           const before = await d.read(activeNote);
-          if ((before.value ?? "").includes(token)) { landed = true; break; }
+          if (before.ok && (before.value ?? "").includes(token)) { landed = true; break; }
           // Create if THIS node doesn't have the note locally yet, else append. So
           // editing before propagation is a natural create-create; after, it's
-          // append-contention — timing decides, no forced sync.
-          const exists = !isAbsentRead(before.value);
+          // append-contention — timing decides, no forced sync. `before.ok` = present.
+          const exists = before.ok;
           created = !exists;
           // Foreground the note on the EDITING node before each edit — the active
           // node changes via `N` without re-selecting, so opening here (not just on
@@ -315,35 +454,44 @@ export async function runHistory(
           if (exists) { await d.open(activeNote); await d.appendLine(activeNote, token); }
           else { await d.createNote(activeNote, token); await d.open(activeNote); }
           const back = await d.read(activeNote);
-          landed = (back.value ?? "").includes(token);
-          if (!landed) logger.log({ kind: "edit-unconfirmed", node: d.node, note: activeNote, token, attempt });
+          landed = back.ok && (back.value ?? "").includes(token);
+          if (!landed) logger.log({ kind: "edit-unconfirmed", node: d.node, note: noteLetter, token, attempt, fullname: activeNote });
         }
         if (landed) {
-          logger.log({ kind: created ? "create" : "append", node: d.node, note: activeNote, token });
+          // Always `append` so the log mirrors the history; `created` marks a create-create
+          // (conflict genesis). The noisy exploded name trails as `fullname`.
+          logger.log({ kind: "append", node: d.node, note: noteLetter, token, created, fullname: activeNote });
           acked.push({ note: activeNote, node: d.node, token });
         } else {
-          logger.log({ kind: "edit-failed", node: d.node, note: activeNote, token, attempts: MAX_ATTEMPTS });
+          logger.log({ kind: "edit-failed", node: d.node, note: noteLetter, token, attempts: MAX_ATTEMPTS, fullname: activeNote });
         }
         break;
       }
     }
   }
 
-  // Final settle: reconnect everyone, ensure syncing, wait until all agree, then
-  // dwell (conflict files lag) before observing.
+  // Final settle: reconnect everyone (no `sync on` — see the rep-start comment above: the
+  // network isolator never turns sync off, so there's nothing to resume), wait until all
+  // agree, then dwell (conflict files lag) before observing.
   for (const num of offline) {
     await isolator.connect(driverOf(num).node);
-    logger.log({ kind: "reconnect", node: driverOf(num).node });
+    logger.log({ kind: "connect", node: driverOf(num).node });
   }
   offline.clear();
-  for (const d of drivers) await d.syncResume();
   const noteList = [...touched];
   // Final settle: wait until the whole vault (canonical + conflict files) is
   // converged and quiescent for the long window — explicitly waiting out the
   // conflict file's own ~2-round-trip sync rather than dwelling blindly.
-  const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 6, opts, logger, { final: true });
+  const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 15, opts, logger, { final: true });
 
-  const observations = await Promise.all(drivers.flatMap((d) => noteList.map((n) => gatherObservation(d, n))));
+  // Judge from the settle's window-confirmed observation, NOT a fresh re-read: a single
+  // `files folder=…` listing can transiently omit a conflict file, which would fabricate
+  // a "loss" for edits that are actually preserved in that file (seen 2026-06-26).
+  const observations = stab.observations;
+  // Independent FS second-source: at this settled point, what the CLI lists under bughunt/
+  // must exactly match what's on disk — or ALARM (catches phantom/never-written conflict
+  // files and listing dropouts alike).
+  await crossCheckFs(drivers, NOTE_DIR);
   const verdict = checkRun(acked, observations);
 
   // Surface conflict-file structure: device named in the file (the producing node),
@@ -367,6 +515,6 @@ export async function runHistory(
     unsynced: stab.unsynced,
   };
   logger.log({ kind: "timings", ...timings });
-  logger.results({ history: str, timings, acked, observations, verdict, forensics });
+  logger.results({ history: str, timings, acked, observations, verdict, forensics, noteLetters: Object.fromEntries(noteLetters) });
   return { verdict, acked, observations, timings, forensics };
 }

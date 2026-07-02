@@ -10,10 +10,10 @@
 // Coordination only applies while both editors are online — you can't take a turn
 // across a partition. With `partitionProb>0` it also opens random `D`…`C`
 // partitions (one or more nodes go offline, edits diverge, then they heal), so the
-// `staleReconnect` preset is just a biased corner of this space. Consecutive
-// same-kind ops are collapsed (back-to-back local edits add no contention).
+// `staleReconnect` preset is just a biased corner of this space. The result is run
+// through `normalize` (see dsl.ts) so the emitted string is exactly what executes.
 
-import { DEFAULT_PAUSE_SEC, type Cmd, type History } from "./dsl.js";
+import { DEFAULT_PAUSE_SEC, normalize, type History } from "./dsl.js";
 
 export type Turns = "barrier" | "paced" | "concurrent";
 
@@ -47,7 +47,6 @@ export function generateHistory(params: GenParams): History {
 
   const ops: History = [];
   let curNode = 0;
-  let curNote = "";
   let prevEditor = 0;
   const offline = new Set<number>(); // nodes currently partitioned
   const offlineSince = new Map<number, number>(); // node -> edit index it went offline
@@ -82,40 +81,18 @@ export function generateHistory(params: GenParams): History {
     const n = randInt(rng, 1, nodeCount);
     const note = pick(rng, letters);
     setNode(n);
-    if (note !== curNote) { ops.push({ cmd: "select", note }); curNote = note; }
     // Coordinate a cross-node edit per `turns`, but only while both editors are
     // online (you can't take a turn across a partition — divergence is the point).
     if (turns !== "concurrent" && prevEditor && prevEditor !== n && !offline.has(n) && !offline.has(prevEditor)) {
       ops.push(turns === "barrier" ? { cmd: "wait" } : { cmd: "pause", seconds: DEFAULT_PAUSE_SEC });
     }
-    ops.push({ cmd: "append" });
+    ops.push({ cmd: "append", note });
     if (rng() < pauseProb) ops.push({ cmd: "pause", seconds: DEFAULT_PAUSE_SEC });
     prevEditor = n;
   }
   for (const v of [...offline]) reconnect(v); // never leave a node partitioned at the end
 
-  return collapse(ops);
-}
-
-const DEDUP = new Set<Cmd>(["append", "disconnect", "connect", "wait"]);
-
-/** Collapse adjacent redundancy in generated histories: a duplicate of a bare op
- *  (append/disconnect/connect/wait) is dropped, and consecutive pauses are summed.
- *  `node`/`select` carry params and are left alone. */
-function collapse(ops: History): History {
-  const out: History = [];
-  for (const op of ops) {
-    const prev = out[out.length - 1];
-    if (prev && prev.cmd === op.cmd) {
-      if (op.cmd === "pause") {
-        prev.seconds = (prev.seconds ?? DEFAULT_PAUSE_SEC) + (op.seconds ?? DEFAULT_PAUSE_SEC);
-        continue;
-      }
-      if (DEDUP.has(op.cmd)) continue;
-    }
-    out.push({ ...op });
-  }
-  return out;
+  return normalize(ops);
 }
 
 /**
@@ -131,16 +108,16 @@ export function staleReconnect(params: GenParams): History {
   const other = stale === 1 ? Math.min(2, nodeCount) : 1;
 
   const ops: History = [
-    { cmd: "node", node: other }, { cmd: "select", note: "a" }, { cmd: "append" }, { cmd: "pause", seconds: DEFAULT_PAUSE_SEC }, // base; pause lets it propagate naturally
+    { cmd: "node", node: other }, { cmd: "append", note: "a" }, { cmd: "pause", seconds: DEFAULT_PAUSE_SEC }, // base; pause lets it propagate naturally
     { cmd: "node", node: stale }, { cmd: "disconnect" }, { cmd: "pause", seconds: 30 }, // deliberately long stale window
   ];
   let cur = stale;
   for (let i = 0; i < edits; i++) {
     const n = randInt(rng, 1, nodeCount);
     if (n !== cur) { ops.push({ cmd: "node", node: n }); cur = n; }
-    ops.push({ cmd: "append" }); // note `a` is still selected
+    ops.push({ cmd: "append", note: "a" });
   }
   if (cur !== stale) ops.push({ cmd: "node", node: stale });
   ops.push({ cmd: "connect" });
-  return ops;
+  return normalize(ops);
 }

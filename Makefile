@@ -50,11 +50,14 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(MIN_FLOOR_SEC),--min-floor-sec $(MIN_FLOOR_SEC)) \
   $(if $(CAP_SEC),--cap-sec $(CAP_SEC)) \
   $(if $(W_SETTLE_SEC),--w-settle-sec $(W_SETTLE_SEC)) \
-  $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC))
+  $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
+  $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
+  $(if $(RUNS_PREFIX),--runs-prefix $(RUNS_PREFIX)) \
+  $(if $(SKIP_SNAPSHOT_TIMING),--skip-snapshot-timing)
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
-        build net secrets-dir clean-secrets login capture node1 containers-up solo-check run campaign soak analyze generate \
+        build net secrets-dir clean-secrets login capture node1 containers-up solo-check reconnect run campaign soak analyze generate \
         clean-runs clean-notes clean-data clean-images trial containers-down ps logs health
 
 help: ## Show this help
@@ -116,11 +119,24 @@ capture: ## Copy the login out of the container into ./secrets, then stop it
 	podman rm -f $(LOGIN)
 	@echo "Captured login into $(SECRETS) (git-ignored). Next: make containers-up"
 
+# Pinned per-node network identity (see src/isolate.ts's nodeAddress — same scheme, kept in
+# sync): node number from the trailing digits of its name; X = 100+number; IP 10.89.0.<X>
+# (matches obsidian-net's actual 10.89.0.0/24 subnet); MAC 6e:62:6e:65:74:<X in hex> ("nbnet",
+# not the cleaner "obnet" — the first byte's I/G bit marks individual/group addressing, and
+# 0x6f ('o') has it SET, i.e. multicast, which the kernel refuses to assign to a real interface;
+# 0x6e ('n') is a valid unicast, locally-administered first byte). The last byte must still be
+# hex, not decimal digits. Applied at every `podman run`/`network connect` for a node so a
+# reconnect restores the SAME identity the container has had since its very first start — the
+# identity never changes at all, on the theory that Sync recognizing "the same device,
+# unchanged" reconnects faster than a fresh join.
+NODE_ADDR = num=$${n\#n}; addr=$$((100+num)); ip=10.89.0.$$addr; mac=6e:62:6e:65:74:$$(printf '%02x' $$addr)
+
 node1: build net ## Run a single node (n1) with VNC published, for inspection/debugging
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
 	-podman rm -f n1 2>/dev/null || true
-	podman run -d --name n1 --hostname n1 --network $(NET) \
-	  -p $(VNC_PORT):5900 -v $(SECRETS):/secrets:ro $(IMAGE)
+	@n=n1; $(NODE_ADDR); \
+	  podman run -d --name n1 --hostname n1 --network $(NET) --ip $$ip --mac-address $$mac \
+	    -p $(VNC_PORT):5900 -v $(SECRETS):/secrets:ro $(IMAGE)
 	@scripts/wait-node.sh n1
 	@echo "n1 ready. Inspect via VNC: vnc://localhost:$(VNC_PORT) (password: obsidian)."
 
@@ -128,8 +144,9 @@ containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC publi
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
 	@port=$(VNC_PORT); for n in $(NODES); do \
 	  podman rm -f $$n 2>/dev/null || true; \
-	  echo "starting $$n (VNC localhost:$$port)"; \
-	  podman run -d --name $$n --hostname $$n --network $(NET) \
+	  $(NODE_ADDR); \
+	  echo "starting $$n (VNC localhost:$$port, $$ip)"; \
+	  podman run -d --name $$n --hostname $$n --network $(NET) --ip $$ip --mac-address $$mac \
 	    -p $$port:5900 -v $(SECRETS):/secrets:ro $(IMAGE); \
 	  port=$$((port+1)); \
 	done
@@ -158,17 +175,30 @@ solo-check:
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
-run: solo-check ## Run ONE history: generated, or HISTORY=<dsl> (REPEAT=N; STEPS=K runs only its first K ops)
+reconnect: ## Reconnect all NODES to the network (fixes a node left detached by an interrupted soak)
+	@for n in $(NODES); do \
+	  $(NODE_ADDR); \
+	  $(PODMAN_GUARD) podman network connect --ip $$ip --mac-address $$mac $(NET) $$n 2>/dev/null && echo "reconnected $$n ($$ip)" || echo "$$n already connected (or absent)"; \
+	done
+
+# run/campaign/soak depend on `reconnect`: a Ctrl-C'd soak can leave a node detached (a `D`
+# with no matching `C`), and partitions are always per-rep, so every node should be attached
+# at the start of a run. (Not folded into `net`: that runs before containers exist.)
+run: solo-check reconnect ## Run ONE history: generated, or HISTORY=<dsl> (REPEAT=N; STEPS=K runs only its first K ops)
 	npm run start -- $(RUN_FLAGS)
 
-campaign: solo-check ## Run HISTORIES histories and tally the error rate (HISTORIES=N TURNS=... OPS=...)
+campaign: solo-check reconnect ## Run HISTORIES histories and tally the error rate (HISTORIES=N TURNS=... OPS=...)
 	npm run start -- --histories $(or $(HISTORIES),20) $(RUN_FLAGS)
 
-soak: solo-check ## Run until stopped (Ctrl-C); DURATION_MIN=N for a fixed span. HISTORY=<dsl> soaks that one history
+soak: solo-check reconnect ## Run until stopped (Ctrl-C); DURATION_MIN=N for a fixed span. HISTORY=<dsl> soaks that one history
 	npm run start -- --histories 0 $(RUN_FLAGS)
 
-analyze: ## Aggregate runs/ into a report (CONFIRMED losses, conflicts, sync-time distribution)
-	npm run analyze
+# RUNS_PREFIX-aware path to the runs/ tree, so analyze/clean-runs/clean-data stay consistent
+# with wherever `make run`/`soak` (via --runs-prefix) put it.
+RUNS_DIR := $(if $(RUNS_PREFIX),$(RUNS_PREFIX)/runs,runs)
+
+analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync-time distribution)
+	npm run analyze -- $(RUNS_DIR)
 
 generate: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB/SCENARIO)
 	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
@@ -177,10 +207,10 @@ clean-notes: solo-check ## Delete the harness's notes (the bughunt/ folder only)
 	npm run clean-notes -- --nodes $(NODES_CSV)
 
 clean-runs: ## Wipe local run results/logs (rm -rf runs/)
-	rm -rf runs
+	rm -rf $(RUNS_DIR)
 
 clean-data: clean-notes ## Fresh slate for a soak: clear the harness's notes (bughunt/) + wipe runs/ (nodes must be up)
-	rm -rf runs
+	rm -rf $(RUNS_DIR)
 
 trial: containers-up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
 

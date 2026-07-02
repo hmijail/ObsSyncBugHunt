@@ -1,17 +1,165 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isAbsentRead, isConflictFile } from "./driver.js";
-
-test("isAbsentRead: empty / not-found read counts as absent (Bug B)", () => {
-  // `read` exits 0 even when the note is missing, so absence is content-based.
-  assert.equal(isAbsentRead(undefined), true);
-  assert.equal(isAbsentRead(""), true);
-  assert.equal(isAbsentRead("   "), true);
-  assert.equal(isAbsentRead('Error: File "286040-a" not found.'), true);
-  assert.equal(isAbsentRead("(op-n1-1)"), false);
-});
+import { ObsidianDriver, isConflictFile } from "./driver.js";
+import { CliUnrecognizedOutput } from "./cli-parse.js";
+import type { Executor } from "./exec.js";
+import type { ExecResult } from "./types.js";
 
 test("isConflictFile matches the (Conflicted copy …) pattern", () => {
   assert.equal(isConflictFile("shared (Conflicted copy n2 202606211146).md"), true);
   assert.equal(isConflictFile("shared.md"), false);
+});
+
+// Executor that replays a queued list of stdout strings (one per exec call), so we can
+// simulate a node answering `sync:history total` with the transient sync-error a few times
+// before it reconnects and returns a real count.
+const SYNC_ERR = "Error: Sync is in error state. Check sync settings.\n";
+class ScriptedExecutor implements Executor {
+  id = "n1";
+  calls = 0;
+  constructor(private readonly outputs: string[]) {}
+  async exec(args: string[]): Promise<ExecResult> {
+    const stdout = this.outputs[Math.min(this.calls++, this.outputs.length - 1)];
+    return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+test("runRecognized: a read riding out a transient sync-error retries then returns the recovered value", async () => {
+  const exec = new ScriptedExecutor([SYNC_ERR, SYNC_ERR, "7"]); // disconnected twice, then a real total
+  const d = new ObsidianDriver(exec);
+  d.recognizeBackoffMs = 0; // no real waiting in the test
+  const events: Record<string, unknown>[] = [];
+  d.onEvent = (e) => events.push(e);
+
+  const r = await d.syncVersionsTotal("bughunt/x.md");
+  assert.equal(r.ok, true);
+  assert.equal(r.value, 7);
+  assert.equal(exec.calls, 3); // two transient replies + the recovered one
+  assert.equal(events.filter((e) => e.kind === "cli-output-unrecognized-retry").length, 2);
+  assert.equal(events[0].recognizer, "parseTotal");
+});
+
+test("runRecognized: a read that never recovers gives up as CliUnrecognizedOutput naming the recognizer", async () => {
+  const d = new ObsidianDriver(new ScriptedExecutor([SYNC_ERR])); // stuck forever
+  d.recognizeBackoffMs = 0;
+  await assert.rejects(
+    () => d.syncVersionsTotal("bughunt/x.md"),
+    (err: unknown) => err instanceof CliUnrecognizedOutput && err.recognizer === "parseTotal",
+  );
+});
+
+// One canned ExecResult for every exec — used to drive the bounded sync:status probe.
+class FixedExecutor implements Executor {
+  id = "n1";
+  lastTimeoutMs?: number;
+  constructor(private readonly result: Partial<ExecResult>) {}
+  async exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+    this.lastTimeoutMs = opts?.timeoutMs;
+    return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false, ...this.result };
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+test("syncStateProbe: a timed-out (killed) sync:status reads as 'timeout', not an outage or an inferred state", async () => {
+  const exec = new FixedExecutor({ killed: true });
+  const d = new ObsidianDriver(exec);
+  assert.equal(await d.syncStateProbe(5000), "timeout"); // never enters the killed→ALARM path; no unconfirmed guess
+  assert.equal(exec.lastTimeoutMs, 5000); // the short cap was actually applied to the call
+});
+
+test("syncStateProbe: a quick recognized reply returns the status word", async () => {
+  const d = new ObsidianDriver(new FixedExecutor({ stdout: "status: synced\nvault: TestVault" }));
+  assert.equal(await d.syncStateProbe(5000), "synced");
+});
+
+test("syncStateProbe: an unreadable reply → '?' and a one-off event (caller keeps polling)", async () => {
+  const d = new ObsidianDriver(new FixedExecutor({ stdout: "wat?" }));
+  const events: Record<string, unknown>[] = [];
+  d.onEvent = (e) => events.push(e);
+  assert.equal(await d.syncStateProbe(5000), "?");
+  assert.equal(events.filter((e) => e.kind === "sync-status-unreadable").length, 1);
+});
+
+// Executor that always answers the same canned exec/shell result and COUNTS calls — proves
+// the snapshot* methods make exactly ONE attempt (no retry-for-recognition, no
+// retry-for-unresponsiveness), unlike the paranoid read()/files()/listDirFs() they're
+// deliberately NOT built on.
+class CountingExecutor implements Executor {
+  id = "n1";
+  execCalls = 0;
+  shellCalls = 0;
+  lastExecTimeoutMs?: number;
+  lastShellTimeoutMs?: number;
+  constructor(private readonly execResult: Partial<ExecResult> = {}, private readonly shellResult: Partial<ExecResult> = {}) {}
+  async exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+    this.execCalls++;
+    this.lastExecTimeoutMs = opts?.timeoutMs;
+    return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false, ...this.execResult };
+  }
+  async shell(argv: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+    this.shellCalls++;
+    this.lastShellTimeoutMs = opts?.timeoutMs;
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false, ...this.shellResult };
+  }
+}
+
+test("snapshotRead: a killed reply → 'timeout' in exactly one attempt (no unresponsive retry)", async () => {
+  const exec = new CountingExecutor({ killed: true });
+  const d = new ObsidianDriver(exec);
+  const r = await d.snapshotRead("bughunt/x", 50);
+  assert.deepEqual(r, { status: "timeout" });
+  assert.equal(exec.execCalls, 1);
+  assert.equal(exec.lastExecTimeoutMs, 50);
+});
+
+test("snapshotRead: an unrecognized (empty) reply → 'unrecognized' in exactly one attempt (no recognize retry)", async () => {
+  const exec = new CountingExecutor({ stdout: "" });
+  const d = new ObsidianDriver(exec);
+  const r = await d.snapshotRead("bughunt/x", 50);
+  assert.equal(r.status, "unrecognized");
+  assert.equal(exec.execCalls, 1); // NOT the ~15x runRecognized would attempt
+});
+
+test("snapshotRead: a present note returns its content in one attempt", async () => {
+  const exec = new CountingExecutor({ stdout: "(n1-1-a)" });
+  const d = new ObsidianDriver(exec);
+  assert.deepEqual(await d.snapshotRead("bughunt/x", 50), { status: "present", content: "(n1-1-a)" });
+  assert.equal(exec.execCalls, 1);
+});
+
+test("snapshotFiles: a killed reply → 'timeout' in exactly one attempt", async () => {
+  const exec = new CountingExecutor({ killed: true });
+  const d = new ObsidianDriver(exec);
+  assert.deepEqual(await d.snapshotFiles("bughunt", 50), { status: "timeout" });
+  assert.equal(exec.execCalls, 1);
+});
+
+test("snapshotFiles: a normal listing returns entries in one attempt", async () => {
+  const exec = new CountingExecutor({ stdout: "bughunt/a.md\nbughunt/a (Conflicted copy n2 202606300000).md" });
+  const d = new ObsidianDriver(exec);
+  const r = await d.snapshotFiles("bughunt", 50);
+  assert.equal(r.status, "ok");
+  assert.equal(r.entries?.length, 2);
+  assert.equal(exec.execCalls, 1);
+});
+
+test("snapshotFs: a killed shell reply → 'timeout' in exactly one attempt (no ~10min unresponsive retry)", async () => {
+  const exec = new CountingExecutor({}, { killed: true });
+  const d = new ObsidianDriver(exec, "/vault");
+  const r = await d.snapshotFs("bughunt", 50);
+  assert.deepEqual(r, { status: "timeout" });
+  assert.equal(exec.shellCalls, 1);
+  assert.equal(exec.lastShellTimeoutMs, 50);
+});
+
+test("snapshotFs: no vaultPath configured → 'unavailable', no call at all", async () => {
+  const exec = new CountingExecutor();
+  const d = new ObsidianDriver(exec); // no vaultPath
+  assert.deepEqual(await d.snapshotFs("bughunt", 50), { status: "unavailable" });
+  assert.equal(exec.shellCalls, 0);
 });
