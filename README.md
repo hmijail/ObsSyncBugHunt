@@ -103,7 +103,7 @@ real, in-use vault, the tester should keep your own notes safe.
 | `NOTES` | `--notes` | 1 | distinct notes per history (1 = max contention) |
 | `TURNS` | `--turns` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
 | `PAUSE_PROB` | `--pause-prob` | 0 | chance of a ~10s pause after an edit |
-| `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ nodes) |
+| `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ total participants — numbered nodes + the Mac if `mac` is in `NODES`; a single numbered node plus the Mac is enough) |
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
 | `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2,mac` / `obsidian-net` / `/opt/…` | container plumbing — the literal `mac` entry is the on/off switch for the Mac node (see below); drop it (`NODES=n1,n2`) for no Mac participation. Container-lifecycle targets (`containers-up`/`down`, `reconnect`, `clean-notes`) always skip `mac` automatically — it's never treated as a podman container |
 | `MAC_BIN` | `--mac-bin` | `.../Obsidian.app/Contents/MacOS/obsidian-cli` | path to a local `obsidian-cli` binary (NOT the GUI `Obsidian` binary — the CLI is much faster per-call), used only when `mac` is in `NODES`/`--nodes`. A history containing `M` with `mac` missing from `NODES` (or `mac` present with no `MAC_BIN`) fails fast at startup rather than crashing mid-run |

@@ -23,7 +23,8 @@ export interface GenParams {
   notes?: number; // distinct notes (default 1 = max contention)
   turns?: Turns; // cross-node coordination (default "barrier")
   pauseProb?: number; // chance of a default-length pause after an edit (default 0)
-  partitionProb?: number; // chance per edit-step of opening a network partition (needs nodes>1; default 0)
+  partitionProb?: number; // chance per edit-step of opening a network partition (needs 2+ total
+                           // participants — numbered nodes + Mac if enabled; default 0)
   macEnabled?: boolean; // include the Mac (M) as an edit target; NEVER a D/C target (default false)
   rng?: () => number; // default Math.random; injectable for tests
 }
@@ -73,9 +74,15 @@ export function generateHistory(params: GenParams): History {
   for (let i = 0; i < count; i++) {
     // Maybe open a partition on a random currently-online NUMBERED node — multiple (up to
     // all) can be offline at once. The Mac is never in this pool (see GenParams.macEnabled).
+    // A partition is only meaningful if some OTHER participant can stay online to diverge
+    // against — that other participant can be a second numbered node, or the Mac (it's always
+    // online), so the gate is on total participants, not nodeCount alone: with just one numbered
+    // node and the Mac enabled, disconnecting that one node while the Mac keeps editing is
+    // exactly the interesting case, and nodeCount>1 alone would wrongly rule it out.
     const onlineNodes: number[] = [];
     for (let x = 1; x <= nodeCount; x++) if (!offline.has(x)) onlineNodes.push(x);
-    if (partitionProb > 0 && nodeCount > 1 && onlineNodes.length > 0 && rng() < partitionProb) {
+    const totalParticipants = nodeCount + (macEnabled ? 1 : 0);
+    if (partitionProb > 0 && totalParticipants > 1 && onlineNodes.length > 0 && rng() < partitionProb) {
       disconnect(pick(rng, onlineNodes), i);
     }
     // Heal each offline node that has lingered past the step it went offline

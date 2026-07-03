@@ -32,7 +32,8 @@
 //   --notes          distinct notes per history              (default 1)
 //   --turns          barrier | paced | concurrent            (default barrier)
 //   --pause-prob     chance of a ~10s pause after an edit     (default 0)
-//   --partition-prob chance per edit of a network partition   (default 0; needs 2+ nodes)
+//   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
+//                    participants — numbered nodes + Mac if "mac" is in --nodes)
 //   --repeat         reps per history                         (default 10)
 //   --histories      number of histories to run (<=0 = until killed) (default 1)
 //   --duration-min   run for N minutes instead of a count

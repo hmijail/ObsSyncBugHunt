@@ -111,6 +111,26 @@ test("macEnabled: the Mac is picked as an edit target but is NEVER a D/C target,
   assert.ok(sawMac, "expected at least one generated history to select the Mac as an edit target");
 });
 
+test("partitions: a single numbered node + the Mac still partitions (the Mac counts as a second participant)", () => {
+  // Regression guard: partitioning used to gate on nodeCount>1 alone, so a single numbered node
+  // (nodes: 1) with macEnabled never partitioned at all, regardless of partitionProb — even
+  // though the Mac staying online while that one node disconnects is exactly the interesting
+  // case (matches --nodes n1,mac in practice).
+  let sawPartition = false;
+  for (let s = 1; s <= 30; s++) {
+    const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, macEnabled: true, rng: mulberry32(s) });
+    if (h.some((o) => o.cmd === "disconnect")) sawPartition = true;
+  }
+  assert.ok(sawPartition, "expected at least one partition with nodes:1 + macEnabled:true");
+});
+
+test("partitions: a single numbered node with NO Mac still never partitions (only one participant, nothing to stay online)", () => {
+  for (let s = 1; s <= 20; s++) {
+    const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "disconnect"), `unexpected partition with only 1 participant: ${serialize(h)}`);
+  }
+});
+
 test("staleReconnect: disconnect early, pause, edits, reconnect", () => {
   const h = staleReconnect({ nodes: 2, ops: [4, 4], rng: mulberry32(3) });
   assert.ok(h.some((o) => o.cmd === "disconnect"));
