@@ -13,6 +13,12 @@ test("generateScript: sources the bash library exactly once, near the top", () =
   assert.match(script, /^#!\/usr\/bin\/env bash\nset -u\n# N1Aa\nsource '.*\/scripts\/repro-lib\.sh'/);
 });
 
+test("generateScript: without --run-id, RUN_ID defaults to the history string itself, not a timestamp", () => {
+  const { runId: _unused, ...noRunId } = baseOpts;
+  const script = generateScript(parse("N1DMAaWN1AaC"), { ...noRunId, macBin: "/path/to/obsidian-cli" });
+  assert.match(script, /^RUN_ID='N1DMAaWN1AaC'$/m); // note paths are built at runtime from NOTE_DIR/RUN_ID inside repro-lib.sh
+});
+
 test("generateScript: a plain append is a single, explicit function call — no inline shell", () => {
   const script = generateScript(parse("N1Aa"), baseOpts);
   assert.match(script, /^Append 1 a$/m);

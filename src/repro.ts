@@ -11,7 +11,7 @@
 //   --network       podman network                                   (default obsidian-net)
 //   --mac-bin       path to a local obsidian-cli binary — required iff --history contains M
 //   --mac-node-id   the Mac's own Sync-reported device name           (default: OS `hostname`)
-//   --run-id        slug embedded in note names                      (default repro-<timestamp>)
+//   --run-id        slug embedded in note names                      (default: the history itself)
 //   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
 //   --out           where to write the script (mode 0755); default runs/<run-id>.sh; "-" prints
 //                    to stdout instead of writing a file
@@ -33,7 +33,7 @@ export interface ReproOpts {
   network: string; // podman network
   macBin?: string; // Mac CLI path; required iff the history uses M
   macNodeId?: string; // the Mac's own node id, embedded in its tokens (same role as d.node)
-  runId?: string; // slug embedded in note names; default repro-<timestamp>
+  runId?: string; // slug embedded in note names; default: the (normalized) history string itself
   waitCapSec?: number; // bounded poll cap for Wait, default 60
   waitPollSec?: number; // poll interval, default 2
 }
@@ -43,12 +43,6 @@ const RUN_ID_RE = /^[a-zA-Z0-9_-]+$/;
 // scripts/repro-lib.sh, resolved from this file's own location (one level up from src/) — an
 // absolute path, since the generated script can be printed to stdout and saved anywhere.
 const LIB_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "repro-lib.sh");
-
-function tsStamp(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
 
 /** Single-quote a value for safe bash embedding (paths/tokens here never contain a `'`, but
  *  quoting costs nothing and guards against a future change). */
@@ -65,7 +59,10 @@ export function generateScript(history: History, opts: ReproOpts): string {
   if (usesMac(h) && !opts.macBin) {
     throw new Error(`history "${serialize(h)}" uses M (the Mac node) but no --mac-bin was given — pass --mac-bin <path> or remove M from the history.`);
   }
-  const runId = opts.runId ?? `repro-${tsStamp()}`;
+  // Default to the history itself (already known safe as a filename/note-path component — the
+  // DSL's own alphabet is a subset of RUN_ID_RE) rather than a timestamp, so both the script's
+  // default filename and the notes it creates are self-describing at a glance.
+  const runId = opts.runId ?? serialize(h);
   if (!RUN_ID_RE.test(runId)) {
     throw new Error(`--run-id "${runId}" must match ${RUN_ID_RE} (it's embedded in note paths)`);
   }
@@ -196,8 +193,10 @@ if (isMain) {
   }
 
   // Resolved here (not left to generateScript's own default) so the same value can also name
-  // the default output file below.
-  const runId = values["run-id"] ?? `repro-${tsStamp()}`;
+  // the default output file below. Mirrors generateScript's own default exactly (the normalized
+  // history string) — cheap and pure to recompute, not worth changing generateScript's return
+  // type just to avoid one extra normalize/serialize call.
+  const runId = values["run-id"] ?? serialize(normalize(history));
 
   let script: string;
   try {

@@ -38,8 +38,9 @@ make repro HISTORY=N1DAaWN2AaC           # write a standalone bash script reprod
 ```
 
 `make repro` bypasses the harness's own execution engine entirely — it writes an executable plain
-bash script to `runs/<run-id>.sh` (`OUT=<path>` to write elsewhere instead; `OUT=-` to print to
-stdout instead of writing a file) for manually poking at one specific finding. The history
+bash script to `runs/<history>.sh` (named after the history itself, e.g. `runs/N1DAaWN2AaC.sh`;
+`OUT=<path>` to write elsewhere instead, `OUT=-` to print to stdout instead of writing a file) for
+manually poking at one specific finding. The history
 translates into a short, flat sequence of calls to a handful of functions (`Disconnect 1`, `Append 1 a`,
 `Wait 1`, ...) defined once in `scripts/repro-lib.sh` (a small hand-maintained bash library every
 generated script sources) — deliberately simplistic: one-shot commands, no retries, no per-note
