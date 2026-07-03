@@ -55,7 +55,7 @@ import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js"
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
-import { parse, serialize, normalize, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesMac, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
@@ -130,7 +130,7 @@ const steps = Number(values.steps ?? 0); // with --history: run only its first N
 // the DSL grammar accepts `M` regardless of whether the Mac is actually wired up, so nothing
 // else catches this mismatch.
 const parsedHistory = historyArg ? normalize(parse(historyArg)) : undefined;
-if (parsedHistory && !macBin && parsedHistory.some((op) => op.cmd === "mac")) {
+if (parsedHistory && !macBin && usesMac(parsedHistory)) {
   console.error(`history "${historyArg}" uses M (the Mac node) but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> (and optionally --mac-node-id) or remove M from the history.`);
   process.exit(2);
 }

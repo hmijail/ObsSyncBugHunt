@@ -196,3 +196,9 @@ export function normalize(h: History): History {
   assertMacAlwaysConnected(result);
   return result;
 }
+
+/** Whether a history ever selects the Mac — callers use this to require `--mac-bin` before
+ *  running/generating anything for it, rather than failing deep inside execute.ts/repro.ts. */
+export function usesMac(h: History): boolean {
+  return h.some((op) => op.cmd === "mac");
+}

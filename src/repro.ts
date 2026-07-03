@@ -1,0 +1,240 @@
+// Generate a standalone bash script that reproduces a DSL history's real commands, bypassing
+// execute.ts/runHistory entirely — for manual debugging of one specific finding. Deliberately
+// simplistic: no retries, no read-verify-token loop, no settle/quiet-window logic (see
+// execute.ts for the real thing) — a flat, readable, tweakable transcript, not a second source
+// of truth for verdicts.
+//
+//   --history       DSL string to reproduce                        (required)
+//   --nodes         comma-separated container names                 (default n1,n2)
+//   --bin           CLI path inside the container                    (default /opt/obsidian/obsidian-cli)
+//   --network       podman network                                   (default obsidian-net)
+//   --mac-bin       path to a local obsidian-cli binary — required iff --history contains M
+//   --mac-node-id   the Mac's own Sync-reported device name           (default: OS `hostname`)
+//   --run-id        slug embedded in note names                      (default repro-<timestamp>)
+//   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
+//   --out           write the script to a file (mode 0755) instead of printing it to stdout
+//
+//   npm run repro -- --history N1DMAaWN1AaC --mac-bin /path/to/obsidian-cli
+
+import { writeFileSync } from "node:fs";
+import { parseArgs } from "node:util";
+import { parse, serialize, normalize, usesMac, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
+import { nodeAddress } from "./isolate.js";
+import { formatToken, NOTE_DIR } from "./types.js";
+import { runProcess } from "./exec.js";
+
+export interface ReproOpts {
+  nodes: string[]; // container names, e.g. ["n1","n2"] (index 0 = node 1, etc.)
+  bin: string; // container CLI path
+  network: string; // podman network
+  macBin?: string; // Mac CLI path; required iff the history uses M
+  macNodeId?: string; // the Mac's own node id, embedded in its tokens (same role as d.node)
+  runId?: string; // slug embedded in note names; default repro-<timestamp>
+  waitCapSec?: number; // bounded poll cap for W / the final wait, default 60
+  waitPollSec?: number; // poll interval, default 2
+}
+
+const RUN_ID_RE = /^[a-zA-Z0-9_-]+$/;
+
+function tsStamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/** Single-quote a value for safe bash embedding (paths/tokens here never contain a `'`, but
+ *  quoting costs nothing and guards against a future change). */
+function sq(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+type Target = { label: string; bin: string; nodeId: string };
+
+function targetOf(activeNode: number | "mac", opts: ReproOpts): Target {
+  if (activeNode === "mac") return { label: "mac", bin: `"$MAC_BIN"`, nodeId: opts.macNodeId ?? "mac" };
+  const container = opts.nodes[activeNode - 1];
+  return { label: container, bin: `podman exec ${container} "$BIN"`, nodeId: container };
+}
+
+/** The exact bounded, simplistic poll this tool uses for every W and the final wait: check
+ *  `sync:status`'s `status: <word>` line, warn (don't abort) if it never says "synced". */
+function waitBlock(label: string, bin: string, iterations: number, capSec: number, pollSec: number): string[] {
+  return [
+    `for i in $(seq 1 ${iterations}); do`,
+    `  status=$(${bin} sync:status)`,
+    `  [[ "$status" == status:\\ synced* ]] && break`,
+    `  sleep ${pollSec}`,
+    `done`,
+    `if [[ "$status" != status:\\ synced* ]]; then`,
+    `  echo "WARNING: ${label} never reported synced after ${capSec}s — continuing anyway" >&2`,
+    `fi`,
+  ];
+}
+
+/** Turn a (possibly un-normalized) DSL history into a standalone bash script performing the
+ *  same real commands. Pure/synchronous — no I/O, no side effects. Throws a plain Error (with a
+ *  message meant to be printed as-is, not a stack trace) for a malformed --run-id or a history
+ *  that uses M without a configured Mac. */
+export function generateScript(history: History, opts: ReproOpts): string {
+  const h = normalize(history); // same canonicalization every history goes through before running
+  if (usesMac(h) && !opts.macBin) {
+    throw new Error(`history "${serialize(h)}" uses M (the Mac node) but no --mac-bin was given — pass --mac-bin <path> or remove M from the history.`);
+  }
+  const runId = opts.runId ?? `repro-${tsStamp()}`;
+  if (!RUN_ID_RE.test(runId)) {
+    throw new Error(`--run-id "${runId}" must match ${RUN_ID_RE} (it's embedded in note paths)`);
+  }
+  const waitCapSec = opts.waitCapSec ?? 60;
+  const waitPollSec = opts.waitPollSec ?? 2;
+  const iterations = Math.max(1, Math.round(waitCapSec / waitPollSec));
+  const wait = (label: string, bin: string) => waitBlock(label, bin, iterations, waitCapSec, waitPollSec);
+
+  const lines: string[] = [
+    "#!/usr/bin/env bash",
+    "set -u",
+    "#",
+    `# Generated by 'make repro' — reproduces history: ${serialize(h)}`,
+    `# nodes=${opts.nodes.join(",")} network=${opts.network} bin=${opts.bin}${opts.macBin ? ` mac-bin=${opts.macBin}` : ""}`,
+    "# Simplistic: one-shot commands, no retries, no settle/quiet-window logic — see execute.ts",
+    "# for the real thing. Exit codes are meaningless here too (the CLI always exits 0); every",
+    "# branch below decides from the actual reply text, never $?.",
+    "",
+    `BIN=${sq(opts.bin)}`,
+  ];
+  if (opts.macBin) lines.push(`MAC_BIN=${sq(opts.macBin)}`);
+  lines.push("");
+
+  let activeNode: number | "mac" = 1;
+  let activeLetter: string | undefined;
+  let seq = 0;
+
+  for (const op of h) {
+    switch (op.cmd) {
+      case "node":
+        activeNode = op.node!;
+        lines.push(`# N${op.node}: switch active node to ${opts.nodes[op.node! - 1]}`, "");
+        break;
+      case "mac":
+        activeNode = "mac";
+        lines.push(`# M: switch active node to the Mac`, "");
+        break;
+      case "pause":
+        lines.push(`# P${op.seconds}: pause`, `sleep ${op.seconds ?? DEFAULT_PAUSE_SEC}`, "");
+        break;
+      case "disconnect": {
+        const container = opts.nodes[(activeNode as number) - 1];
+        lines.push(`# D: disconnect ${container}`, `podman network disconnect ${opts.network} ${container}`, "");
+        break;
+      }
+      case "connect": {
+        const container = opts.nodes[(activeNode as number) - 1];
+        const { ip, mac } = nodeAddress(container);
+        lines.push(
+          `# C: reconnect ${container} (same pinned identity every time)`,
+          `podman network connect --ip ${ip} --mac-address ${mac} ${opts.network} ${container}`,
+          "",
+        );
+        break;
+      }
+      case "wait": {
+        if (!activeLetter) { lines.push(`# W: skipped (nothing appended yet, matches harness's no-op)`, ""); break; }
+        const t = targetOf(activeNode, opts);
+        lines.push(`# W: wait for ${t.label}'s own sync:status to report "synced" (bounded, simplistic)`, ...wait(t.label, t.bin), "");
+        break;
+      }
+      case "append": {
+        const letter = op.note!;
+        activeLetter = letter;
+        seq++;
+        const t = targetOf(activeNode, opts);
+        const note = `${NOTE_DIR}/${runId}-${letter}`;
+        const token = formatToken({ node: t.nodeId, seq, note: letter });
+        lines.push(
+          `# A${letter}: append to ${note} on ${t.label} (create if this node doesn't have it yet)`,
+          `out=$(${t.bin} append file=${note} content=${sq(token)})`,
+          `if [[ "$out" != Appended\\ to:* ]]; then`,
+          `  ${t.bin} create name=${note} content=${sq(token)}`,
+          `fi`,
+          `${t.bin} open file=${note}`,
+          "",
+        );
+        break;
+      }
+    }
+  }
+
+  lines.push(`echo "--- final: reconnect any still-offline nodes, wait for sync ---"`);
+  for (const container of opts.nodes) {
+    const { ip, mac } = nodeAddress(container);
+    lines.push(`podman network connect --ip ${ip} --mac-address ${mac} ${opts.network} ${container} 2>/dev/null || true`);
+  }
+  for (const container of opts.nodes) {
+    lines.push(...wait(container, `podman exec ${container} "$BIN"`));
+  }
+  lines.push(`echo "done — inspect ${NOTE_DIR}/${runId}-* on each node"`);
+
+  return lines.join("\n") + "\n";
+}
+
+// --- CLI glue -----------------------------------------------------------------
+// Guarded so repro.test.ts can import generateScript without triggering this (parseArgs/
+// process.exit on a test-runner invocation with no --history would otherwise fire on import).
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  const { values } = parseArgs({
+    options: {
+      history: { type: "string" },
+      nodes: { type: "string" },
+      bin: { type: "string" },
+      network: { type: "string" },
+      "mac-bin": { type: "string" },
+      "mac-node-id": { type: "string" },
+      "run-id": { type: "string" },
+      "wait-cap-sec": { type: "string" },
+      "wait-poll-sec": { type: "string" },
+      out: { type: "string" },
+    },
+  });
+
+  if (!values.history) {
+    console.error("Pass --history <dsl> (e.g. --history N1DMAaWN1AaC).");
+    process.exit(2);
+  }
+
+  const macBin = values["mac-bin"];
+  // Only worth a subprocess call when the Mac is actually configured — mirrors run.ts's own
+  // hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
+  const macNodeId = macBin ? (values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
+
+  let history: History;
+  try {
+    history = parse(values.history);
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
+
+  let script: string;
+  try {
+    script = generateScript(history, {
+      nodes: (values.nodes ?? "n1,n2").split(",").map((s) => s.trim()),
+      bin: values.bin ?? "/opt/obsidian/obsidian-cli",
+      network: values.network ?? "obsidian-net",
+      macBin,
+      macNodeId,
+      runId: values["run-id"],
+      waitCapSec: values["wait-cap-sec"] ? Number(values["wait-cap-sec"]) : undefined,
+      waitPollSec: values["wait-poll-sec"] ? Number(values["wait-poll-sec"]) : undefined,
+    });
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
+
+  if (values.out) {
+    writeFileSync(values.out, script, { mode: 0o755 });
+    console.log(`wrote ${values.out}`);
+  } else {
+    console.log(script);
+  }
+}

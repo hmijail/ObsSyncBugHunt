@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parse, serialize, normalize, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesMac, type History } from "./dsl.js";
 
 test("parses the worked example N1DAaC", () => {
   const h = parse("N1DAaC");
@@ -102,4 +102,9 @@ test("normalize: D/C while the Mac is active is rejected — the Mac must always
 test("normalize: D/C on a numbered node is unaffected by the Mac-safety check", () => {
   assert.equal(norm("N1DC"), "N1DC");
   assert.equal(norm("N1DCMW"), "N1DCMW"); // disconnecting N1, THEN selecting the Mac, is fine
+});
+
+test("usesMac: true iff the history ever selects the Mac", () => {
+  assert.equal(usesMac(parse("N1AaN2Ab")), false);
+  assert.equal(usesMac(parse("N1AaMAaN2Ab")), true);
 });

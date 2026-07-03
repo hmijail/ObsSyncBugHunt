@@ -62,7 +62,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
-        build net secrets-dir clean-secrets login capture node1 containers-up solo-check reconnect run campaign soak analyze generate \
+        build net secrets-dir clean-secrets login capture node1 containers-up solo-check reconnect run campaign soak analyze generate repro \
         clean-runs clean-notes clean-data clean-images trial containers-down ps logs health
 
 help: ## Show this help
@@ -207,6 +207,20 @@ analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync
 
 generate: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB/SCENARIO)
 	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
+
+# Most of RUN_FLAGS (turns/ops/notes/pause-prob/isolator/...) doesn't apply to an already-concrete
+# HISTORY, hence its own smaller flags var.
+REPRO_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
+  $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
+  $(if $(MAC_BIN),--mac-bin $(MAC_BIN)) \
+  $(if $(MAC_NODE_ID),--mac-node-id $(MAC_NODE_ID)) \
+  $(if $(RUN_ID),--run-id $(RUN_ID)) \
+  $(if $(WAIT_CAP_SEC),--wait-cap-sec $(WAIT_CAP_SEC)) \
+  $(if $(WAIT_POLL_SEC),--wait-poll-sec $(WAIT_POLL_SEC)) \
+  $(if $(OUT),--out $(OUT))
+
+repro: ## Generate a standalone bash script reproducing HISTORY=<dsl> by hand (does not touch nodes)
+	npm run repro -- --history "$(HISTORY)" $(REPRO_FLAGS)
 
 clean-notes: solo-check ## Delete the harness's notes (the bughunt/ folder only) on all nodes (nodes must be up)
 	npm run clean-notes -- --nodes $(NODES_CSV)

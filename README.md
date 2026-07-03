@@ -33,7 +33,16 @@ make run HISTORY=N1AaWN2Aa REPEAT=3      # run one specific history
 make soak HISTORY=N1AaWN2Aa              # soak one history until Ctrl-C
 make soak TURNS=paced                    # generate histories and run them until Ctrl-C
 make analyze                             # aggregate runs/ into a report
+
+make repro HISTORY=N1DAaWN2AaC           # print a standalone bash script reproducing that history by hand
 ```
+
+`make repro` bypasses the harness's own execution engine entirely — it prints (or, with `OUT=<path>`,
+writes an executable) a plain bash script of the real `podman`/`obsidian-cli` commands a history implies,
+for manually poking at one specific finding. Deliberately simplistic: one-shot commands, no retries, no
+settle/quiet-window logic (that's `execute.ts`'s job) — just a flat, readable, tweakable transcript. Takes
+`RUN_ID`/`WAIT_CAP_SEC`/`WAIT_POLL_SEC`/`OUT` in addition to the usual `NODES`/`NETWORK`/`OBSIDIAN_BIN`/
+`MAC_BIN`/`MAC_NODE_ID`; `make repro HISTORY=...` needs no containers up (it never touches podman itself).
 
 Each repeat generates one result file, `runs/<ts>-<history>/<repTs>.jsonl`. It contains the timestamped execution
 trace, opening with a `history` event (the DSL string + parsed ops, the isolator/settle-timing
