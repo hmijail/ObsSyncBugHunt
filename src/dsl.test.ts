@@ -24,9 +24,14 @@ test("parse ignores whitespace and parses pauses", () => {
 });
 
 test("round-trips serialize(parse(s)) for canonical strings", () => {
-  for (const s of ["N1DAaC", "N1AaN2Aa", "N1DAaWCWN2W", "AaP30C", "N2Ab"]) {
+  for (const s of ["N1DAaC", "N1AaN2Aa", "N1DAaWCWN2W", "AaP30C", "N2Ab", "MAaN1DC"]) {
     assert.equal(serialize(parse(s)), s);
   }
+});
+
+test("parses and serializes M (the Mac selector) like a bare token, same as D/C/W", () => {
+  assert.deepEqual(parse("MAaW"), [{ cmd: "mac" }, { cmd: "append", note: "a" }, { cmd: "wait" }]);
+  assert.equal(serialize([{ cmd: "mac" }]), "M");
 });
 
 test("round-trips parse(serialize(h))", () => {
@@ -76,4 +81,25 @@ test("normalize is idempotent", () => {
   for (const s of ["N1PN2Aa", "N1DPN2Aa", "N1AaAaN2Ab", "N1PPN2Aa"]) {
     assert.equal(norm(norm(s)), norm(s));
   }
+});
+
+// --- the Mac selector (M) ------------------------------------------------------
+
+test("normalize: M and N are a unified selector — an unused N1 (overwritten by M before use) drops, and a redundant re-select of M drops too", () => {
+  assert.equal(norm("N1MAaM"), "MAa"); // N1 never used (M overwrites it); the trailing M is a no-op re-select
+});
+
+test("normalize: M collapses redundantly just like N does", () => {
+  assert.equal(norm("MMAa"), "MAa");
+});
+
+test("normalize: D/C while the Mac is active is rejected — the Mac must always stay connected", () => {
+  assert.throws(() => normalize(parse("MD")), /Mac node.*always-connected/);
+  assert.throws(() => normalize(parse("MC")), /Mac node.*always-connected/);
+  assert.throws(() => normalize(parse("N1DCMD")), /Mac node.*always-connected/); // a numbered D/C is fine; the one after M isn't
+});
+
+test("normalize: D/C on a numbered node is unaffected by the Mac-safety check", () => {
+  assert.equal(norm("N1DC"), "N1DC");
+  assert.equal(norm("N1DCMW"), "N1DCMW"); // disconnecting N1, THEN selecting the Mac, is fine
 });

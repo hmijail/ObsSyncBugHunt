@@ -98,6 +98,19 @@ test("partitions: D/C balanced, healed by the end, and can overlap (all-offline)
   assert.ok(sawConcurrent, "expected at least one history with 2+ nodes offline at once");
 });
 
+test("macEnabled: the Mac is picked as an edit target but is NEVER a D/C target, even under heavy partitioning", () => {
+  // normalize() (called internally by generateHistory) throws if a D/C is ever emitted while
+  // the Mac is the active selector — see dsl.ts's assertMacAlwaysConnected. So simply calling
+  // generateHistory without it throwing, across many seeds/configs, IS the property test: any
+  // violation of "the Mac is never disconnected" would surface as an uncaught exception here.
+  let sawMac = false;
+  for (let s = 1; s <= 40; s++) {
+    const h = generateHistory({ nodes: 3, ops: [6, 14], partitionProb: 0.6, macEnabled: true, rng: mulberry32(s) });
+    if (h.some((o) => o.cmd === "mac")) sawMac = true;
+  }
+  assert.ok(sawMac, "expected at least one generated history to select the Mac as an edit target");
+});
+
 test("staleReconnect: disconnect early, pause, edits, reconnect", () => {
   const h = staleReconnect({ nodes: 2, ops: [4, 4], rng: mulberry32(3) });
   assert.ok(h.some((o) => o.cmd === "disconnect"));

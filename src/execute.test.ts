@@ -109,16 +109,25 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
 // uninteresting here; what's under test is which DRIVERS a mid-history `W` hands to
 // waitForSynced, observable via the `states` array length on the settle-poll events it logs.
 class SharedVaultExecutor implements Executor {
-  constructor(readonly id: string, private readonly vault: Map<string, string>) {}
-  async exec(args: string[]): Promise<ExecResult> {
-    const r = (stdout: string): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
+  // `syncStatus`: the word reported on `sync:status`; "killed" simulates a probe that never
+  // returns in time (syncStateProbe reports it as "timeout") rather than a real status word.
+  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: string | "killed" = "synced") {}
+  async exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+    const r = (stdout: string, killed = false): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed });
     const params = Object.fromEntries(args.slice(1).map((a) => {
       const i = a.indexOf("=");
       return i < 0 ? [a, ""] : [a.slice(0, i), a.slice(i + 1)];
     }));
     const notFound = (file: string) => r(`Error: File "${file}" not found.`);
     switch (args[0]) {
-      case "sync:status": return r("status: synced");
+      case "sync:status":
+        // The strict, retrying path (run()/syncStatus(), called with no timeoutMs — used by
+        // runHistory's baseline gate) always sees a healthy vault; only the BOUNDED probe
+        // (syncStateProbe/assertMacSyncOn, always called WITH a timeoutMs) sees the state under
+        // test. Otherwise a simulated "paused"/unrecognized status would make the baseline gate
+        // itself retry for minutes before this test ever reaches the op under test.
+        if (opts?.timeoutMs === undefined) return r("status: synced");
+        return this.syncStatus === "killed" ? r("", true) : r(`status: ${this.syncStatus}`);
       case "sync:history": return this.vault.has(params.file) ? r("1") : notFound(params.file);
       case "files": return r([...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
       case "read": return this.vault.has(params.file) ? r(this.vault.get(params.file)!) : notFound(params.file);
@@ -161,4 +170,69 @@ test("W only waits on the active node's own driver, not every online driver (fin
   assert.ok(final.length > 0, "the final settle logged at least one settle-poll");
   assert.ok(midWait.every((e) => (e.states as unknown[]).length === 1), "W only probed the active node's own driver");
   assert.ok(final.every((e) => (e.states as unknown[]).length === 2), "the final settle probed every driver");
+});
+
+// --- the Mac node: another ordinary driver, except D/C must never target it -------------
+test("a Mac-backed third driver: W still scopes to 1, the final settle scopes to all 3", async () => {
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+
+  await runHistory([n1, n2, mac], new NoopIsolator(), logger, parse("AaWMAaW"), {
+    noteName: (l) => `bughunt/${l}`,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, wSettleSec: 0.02, finalSettleSec: 0.02, probeSec: 1,
+    hostCheck: false, macNode: 3,
+  });
+
+  const polls = events.filter((e) => e.kind === "settle-poll");
+  const midWait = polls.filter((e) => "wait" in e);
+  const final = polls.filter((e) => e.final === true);
+  assert.ok(midWait.length > 0);
+  assert.ok(final.length > 0);
+  assert.ok(midWait.every((e) => (e.states as unknown[]).length === 1), "every mid-history W (numbered or Mac) probes only its own driver");
+  assert.ok(final.every((e) => (e.states as unknown[]).length === 3), "the final settle probes all 3 drivers, including the Mac");
+});
+
+test("the D/C defense-in-depth assert fires if a D op is forced through while the Mac is active (bypassing dsl.ts's normalize-time guarantee on purpose)", async () => {
+  const vault = new Map<string, string>();
+  const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault));
+  const noLog = { log() {} } as unknown as RunLogger;
+  // A hand-built op array, never passed through dsl.ts's normalize()/assertMacAlwaysConnected
+  // — proving the runtime assert in execute.ts is a real, independent second layer, not dead code.
+  await assert.rejects(
+    () => runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "disconnect" }], {
+      noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false,
+    }),
+    /Mac node must never be disconnected/,
+  );
+});
+
+// --- the Mac's Sync-on guard: abort (not just tag the rep) if it's ever found off -------------
+test("assertMacSyncOn: a Mac whose Sync is paused aborts the whole run, not just the rep", async () => {
+  const vault = new Map<string, string>();
+  const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault, "paused"));
+  const noLog = { log() {} } as unknown as RunLogger;
+  // A plain Error (not AlarmError) — proving it escapes the per-rep catch in run.ts's runRep
+  // rather than becoming a quiet -OBSFAIL, since a Mac with Sync off invalidates every
+  // subsequent rep until a human fixes it.
+  await assert.rejects(
+    () => runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "append", note: "a" }], {
+      noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false,
+    }),
+    /Mac's Sync is not on.*"paused"/,
+  );
+});
+
+test("assertMacSyncOn: an inconclusive probe (syncing / timed-out / unreadable) is tolerated, not treated as off", async () => {
+  for (const syncStatus of ["syncing", "killed" as const, "bogus-status-word"]) {
+    const vault = new Map<string, string>();
+    const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault, syncStatus));
+    const noLog = { log() {} } as unknown as RunLogger;
+    await runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "append", note: "a" }], {
+      noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false, capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    }); // resolves without throwing for every one of these states
+  }
 });

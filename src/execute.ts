@@ -57,6 +57,13 @@ export interface ExecuteOpts {
   // travel WITH the rep's own trace, not just live in the invocation's separate run log.
   isolator?: string; // "network" | "sync" — which fault primitive drove this run's D/C
   obsidianVersion?: string; // the CLI's own self-reported version, queried once at startup
+  // The Mac (DSL `M`), when configured: its 1-based position within `drivers` (it's just
+  // another element of that array, always last — see run.ts) and its own self-reported
+  // Obsidian version (likely different from the containers' pinned build, which is the
+  // whole point of testing against it). `macNode` drives both `case "mac"`'s resolution
+  // and the D/C defense-in-depth assert below — undefined means no Mac is configured.
+  macNode?: number;
+  macObsidianVersion?: string;
 }
 
 export interface LostForensic {
@@ -102,6 +109,23 @@ function signature(notes: string[], obs: NodeObservation[]): string {
  *  straddle the quiescence window and fabricate a `-SYNCBAD` — see waitForSynced). */
 async function syncState(d: ObsidianDriver, probeMs: number): Promise<string> {
   return d.syncStateProbe(probeMs);
+}
+
+/** The Mac has no network-level isolation (see dsl.ts's assertMacAlwaysConnected) — its Sync
+ *  being on is the whole load-bearing assumption of testing against it. Checked before every op
+ *  that actually touches it (append/wait), using the same bounded, non-blocking probe the settle
+ *  uses. Only a POSITIVELY-read off-state aborts; a probe "timeout"/"?" (inconclusive, e.g.
+ *  mid-sync) is tolerated — never manufacture a failure from an inconclusive bounded probe (same
+ *  philosophy as syncStateProbe itself). Throws a plain Error (not AlarmError): a Mac with Sync
+ *  off invalidates every subsequent rep until a human fixes it, so this must escape runRep's
+ *  per-rep catch and abort the whole soak, not just tag one rep -OBSFAIL. */
+const MAC_SYNC_OFF_STATES = new Set(["paused", "error", "stopped", "offline"]);
+async function assertMacSyncOn(driver: ObsidianDriver, opts: ExecuteOpts): Promise<void> {
+  const probeMs = (opts.probeSec ?? 5) * 1000;
+  const state = await syncState(driver, probeMs);
+  if (MAC_SYNC_OFF_STATES.has(state)) {
+    throw new Error(`the Mac's Sync is not on (observed "${state}") — the harness requires the Mac to stay always-connected. Check Sync on the Mac and re-run.`);
+  }
 }
 
 /**
@@ -257,7 +281,7 @@ export async function waitForSynced(
 export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): Promise<void> {
   for (const d of drivers) {
     const fs = await d.listDirFs(folder);
-    if (!fs.ok && fs.reason === "unavailable") return; // no FS path configured → skip
+    if (!fs.ok && fs.reason === "unavailable") continue; // no FS path configured for THIS driver → skip it, not the rest
     const cli = new Set((await d.listFiles(folder)).value ?? []);
     const onDisk = new Set((fs.ok ? fs.entries : []).map((e) => `${folder}/${e}`));
     const cliReportedButNotOnDisk = [...cli].filter((x) => !onDisk.has(x));
@@ -318,7 +342,7 @@ export async function runHistory(
   const str = serialize(history);
   logger.log({
     kind: "history", string: str, ops: history,
-    isolator: opts.isolator, obsidianVersion: opts.obsidianVersion,
+    isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, macObsidianVersion: opts.macObsidianVersion,
     wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
     capSec: opts.capSec ?? 120, probeSec: opts.probeSec ?? 5,
@@ -353,6 +377,12 @@ export async function runHistory(
     switch (op.cmd) {
       case "node":
         activeNode = op.node!;
+        break;
+      case "mac":
+        // opts.macNode is the Mac driver's own position within `drivers` (run.ts appends it
+        // last) — from here on it's indistinguishable from any other numbered node to the
+        // rest of this function, except D/C refuse it (see the asserts below).
+        activeNode = opts.macNode!;
         break;
       case "pause": {
         // Logged at START: a pause has no result to report beyond "I did the thing" (just the
@@ -417,6 +447,9 @@ export async function runHistory(
         break;
       }
       case "disconnect":
+        // Defense-in-depth: dsl.ts's assertMacAlwaysConnected already makes this unreachable
+        // via any real history, but never trust a single layer for "never disconnect the Mac".
+        assert(activeNode !== opts.macNode, "the Mac node must never be disconnected");
         // Logged at START: no result of its own beyond "I did the thing" — the actual outcome
         // (each reachability attempt, and how long it took) is network-probe's job, at ITS finish.
         logger.log({ kind: "disconnecting", node: driverOf(activeNode).node });
@@ -424,6 +457,7 @@ export async function runHistory(
         offline.add(activeNode);
         break;
       case "connect":
+        assert(activeNode !== opts.macNode, "the Mac node must never be disconnected");
         logger.log({ kind: "connecting", node: driverOf(activeNode).node });
         await isolator.connect(driverOf(activeNode).node);
         offline.delete(activeNode);
@@ -439,10 +473,12 @@ export async function runHistory(
           logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
           break;
         }
+        if (activeNode === opts.macNode) await assertMacSyncOn(driverOf(activeNode), opts);
         await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
         break;
       }
       case "append": {
+        if (activeNode === opts.macNode) await assertMacSyncOn(driverOf(activeNode), opts);
         const noteLetter = op.note!;
         activeNote = opts.noteName(noteLetter); // logical letter -> concrete vault note (also the W target)
         touched.add(activeNote);

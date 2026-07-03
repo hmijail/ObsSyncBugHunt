@@ -12,6 +12,16 @@
 //   --bin            CLI path inside the container           (default /opt/obsidian/obsidian-cli)
 //   --isolator       network | sync                          (default network)
 //   --network        podman network                          (default obsidian-net)
+//   --mac-bin        path to a local obsidian-cli binary (NOT the GUI Obsidian binary — the CLI
+//                    is much faster per-call) — enables the DSL's `M` node (a real,
+//                    always-connected local instance; never a D/C target, see dsl.ts). A history
+//                    that uses `M` without --mac-bin/MAC_BIN set fails fast at startup rather than
+//                    crashing mid-run. Its Sync state is also checked before every op it performs
+//                    (paused/error/stopped/offline aborts the whole run — see execute.ts's
+//                    assertMacSyncOn); its vault path is self-reported (`vault info=path`), which
+//                    enables the same FS cross-check the containers get, with nothing to configure.
+//   --mac-node-id    the Mac's own Sync-reported device name (default: OS `hostname`, which
+//                    is a guess, not verified to match — see run.ts's own comment on this)
 //   --history        run a specific DSL string (else generate)
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --scenario       random | stale                          (default random)
@@ -39,7 +49,7 @@ import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSyn
 import assert from "node:assert/strict";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { PodmanExecutor, runProcess } from "./exec.js";
+import { PodmanExecutor, LocalExecutor, runProcess } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
@@ -76,6 +86,8 @@ const { values } = parseArgs({
     bin: { type: "string" },
     network: { type: "string" },
     isolator: { type: "string" },
+    "mac-bin": { type: "string" },
+    "mac-node-id": { type: "string" },
     scenario: { type: "string" },
     histories: { type: "string" },
     repeat: { type: "string" },
@@ -105,12 +117,23 @@ const nodesList = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const network = values.network ?? "obsidian-net";
 const isolatorKind = values.isolator ?? "network";
+const macBin = values["mac-bin"];
 const scenario = values.scenario ?? "random";
 const histories = Number(values.histories ?? 1);
 const repeat = Number(values.repeat ?? 10);
 const durationMin = Number(values["duration-min"] ?? 0);
 const historyArg = values.history;
 const steps = Number(values.steps ?? 0); // with --history: run only its first N ops (0 = all)
+
+// Normalize a hand-typed --history up front (before any container is touched) so an `M` used
+// without `--mac-bin` fails fast with a clear message instead of crashing deep in runHistory:
+// the DSL grammar accepts `M` regardless of whether the Mac is actually wired up, so nothing
+// else catches this mismatch.
+const parsedHistory = historyArg ? normalize(parse(historyArg)) : undefined;
+if (parsedHistory && !macBin && parsedHistory.some((op) => op.cmd === "mac")) {
+  console.error(`history "${historyArg}" uses M (the Mac node) but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> (and optionally --mac-node-id) or remove M from the history.`);
+  process.exit(2);
+}
 
 const opsRange = (values.ops ?? "6-12").split("-").map(Number);
 const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
@@ -123,6 +146,7 @@ const genParams: GenParams = {
   turns,
   pauseProb: Number(values["pause-prob"] ?? 0),
   partitionProb: Number(values["partition-prob"] ?? 0),
+  macEnabled: !!macBin,
 };
 
 // --generate N: print N generated histories and exit — no nodes, no host check.
@@ -143,6 +167,45 @@ async function obsidianVersion(): Promise<string> {
   return r.stdout.trim() || "?";
 }
 
+// Same idea for the Mac, queried directly (no podman wrapping — same construction as
+// LocalExecutor.exec) — worth recording separately since a real reason to test against a real
+// Mac is likely a DIFFERENT installed version than the containers' pinned build.
+async function macObsidianVersion(): Promise<string | undefined> {
+  if (!macBin) return undefined;
+  const r = await runProcess(macBin, ["version"]);
+  return r.stdout.trim() || "?";
+}
+
+// The Mac's own vault root, self-reported (`obsidian-cli vault info=path`) — enables the same
+// CLI-vs-filesystem cross-check the containers get, with no manual path to configure or keep in
+// sync with wherever the user's real vault happens to live.
+async function macVaultPath(): Promise<string | undefined> {
+  if (!macBin) return undefined;
+  const r = await runProcess(macBin, ["vault", "info=path"]);
+  return r.stdout.trim() || undefined;
+}
+
+// Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
+// cwd (e.g. a bigger disk). Default (no flag) keeps today's behavior: plain "runs".
+const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs") : "runs";
+
+// Vault's on-disk root in the container — enables the filesystem second-source / CLI-vs-FS
+// cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.
+const vaultPath = values["vault-path"] ?? "/root/vaults/TestVault";
+const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vaultPath));
+if (macBin) {
+  // The Mac's own Sync-reported device name — oracle.ts's conflict-file `wellFormed` check
+  // matches the parsed `(Conflicted copy <device> ...)` name against each driver's own `.node`,
+  // so this has to be what Sync itself calls the device, not an arbitrary label. `hostname` is
+  // a reasonable GUESS, not verified to match (e.g. a `.local` suffix hostname includes that
+  // Sync's own naming may not) — override with --mac-node-id if a real conflict later shows a
+  // mismatch (wellFormed is informational only, so this doesn't gate the core token oracle).
+  const macNodeId = values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim();
+  drivers.push(new ObsidianDriver(new LocalExecutor(macBin, macNodeId), await macVaultPath()));
+}
+const byId = new Map(drivers.map((d) => [d.node, d]));
+const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
+
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
   minFloorSec: Number(values["min-floor-sec"] ?? 3),
@@ -154,18 +217,9 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   snapshotTiming: !values["skip-snapshot-timing"], // on by default; --skip-snapshot-timing turns it off
   isolator: isolatorKind,
   obsidianVersion: await obsidianVersion(),
+  macNode: macBin ? drivers.length : undefined, // the Mac driver's own (last) position
+  macObsidianVersion: await macObsidianVersion(),
 };
-
-// Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
-// cwd (e.g. a bigger disk). Default (no flag) keeps today's behavior: plain "runs".
-const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs") : "runs";
-
-// Vault's on-disk root in the container — enables the filesystem second-source / CLI-vs-FS
-// cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.
-const vaultPath = values["vault-path"] ?? "/root/vaults/TestVault";
-const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vaultPath));
-const byId = new Map(drivers.map((d) => [d.node, d]));
-const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
 
 // Human-readable wall-clock stamp DDTHHMMSS (local time), e.g. 25T181530 — used for both the
 // run log filename below and each rep/history-group dir (see uniqueRepId), so they share one
@@ -441,9 +495,9 @@ if (historyArg) {
   // until stopped — not a fresh dir per batch. `--steps N` truncates the history to its
   // first N ops (a prefix, for shrinking a finding); the final settle still reconnects
   // any node left partitioned by the cut.
-  // Normalize so the printed/dir string is exactly what executes (same as generated histories);
-  // then `--steps` truncates the canonical form to its first N ops.
-  let hist = normalize(parse(historyArg));
+  // Already normalized above (parsedHistory) so the printed/dir string is exactly what executes
+  // (same as generated histories); `--steps` truncates the canonical form to its first N ops.
+  let hist = parsedHistory!;
   if (steps > 0) hist = hist.slice(0, steps);
   const str = serialize(hist);
   const groupName = `${tsStamp()}-${str}`;

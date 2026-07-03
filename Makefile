@@ -20,6 +20,9 @@ SECRETS    := $(CURDIR)/secrets/obsidian
 TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
+# Local Mac's obsidian-cli (much faster than the GUI Obsidian binary) — enables the DSL's `M`
+# node by default. Override/clear: make soak MAC_BIN= (or a different path)
+MAC_BIN    ?= /Users/mija/Applications/Obsidian.app/Contents/MacOS/obsidian-cli
 
 # Bound podman calls in solo-check so a wedged podman API fails fast with a hint
 # instead of hanging silently. Uses `timeout` (or `gtimeout` from coreutils on macOS)
@@ -35,6 +38,8 @@ NODES_CSV := $(shell echo $(NODES) | tr ' ' ',')
 RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
   $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
+  $(if $(MAC_BIN),--mac-bin $(MAC_BIN)) \
+  $(if $(MAC_NODE_ID),--mac-node-id $(MAC_NODE_ID)) \
   $(if $(SCENARIO),--scenario $(SCENARIO)) \
   $(if $(HISTORY),--history $(HISTORY)) \
   $(if $(STEPS),--steps $(STEPS)) \

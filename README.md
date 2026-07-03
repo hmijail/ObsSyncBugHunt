@@ -36,7 +36,9 @@ make analyze                             # aggregate runs/ into a report
 ```
 
 Each repeat generates one result file, `runs/<ts>-<history>/<repTs>.jsonl`. It contains the timestamped execution
-trace, opening with a `history` event (the DSL string + parsed ops) and closing with a
+trace, opening with a `history` event (the DSL string + parsed ops, the isolator/settle-timing
+config that governed the run, and the Obsidian version(s) involved — including `macObsidianVersion`
+when a Mac node is configured, which can differ from the containers' pinned build) and closing with a
 `results` event (the verdict), or `obsfail`/`unknown`. A failing repeat's file is renamed with its outcome suffix
 (`<repTs>-LOST.jsonl`, etc.). The group dir's `<ts>` is when that
 history started executing.
@@ -78,6 +80,8 @@ real, in-use vault, the tester should keep your own notes safe.
 | `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ nodes) |
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
 | `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
+| `MAC_BIN` | `--mac-bin` | `.../Obsidian.app/Contents/MacOS/obsidian-cli` | path to a local `obsidian-cli` binary (NOT the GUI `Obsidian` binary — the CLI is much faster per-call) — enables the DSL's `M` node (see the DSL table above); clear it (`MAC_BIN=`) for no Mac participation. A history containing `M` with no `MAC_BIN`/`--mac-bin` fails fast at startup rather than crashing mid-run |
+| `MAC_NODE_ID` | `--mac-node-id` | OS `hostname` | the Mac's own Sync-reported device name, used to attribute its conflict files correctly — `hostname` is a guess, not verified to match; override if a real conflict shows a mismatch |
 | `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online checks: the startup preflight *and* the in-settle host-outage wait (set it where outbound TCP is blocked, else a stalled settle would wait forever) |
 | `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
 | `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
@@ -98,6 +102,7 @@ containerized nodes. Commands are uppercase, parameters lowercase/digits.
 | Command | meaning |
 |---|---|
 | `N<d>` | set the active node (`N1`, `N2`) |
+| `M` | set the active node to the Mac — a real local Obsidian instance, if `MAC_BIN` is configured (see Parameters); **exempt from `D`/`C`** below, it must always stay connected. Its Sync state is checked before every op it performs — if found `paused`/`error`/`stopped`/`offline`, the whole run aborts (not just that rep), since a disconnected Mac invalidates every subsequent rep until fixed |
 | `A<x>` | append a uniquely-tagged line to note `x` (`Aa`), by the active node (first touch creates it; also opens it in the GUI so you can watch the history unfold) |
 | `D` / `C` | disconnect / connect the active node from the network |
 | `W`    | wait until the active node reports that the last-edited note is synced |
@@ -113,7 +118,7 @@ Histories can be auto-generated or typed manually. They are run through a `norma
 
 Timings are necessarily variable between repetitions of a history, since we don't have control of the Sync server, timing of the client's retries, network state, etc. This can cause results to change every time you repeat the history. Therefore histories are run `REPEAT` times to sample the distribution of end results. Also, to minimize variability in a given history, command W waits until Obsidian itself reports the node is synced.
 
-Note that the harness models a single user using Obsidian across `NODES` devices, so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing, while Obsidian might be doing its thing. Similarly, W waits for the current node to report it's synced, but this also implies that the other nodes wait until that happens.
+Note that the harness models a single user using Obsidian across `NODES` devices (plus the Mac, when configured), so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing, while Obsidian might be doing its thing. Similarly, W waits for the current node to report it's synced, but this also implies that the other nodes wait until that happens.
 
 At the end of the history, the harness reconnects all nodes to the network,  waits for them all to report synced, and still waits for a settling window to ensure that no further changes happen. Only then the end result is judged.
 
@@ -227,13 +232,16 @@ Makefile         podman lifecycle: build -> login -> capture -> containers-up ->
 
 ## Future work
 
-- Obsidian Sync's auto-merge mode is not tested yet. This is because I didn't expect to find bugs so early; conflict file mode is supposed to be the safe one, in part because it's the official recommendation in the Obsidian forums. Go figure.
-- Outcome judgment is very lenient: as long as the input tokens are stored *somewhere*, the result is considered OK. However, a real user surely wouldn't be happy if their inputs keep getting moved into Conflict files randomly. So judgment should probably be made more... judgmental.
-- Both auto-merge and stricter judgment of conflict files would probably require keeping an internal model of what result to expect from Obsidian Sync. That would probably be a bit of a can of worms, given the closed-source nature of the beast.
+- Obsidian Sync's auto-merge mode is not tested yet. Conflict file mode is the official recommendation in the Obsidian forums thread about data loss, so I thought I'd start here.
+- Outcome judgment is very lenient: as long as the input tokens are stored *somewhere* (canonical note or conflict file), the result is considered OK. However, a real user surely wouldn't be happy if their inputs keep getting moved into conflict files randomly. So judgment should probably be made more... judgmental.
+- Both auto-merge and stricter judgment of conflict files would probably require keeping an internal model of what results are acceptable according to Obsidian Sync docs. That would probably be a bit of a can of worms, given the closed-source nature of the beast.
+- Relatedly, I started this project inspired by Jepsen, which probably does something similar. turned out to be overkill for something like Obsidian. Plus, there is a lot of research on fuzzing a black box with semantics, surely including internal models too. Something to look into, I guess.
 - It would be interesting to force network failures or slowness, once Sync is solid enough over a normal network.
+- Stopping Sync from working via network vs via obsidian-cli commands changes the behavior (and the bugs found). What if we also fully restarted Obsidian as a history command? (as it can happen in e.g. iOS because of memory pressure)
 - The Obsidian Sync driving code could be made generic to work on other sync backends. Would e.g. Obsidian-on-iCloud lose more or less data? What about Syncthing, etc?
 - In fact, the very Obsidian driving could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *lossy* it was.
-- I started this project inspired by Jepsen, which turned out to be overkill for something like Obsidian. Plus, there is a lot of research on fuzzing a black box with semantics, surely including internal models too. Something to look into, I guess.
+- The Mac node (`M`) currently works on the (assumed Mac) host's Obsidian instance, which limits what can be done with it: e.g., no network faults. It could be interesting to use `tart` to have a macOS VM and treat it as another container — provisioning it might be simpler than it sounds: an Obsidian developer's own forum comment says Sync credentials live in IndexedDB inside the app's appdata folder (not the OS Keychain), so copying that folder into a fresh VM may carry the login over, similar to how the container image already bakes one in.
+- A nearer-term alternative for real network isolation without a VM: a narrowly-scoped `pfctl` anchor blocking only Obsidian Sync's own traffic (not a broad default-deny), paired with a session-scoped sudoers grant set up/torn down per soak (`make pf-setup`/`make pf-teardown`, restricted to exact `pfctl` args) and an exit hook to flush it on any normal exit. Would reverse the current "Mac always connected" premise, so it needs its own design pass.
 
 
 ## Tooling

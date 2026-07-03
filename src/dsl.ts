@@ -5,6 +5,8 @@
 // reads as what the USER does — the user never "syncs", they only Wait and hope it happens.
 //
 //   N<d>   set active node           (N1, N2)
+//   M      set active node to the Mac (a real local Obsidian instance, if configured) —
+//          exempt from D/C: it must always stay connected, see assertMacAlwaysConnected below
 //   A<x>   append a line to note <x> by the active node (first touch of a note creates it)
 //   D      disconnect the active node (network)
 //   C      connect the active node
@@ -15,7 +17,7 @@
 // string is exactly what executes (see normalize). Trailing waits are implicit (the
 // executor always settles before judging); timing is otherwise string-controlled.
 
-export type Cmd = "node" | "append" | "disconnect" | "connect" | "wait" | "pause";
+export type Cmd = "node" | "mac" | "append" | "disconnect" | "connect" | "wait" | "pause";
 
 export interface Op {
   cmd: Cmd;
@@ -61,6 +63,7 @@ export function parse(s: string): History {
       case "D": ops.push({ cmd: "disconnect" }); break;
       case "C": ops.push({ cmd: "connect" }); break;
       case "W": ops.push({ cmd: "wait" }); break;
+      case "M": ops.push({ cmd: "mac" }); break;
       case "P": {
         const n = digits();
         ops.push({ cmd: "pause", seconds: n ? Number(n) : DEFAULT_PAUSE_SEC });
@@ -79,6 +82,7 @@ export function serialize(h: History): string {
     .map((op) => {
       switch (op.cmd) {
         case "node": return `N${op.node}`;
+        case "mac": return "M";
         case "append": return `A${op.note}`;
         case "disconnect": return "D";
         case "connect": return "C";
@@ -92,12 +96,14 @@ export function serialize(h: History): string {
 // --- normalization: printed == executed --------------------------------------
 //
 // `normalize` is the single canonical preprocessing applied to EVERY history (generated or
-// typed). Three passes, in order:
+// typed). Three passes, in order, then a safety check:
 //   1. floatPauses        — a pause only matters next to an action (D/C/A). One sandwiched
 //                           between non-actions is moved to just before the next action (or
 //                           dropped if there is none); carried pauses sum.
-//   2. dropRedundantNodes — an N overwritten before use, or re-selecting the active node, goes.
+//   2. dropRedundantNodes — an N/M overwritten before use, or re-selecting the active
+//                           node/Mac, goes.
 //   3. collapseAdjacent   — dedup adjacent A(same note)/D/C/W; sum adjacent pauses.
+//   4. assertMacAlwaysConnected — the Mac must never be D/C'd; throws otherwise.
 
 /** Move "floating" pauses (not adjacent to an action) forward to the next action. */
 function floatPauses(h: History): History {
@@ -125,22 +131,44 @@ function floatPauses(h: History): History {
   return out;
 }
 
-/** Drop node-sets that are never used: re-selecting the active node, or overwritten by the
- *  next node-set before any node-using op (anything but a pause). */
+/** Drop selector ops that are never used: re-selecting the active node/Mac, or overwritten by
+ *  the next selector before any selector-using op (anything but a pause). `node` and `mac` are
+ *  both selectors — a unified `active` key covers "no selector picked twice in a row and nothing
+ *  wasted" regardless of which kind. `0` is a safe "nothing selected yet" sentinel: it can never
+ *  collide with a real (1-based) node number or with the "mac" string. */
 function dropRedundantNodes(h: History): History {
   const out: History = [];
-  let active = 0;
+  let active: number | "mac" = 0;
+  const isSelector = (op: Op) => op.cmd === "node" || op.cmd === "mac";
+  const keyOf = (op: Op): number | "mac" => (op.cmd === "mac" ? "mac" : op.node!);
   for (let i = 0; i < h.length; i++) {
     const op = h[i];
-    if (op.cmd !== "node") { out.push({ ...op }); continue; }
-    if (op.node === active) continue; // no-op re-select
+    if (!isSelector(op)) { out.push({ ...op }); continue; }
+    const key = keyOf(op);
+    if (key === active) continue; // no-op re-select
     let j = i + 1;
-    while (j < h.length && h[j].cmd === "pause") j++; // a pause doesn't "use" the node
-    if (j >= h.length || h[j].cmd === "node") continue; // nothing uses it / overwritten
-    active = op.node!;
+    while (j < h.length && h[j].cmd === "pause") j++; // a pause doesn't "use" the selector
+    if (j >= h.length || isSelector(h[j])) continue; // nothing uses it / overwritten
+    active = key;
     out.push({ ...op });
   }
   return out;
+}
+
+/** The Mac (when selected via `M`) must stay always-connected — no isolation primitive is ever
+ *  applied to it (see run.ts: it's a real local Obsidian instance, not a disposable container).
+ *  Walks the FINAL normalized ops (default active node is 1, matching execute.ts's own runtime
+ *  default) and throws if a D/C op is ever reached while the Mac is the active selector — the
+ *  DSL-grammar-level half of that guarantee (execute.ts also asserts it at runtime). */
+function assertMacAlwaysConnected(h: History): void {
+  let active: number | "mac" = 1;
+  for (const op of h) {
+    if (op.cmd === "node") active = op.node!;
+    else if (op.cmd === "mac") active = "mac";
+    else if ((op.cmd === "disconnect" || op.cmd === "connect") && active === "mac") {
+      throw new Error(`history disconnects/connects the Mac node, which must stay always-connected: ${serialize(h)}`);
+    }
+  }
 }
 
 /** Collapse adjacent redundancy: a duplicate of A (same note)/D/C/W is dropped, and
@@ -164,5 +192,7 @@ function collapseAdjacent(h: History): History {
 
 /** Canonicalize a history so the printed/serialized form is exactly what executes. */
 export function normalize(h: History): History {
-  return collapseAdjacent(dropRedundantNodes(floatPauses(h)));
+  const result = collapseAdjacent(dropRedundantNodes(floatPauses(h)));
+  assertMacAlwaysConnected(result);
+  return result;
 }
