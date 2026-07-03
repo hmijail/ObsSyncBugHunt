@@ -34,11 +34,12 @@ make soak HISTORY=N1AaWN2Aa              # soak one history until Ctrl-C
 make soak TURNS=paced                    # generate histories and run them until Ctrl-C
 make analyze                             # aggregate runs/ into a report
 
-make repro HISTORY=N1DAaWN2AaC           # print a standalone bash script reproducing that history by hand
+make repro HISTORY=N1DAaWN2AaC           # write a standalone bash script reproducing that history by hand
 ```
 
-`make repro` bypasses the harness's own execution engine entirely — it prints (or, with `OUT=<path>`,
-writes an executable) a plain bash script for manually poking at one specific finding. The history
+`make repro` bypasses the harness's own execution engine entirely — it writes an executable plain
+bash script to `runs/<run-id>.sh` (`OUT=<path>` to write elsewhere instead; `OUT=-` to print to
+stdout instead of writing a file) for manually poking at one specific finding. The history
 translates into a short, flat sequence of calls to a handful of functions (`Disconnect 1`, `Append 1 a`,
 `Wait 1`, ...) defined once in `scripts/repro-lib.sh` (a small hand-maintained bash library every
 generated script sources) — deliberately simplistic: one-shot commands, no retries, no per-note

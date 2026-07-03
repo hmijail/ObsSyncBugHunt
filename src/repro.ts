@@ -13,11 +13,12 @@
 //   --mac-node-id   the Mac's own Sync-reported device name           (default: OS `hostname`)
 //   --run-id        slug embedded in note names                      (default repro-<timestamp>)
 //   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
-//   --out           write the script to a file (mode 0755) instead of printing it to stdout
+//   --out           where to write the script (mode 0755); default runs/<run-id>.sh; "-" prints
+//                    to stdout instead of writing a file
 //
 //   npm run repro -- --history N1DMAaWN1AaC --mac-bin /path/to/obsidian-cli
 
-import { writeFileSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -194,6 +195,10 @@ if (isMain) {
     process.exit(2);
   }
 
+  // Resolved here (not left to generateScript's own default) so the same value can also name
+  // the default output file below.
+  const runId = values["run-id"] ?? `repro-${tsStamp()}`;
+
   let script: string;
   try {
     script = generateScript(history, {
@@ -202,7 +207,7 @@ if (isMain) {
       network: values.network ?? "obsidian-net",
       macBin,
       macNodeId,
-      runId: values["run-id"],
+      runId,
       waitCapSec: values["wait-cap-sec"] ? Number(values["wait-cap-sec"]) : undefined,
       waitPollSec: values["wait-poll-sec"] ? Number(values["wait-poll-sec"]) : undefined,
     });
@@ -211,10 +216,15 @@ if (isMain) {
     process.exit(2);
   }
 
-  if (values.out) {
-    writeFileSync(values.out, script, { mode: 0o755 });
-    console.log(`wrote ${values.out}`);
-  } else {
+  // Default: write to runs/<run-id>.sh (executable) — a script whose whole point is to be run
+  // shouldn't require the user to redirect+chmod it themselves every time. --out - prints to
+  // stdout instead (e.g. for piping); --out <path> writes there instead of the default.
+  if (values.out === "-") {
     console.log(script);
+  } else {
+    const outPath = values.out ?? path.join("runs", `${runId}.sh`);
+    mkdirSync(path.dirname(outPath), { recursive: true });
+    writeFileSync(outPath, script, { mode: 0o755 });
+    console.log(`wrote ${outPath}`);
   }
 }
