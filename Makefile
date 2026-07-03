@@ -15,6 +15,17 @@ NET        := obsidian-net
 # supplies its binary path. Drop it (NODES="n1 n2") to exclude the Mac; podman-container targets
 # below use CONTAINER_NODES (NODES minus "mac") so they never try to manage it as a container.
 NODES      := n1 n2 mac
+# NODES is space-separated internally (NODES_CSV below comma-joins it for the CLI flag) — but
+# `make soak NODES=n1,mac` (comma-separated, matching how the CLI itself takes --nodes) is a
+# completely natural thing to type, and silently produced a single mangled word ("n1,mac") that
+# made every container-lifecycle target misbehave (e.g. solo-check flagging 'n1' itself as a
+# stray container, since " n1 " never appears inside " n1,mac "). Accept either form by
+# normalizing commas to spaces right after NODES is set, whether from the default above or a
+# command-line override (needs `override` — a plain `:=` here would be shadowed by the override).
+empty :=
+space := $(empty) $(empty)
+comma := ,
+override NODES := $(subst $(comma),$(space),$(NODES))
 # Host port for the login VNC (container side is 5900). 5900 clashes with macOS
 # Screen Sharing, so default to 5901; override: make login VNC_PORT=5910
 VNC_PORT   ?= 5901
