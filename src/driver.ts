@@ -86,20 +86,40 @@ export class ObsidianDriver {
    * `Error: Sync is in error state.` — wait and re-run, hoping for a recognizable reply.
    * After RECOGNIZE_MAX_RETRIES it gives up and throws CliUnrecognizedOutput (→ `-UNKNOWN`),
    * naming the recognizer. SAFE only for idempotent reads — never use for a mutation.
+   *
+   * Each individual call is timed (`callMs`) — some commands (`sync:history ... total` in
+   * particular, see execute.ts's readTotals comment) can themselves block for tens of seconds
+   * once Sync hasn't caught up yet, well under this.run()'s own much larger unresponsive-kill
+   * timeout, so a single slow-but-eventually-answering call previously produced NO log at all
+   * while in flight, and — since success just returned silently — none afterward either. A
+   * retry sequence that eventually succeeds now logs that too (only when attempt > 0, so the
+   * common "recognized on the first try" case stays exactly as silent as before).
    */
   private async runRecognized<T>(
     command: string,
     params: string[],
     recognize: (stdout: string) => T | Unrecognized,
   ): Promise<{ value: T; raw: ExecResult }> {
+    const sequenceStart = Date.now();
     for (let attempt = 0; ; attempt++) {
+      const callStart = Date.now();
       const raw = await this.run(command, params); // run() still handles the untimely(killed) retry
+      const callMs = Date.now() - callStart;
       const result = recognize(raw.stdout);
-      if (result !== UNRECOGNIZED) return { value: result, raw };
+      if (result !== UNRECOGNIZED) {
+        if (attempt > 0) {
+          this.emit({
+            kind: "cli-output-recognized-after-retry",
+            node: this.node, command, recognizer: recognize.name,
+            attempts: attempt + 1, callMs, totalMs: Date.now() - sequenceStart,
+          });
+        }
+        return { value: result, raw };
+      }
       if (attempt >= RECOGNIZE_MAX_RETRIES) throw new CliUnrecognizedOutput(raw, recognize.name);
       this.emit({
         kind: "cli-output-unrecognized-retry",
-        node: this.node, command, recognizer: recognize.name, attempt: attempt + 1, stdout: raw.stdout,
+        node: this.node, command, recognizer: recognize.name, attempt: attempt + 1, stdout: raw.stdout, callMs,
       });
       await sleep(this.recognizeBackoffMs);
     }

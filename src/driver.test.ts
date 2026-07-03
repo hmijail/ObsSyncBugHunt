@@ -38,8 +38,29 @@ test("runRecognized: a read riding out a transient sync-error retries then retur
   assert.equal(r.ok, true);
   assert.equal(r.value, 7);
   assert.equal(exec.calls, 3); // two transient replies + the recovered one
-  assert.equal(events.filter((e) => e.kind === "cli-output-unrecognized-retry").length, 2);
+  const retries = events.filter((e) => e.kind === "cli-output-unrecognized-retry");
+  assert.equal(retries.length, 2);
   assert.equal(events[0].recognizer, "parseTotal");
+  assert.equal(typeof retries[0].callMs, "number"); // each attempt is individually timed
+
+  // The previously-silent case this exists for: a retry sequence that DOES eventually succeed
+  // now logs it too — otherwise a slow-but-successful final call (see execute.ts's readTotals
+  // comment on sync:history total blocking for tens of seconds) leaves no trace at all.
+  const recovered = events.filter((e) => e.kind === "cli-output-recognized-after-retry");
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].attempts, 3);
+  assert.equal(recovered[0].recognizer, "parseTotal");
+  assert.equal(typeof recovered[0].callMs, "number");
+  assert.equal(typeof recovered[0].totalMs, "number");
+});
+
+test("runRecognized: recognized on the FIRST try stays silent — no recognized-after-retry noise for the common case", async () => {
+  const d = new ObsidianDriver(new ScriptedExecutor(["7"]));
+  const events: Record<string, unknown>[] = [];
+  d.onEvent = (e) => events.push(e);
+
+  await d.syncVersionsTotal("bughunt/x.md");
+  assert.equal(events.length, 0);
 });
 
 test("runRecognized: a read that never recovers gives up as CliUnrecognizedOutput naming the recognizer", async () => {
