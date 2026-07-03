@@ -1,3 +1,5 @@
+import assert from "node:assert/strict";
+
 // History DSL: a history is a string of user actions, e.g. "N1DAaC".
 //
 // COMMANDS are uppercase, params are lowercase letters / digits. The active node is a
@@ -140,7 +142,12 @@ function dropRedundantNodes(h: History): History {
   const out: History = [];
   let active: number | "mac" = 0;
   const isSelector = (op: Op) => op.cmd === "node" || op.cmd === "mac";
-  const keyOf = (op: Op): number | "mac" => (op.cmd === "mac" ? "mac" : op.node!);
+  const keyOf = (op: Op): number | "mac" => {
+    if (op.cmd === "mac") return "mac";
+    assert(op.node !== undefined, "'node' op must carry a node field");
+    assert(op.node !== 0, "node numbers are 1-based — 0 is normalize's internal-only sentinel");
+    return op.node;
+  };
   for (let i = 0; i < h.length; i++) {
     const op = h[i];
     if (!isSelector(op)) { out.push({ ...op }); continue; }
@@ -163,8 +170,11 @@ function dropRedundantNodes(h: History): History {
 function assertMacAlwaysConnected(h: History): void {
   let active: number | "mac" = 1;
   for (const op of h) {
-    if (op.cmd === "node") active = op.node!;
-    else if (op.cmd === "mac") active = "mac";
+    if (op.cmd === "node") {
+      assert(op.node !== undefined, "'node' op must carry a node field");
+      assert(op.node !== 0, "node numbers are 1-based — 0 is normalize's internal-only sentinel");
+      active = op.node;
+    } else if (op.cmd === "mac") active = "mac";
     else if ((op.cmd === "disconnect" || op.cmd === "connect") && active === "mac") {
       throw new Error(`history disconnects/connects the Mac node, which must stay always-connected: ${serialize(h)}`);
     }

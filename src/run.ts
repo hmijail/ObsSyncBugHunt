@@ -214,6 +214,10 @@ if (macRequested) {
   // mismatch (wellFormed is informational only, so this doesn't gate the core token oracle).
   const macNodeId = values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim();
   drivers.push(new ObsidianDriver(new LocalExecutor(macBin!, macNodeId), await macVaultPath()));
+  // execBase.macNode below is `drivers.length`, i.e. "whatever the Mac driver's position is,
+  // it must be last" — true by construction right here, but silent if a future edit ever
+  // reorders driver construction. Make that assumption loud instead.
+  assert(drivers[drivers.length - 1].node === macNodeId, "Mac driver must be pushed last so macNode: drivers.length resolves to it");
 }
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);

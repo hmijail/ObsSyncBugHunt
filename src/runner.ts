@@ -11,6 +11,7 @@
 // Requires real Obsidian nodes; wired to Podman in the topology step. The
 // oracle it calls is already unit-tested (src/oracle.test.ts).
 
+import assert from "node:assert/strict";
 import { formatToken, type NodeId } from "./types.js";
 import { ObsidianDriver, isConflictFile } from "./driver.js";
 import { AlarmError } from "./alarm.js";
@@ -89,9 +90,10 @@ async function waitForQuiescence(
       }),
     );
 
-    for (const p of probes) {
-      if (p.state === null) throw new Error(`sync:status on ${p.node} returned no status`);
-    }
+    // syncStatus()'s own contract guarantees a value or a throw (see the comment above) — this
+    // is checking OUR OWN code held that contract, not a new black-box inconsistency, so assert
+    // is the right tool (unlike gatherObservation's AlarmError below, which IS a real finding).
+    for (const p of probes) assert(p.state !== null, `syncStatus on ${p.node} returned no status`);
 
     consecutiveSynced = probes.every((p) => p.state === "synced") ? consecutiveSynced + 1 : 0;
     if (consecutiveSynced >= 2) return { quiesced: true, reason: "synced" };
@@ -105,8 +107,8 @@ export async function gatherObservation(d: ObsidianDriver, note: string): Promis
   const files = (await d.listFiles()).value ?? [];
   // Anchor (positive identification of the listing): if the note reads as PRESENT, the
   // folder listing MUST contain it. A listing that omits a note we just read is self-
-  // inconsistent — exactly the 2026-06-26 shape (an empty `files` while the read succeeded)
-  // that fabricated a "loss". Don't trust such a listing; raise a loud ALARM instead.
+  // inconsistent and can fabricate a false "loss" (see docs/cli-trust.md's founding incident) —
+  // don't trust such a listing; raise a loud ALARM instead.
   if (canonical !== null && !files.includes(`${note}.md`)) {
     throw new AlarmError("cli-listing-inconsistent", {
       node: d.node, note, listedCount: files.length,

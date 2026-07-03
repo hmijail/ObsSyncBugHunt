@@ -46,18 +46,15 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Pinned per-node network identity, so a reconnect restores the EXACT same IP/MAC the
 // container had before (and from its very first `containers-up` — see the Makefile) rather
-// than a fresh dynamically-assigned one. Theory: Obsidian/Sync recognizing "the same device,
-// unchanged" rather than a fresh join may reconnect faster than a genuinely new identity would.
+// than a fresh dynamically-assigned one — see docs/DESIGN.md for why, and for the story behind
+// the MAC address's first byte specifically.
 // Node number comes from the trailing digits of its name (n1 -> 1, n2 -> 2); X = 100 + number.
-// IP = 10.89.0.<X> (decimal; confirmed live to match obsidian-net's actual 10.89.0.0/24 subnet).
-// MAC = 6e:62:6e:65:74:<X in hex> — "n" "b" "n" "e" "t", not the cleaner "obnet": the first
-// byte's I/G bit (its least-significant bit) marks individual(0)/group(1) addressing, and
-// 0x6f ('o') has that bit SET — a multicast address, which the kernel refuses to assign to a
-// real interface (confirmed live: `Error: netavark: create veth pair: Netlink error: Cannot
-// assign requested address` when 'o' was the first byte). 0x6e ('n') has I/G=0 (unicast) and
-// the U/L bit=1 (locally-administered) — a valid interface MAC. Only the FIRST byte carries
-// this constraint; the rest (and the trailing per-node byte) can be any value. The last byte
-// must still be hex, not decimal digits (e.g. X=101 -> "65", not the invalid 3-char "101").
+// IP = 10.89.0.<X> (matches obsidian-net's actual 10.89.0.0/24 subnet).
+// MAC = 6e:62:6e:65:74:<X in hex>. The first byte (0x6e = 'n') MUST keep its I/G bit (least
+// significant bit of the first byte) at 0 — a real interface MAC must be unicast, not
+// multicast — and its U/L bit at 1 (locally-administered, since this isn't vendor-assigned).
+// Only the first byte carries this constraint; the rest is free, but must stay valid 2-digit hex
+// (e.g. X=101 -> "65", not the invalid 3-char decimal "101").
 export function nodeAddress(node: NodeId): { ip: string; mac: string } {
   const m = /(\d+)$/.exec(node);
   if (!m) throw new Error(`can't derive a node number from "${node}" for IP/MAC pinning`);

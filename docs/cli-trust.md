@@ -19,17 +19,27 @@ error" is not enough; it must affirmatively match a known answer shape.
     synced* (it returns immediately only when synced), so the settle loop (`execute.ts`) reads it via a
     **bounded probe** (`driver.ts`'s `syncStateProbe`, `--probe-sec`, default 5s): a quick reply is the
     real status word, a timeout means "still syncing". This is essential for correctness, not just
-    speed — a single ~70s blocking `sync:status` straddled the quiescence window and made the settle
-    judge a *single pre-convergence sample* (fabricating `-SYNCBAD`). Polling re-samples the content
-    signature every cycle, so the verdict is built from the genuinely-settled state.
+    speed — a single long blocking `sync:status` call straddling the quiescence window once made the
+    settle judge a *single pre-convergence sample* (fabricating `-SYNCBAD`). Polling re-samples the
+    content signature every cycle, so the verdict is built from the genuinely-settled state.
 - **Then positively recognized.** `cli-parse.ts` has one recognizer per command; each returns a typed
   result only for a known shape, else the `UNRECOGNIZED` sentinel.
   - **Read-only calls retry for recovery.** An unparseable read is often just transient — a node
     mid-(re)connect answers a sync command with the free-text `Error: Sync is in error state.`
     (disconnection is also reported as the recognized word `error` by `sync:status`, which is why only
-    the free-text commands tripped). So `driver.ts`'s `runRecognized` **re-runs the command every ~2s
-    hoping for a recognizable reply** (logging `cli-output-unrecognized-retry`), and only after the
-    budget gives up. SAFE because reads are idempotent.
+    the free-text commands tripped). So `driver.ts`'s `runRecognized` **re-runs the command a few
+    seconds later hoping for a recognizable reply** (logging `cli-output-unrecognized-retry`), and only
+    after the budget gives up. SAFE because reads are idempotent.
+  - **Every attempt is also individually timeout-bounded, not just retried.** A read misbehaving isn't
+    limited to "answers fast but wrong" — some commands (`sync:history ... total` in particular) can
+    themselves silently block for a long stretch even after `sync:status` already reports the node
+    `synced`, since the two commands' own internal readiness isn't the same clock. `runRecognized`
+    bounds every attempt to a short per-call timeout (`recognizeCallTimeoutMs`) instead of inheriting
+    `run()`'s much larger default, and a timed-out attempt retries exactly like an unrecognized one
+    (`cli-call-timeout-retry`, same budget) — turning a long silent stall into a visible, bounded,
+    retried sequence. A retry sequence that eventually succeeds is now logged too
+    (`cli-output-recognized-after-retry`) — success used to return silently with no trace of how long
+    it actually took to get there.
   - **Mutations fail fast.** `create`/`append`/`prepend`/`open`/`delete` (and sync on/off) are never
     retried — re-issuing a write could double-apply it; they go straight to `-UNKNOWN`.
   - On final give-up the driver throws a `CliUnrecognizedOutput` naming the **recognizer** that

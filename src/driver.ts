@@ -30,17 +30,15 @@ const UNRESPONSIVE_MAX_RETRIES = 120;
 
 // Wait-for-recovery bounds for a read whose output isn't (yet) parseable — typically a node
 // mid-(re)connect reporting `Error: Sync is in error state.` on a sync command. Retry every
-// BACKOFF up to MAX_RETRIES hoping the reply becomes recognizable; kept short relative to the
-// settle cap (~120s) so one read can't dominate a settle. Then the rep ends `-UNKNOWN`.
+// BACKOFF up to MAX_RETRIES hoping the reply becomes recognizable. Then the rep ends `-UNKNOWN`.
 const RECOGNIZE_BACKOFF_MS = 2_000;
 const RECOGNIZE_MAX_RETRIES = 15;
 // Per-attempt bound for a runRecognized() call — some commands (`sync:history ... total` in
-// particular) can themselves silently block for tens of seconds once Sync hasn't caught up yet
-// (see readTotals's comment in execute.ts), with zero signal while in flight under the old
-// unbounded (120s-default) call. Bounding each attempt turns a long silent stall into a visible,
-// retried sequence — worst case MAX_RETRIES × (CALL_TIMEOUT + BACKOFF) ≈ 15 × 7s ≈ 105s, which
-// is comfortably above the observed real durations (42s, 64s) and a large improvement over the
-// old theoretical worst case (up to ~30 minutes if every attempt took the full 120s default).
+// particular) can themselves silently block for a long time once Sync hasn't caught up yet (see
+// readTotals's comment in execute.ts and docs/cli-trust.md), with zero signal while in flight
+// under an unbounded call. Bounding each attempt turns a long silent stall into a visible,
+// retried sequence — worst case MAX_RETRIES × (CALL_TIMEOUT + BACKOFF), well under the settle
+// cap so one read can't dominate a settle (full story: docs/cli-trust.md).
 const RECOGNIZE_CALL_TIMEOUT_MS = 5_000;
 
 export class ObsidianDriver {
@@ -91,26 +89,21 @@ export class ObsidianDriver {
   }
 
   /**
-   * Read-only call with retry-for-recovery: run the command (bounded to recognizeCallTimeoutMs
-   * per attempt — NOT via this.run()'s own much-more-patient untimely-retry, which stays
-   * reserved for mutations, where retrying blind after a long wait is the safe choice; here a
-   * single attempt just gets cut short and retried sooner, which is strictly better for a
-   * read) and apply `recognize`. Two distinct reasons an attempt doesn't yet produce a value,
-   * both retried the same way:
-   *   - the call TIMED OUT (`raw.killed`) — some commands (`sync:history ... total` in
-   *     particular, see execute.ts's readTotals comment) can themselves block for tens of
-   *     seconds once Sync hasn't caught up yet; without a bound, a single such call previously
-   *     produced NO log at all while in flight.
-   *   - the call answered fast but with something UNRECOGNIZED — e.g. a node mid-(re)connect
-   *     answering a sync command with `Error: Sync is in error state.`
+   * Read-only call with retry-for-recovery: bounded to recognizeCallTimeoutMs per attempt — NOT
+   * via this.run()'s own untimely-retry, which stays reserved for mutations (see docs/cli-trust.md
+   * for why reads and mutations retry differently). Two distinct reasons an attempt doesn't yet
+   * produce a value, both retried the same way, same budget:
+   *   - the call TIMED OUT (`raw.killed`) — logged as `cli-call-timeout-retry`.
+   *   - the call answered but with something UNRECOGNIZED (e.g. a node mid-(re)connect answering
+   *     a sync command with `Error: Sync is in error state.`) — logged as
+   *     `cli-output-unrecognized-retry`.
    * After RECOGNIZE_MAX_RETRIES (of either kind, combined) it gives up and throws
    * CliUnrecognizedOutput (→ `-UNKNOWN`), naming the recognizer. SAFE only for idempotent reads
    * — never use for a mutation.
    *
-   * Each individual call is timed (`callMs`). Success after retry was previously silent too
-   * (a plain `return`, no log) — now logged whenever attempt > 0, so a sequence that eventually
-   * recovers leaves a trace of how long it actually took; the common "recognized on the first
-   * try" case stays exactly as silent as before.
+   * Each attempt is timed (`callMs`). A retry sequence that eventually succeeds logs that too
+   * (`cli-output-recognized-after-retry`, attempt > 0) — the common "recognized on the first
+   * try" case stays silent, as before.
    */
   private async runRecognized<T>(
     command: string,

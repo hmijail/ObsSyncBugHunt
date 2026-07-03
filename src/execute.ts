@@ -48,8 +48,8 @@ export interface ExecuteOpts {
   // and wait forever. Default on.
   hostCheck?: boolean;
   // Per-call `ms` timing on the pause-snapshot (debug/observability aid — see the "pause"
-  // case). Default ON (this round's diagnosis of a slow snapshot); --skip-snapshot-timing
-  // turns it off later without touching the snapshot logic itself.
+  // case, useful for spotting a slow snapshot call). Default ON; --skip-snapshot-timing turns
+  // it off without touching the snapshot logic itself.
   snapshotTiming?: boolean;
   // Recorded into the `history` event only — neither changes execution here. A rep's
   // outcome can depend on which of these governed it (confirmed: the isolator choice alone
@@ -159,7 +159,8 @@ export async function waitForSynced(
   // Baseline server-version counts (the `from` reference) are read LAZILY, the first time
   // every node is synced — NOT up front. `sync:history total` blocks until the queried node has
   // caught up, so reading it on a just-reconnected, still-syncing node would stall the whole
-  // settle (~64s) before the bounded-probe loop even starts. Gate on the probe instead.
+  // settle before the bounded-probe loop even starts (full story: docs/cli-trust.md). Gate on
+  // the probe instead.
   let baseline: Record<string, number> | null = null;
   let start = Date.now();
   let lastSig: string | null = null;
@@ -274,9 +275,9 @@ export async function waitForSynced(
  * Independent FS second-source check at the SETTLED verdict: the set of `.md` files the CLI
  * reports in `folder` must EXACTLY match what's actually on disk (`ls`). A file the CLI
  * reports that the FS lacks is the forum "conflict file was never really created" bug; a file
- * on disk the CLI omits is the 2026-06-26 empty-listing bug. Either way → ALARM. Skipped when
- * the driver has no vault path (local/dev). Run only once settled, so a mid-sync difference
- * can't fire.
+ * on disk the CLI omits is the empty-listing bug docs/cli-trust.md opens with. Either way →
+ * ALARM. Skipped when the driver has no vault path (local/dev). Run only once settled, so a
+ * mid-sync difference can't fire.
  */
 export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): Promise<void> {
   for (const d of drivers) {
@@ -414,13 +415,13 @@ export async function runHistory(
         const touchedList = [...touched];
         const noteBase = (fullname: string) => fullname.slice(NOTE_DIR.length + 1); // strip "bughunt/"
         const isRelevant = (entry: string, base: string) => entry === `${base}.md` || entry.startsWith(`${base} (Conflicted copy`);
-        // A synced node's sync:status replies in well under a second (live-measured: 0.24-0.46s);
-        // an unsynced one blocks for the WHOLE budget regardless (it never returns early with a
-        // "syncing" word — see syncStateProbe), so a short cap here just makes that wasted wait
-        // cheap. Separate from the settle's own probeMs (unchanged, different concern).
+        // A synced node's sync:status replies quickly; an unsynced one blocks for the WHOLE
+        // budget regardless (it never returns early with a "syncing" word — see
+        // syncStateProbe), so a short cap here just makes that wasted wait cheap. Separate from
+        // the settle's own probeMs (unchanged, different concern).
         const SNAPSHOT_SYNC_PROBE_MS = 1000;
-        // Debug/observability aid (this round's ~15s-snapshot investigation): time each call
-        // individually, without affecting their concurrency. Default on; --skip-snapshot-timing
+        // Debug/observability aid: time each call individually (useful for spotting a slow
+        // snapshot call), without affecting their concurrency. Default on; --skip-snapshot-timing
         // (opts.snapshotTiming === false) drops the `ms` fields with no other code change.
         const mkTimed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms?: number }> => {
           const t0 = Date.now();
@@ -550,7 +551,8 @@ export async function runHistory(
 
   // Judge from the settle's window-confirmed observation, NOT a fresh re-read: a single
   // `files folder=…` listing can transiently omit a conflict file, which would fabricate
-  // a "loss" for edits that are actually preserved in that file (seen 2026-06-26).
+  // a "loss" for edits that are actually preserved in that file (docs/cli-trust.md's founding
+  // incident, same failure mode).
   const observations = stab.observations;
   // Independent FS second-source: at this settled point, what the CLI lists under bughunt/
   // must exactly match what's on disk — or ALARM (catches phantom/never-written conflict
