@@ -8,18 +8,21 @@
 // Params are CLI args (args-only — env is not read). Use `make` (which maps
 // `make soak TURNS=paced` to the flags below), or run directly: `npm run start -- <flags>`.
 //
-//   --nodes          comma-separated container names         (default n1,n2)
+//   --nodes          comma-separated container names, plus the literal "mac" to include the Mac
+//                    node — e.g. "n1,n2,mac" (default n1,n2). "mac" is the sole on/off switch for
+//                    the DSL's `M` node (a real, always-connected local instance; never a D/C
+//                    target, see dsl.ts) — --mac-bin only supplies its binary path, so "mac" in
+//                    --nodes without --mac-bin/MAC_BIN set fails fast at startup rather than
+//                    crashing mid-run (and vice versa: a history using `M` without "mac" in
+//                    --nodes also fails fast). Its Sync state is also checked before every op it
+//                    performs (paused/error/stopped/offline aborts the whole run — see execute.ts's
+//                    assertMacSyncOn); its vault path is self-reported (`vault info=path`), which
+//                    enables the same FS cross-check the containers get, with nothing to configure.
 //   --bin            CLI path inside the container           (default /opt/obsidian/obsidian-cli)
 //   --isolator       network | sync                          (default network)
 //   --network        podman network                          (default obsidian-net)
 //   --mac-bin        path to a local obsidian-cli binary (NOT the GUI Obsidian binary — the CLI
-//                    is much faster per-call) — enables the DSL's `M` node (a real,
-//                    always-connected local instance; never a D/C target, see dsl.ts). A history
-//                    that uses `M` without --mac-bin/MAC_BIN set fails fast at startup rather than
-//                    crashing mid-run. Its Sync state is also checked before every op it performs
-//                    (paused/error/stopped/offline aborts the whole run — see execute.ts's
-//                    assertMacSyncOn); its vault path is self-reported (`vault info=path`), which
-//                    enables the same FS cross-check the containers get, with nothing to configure.
+//                    is much faster per-call) — only used if "mac" is in --nodes; see above
 //   --mac-node-id    the Mac's own Sync-reported device name (default: OS `hostname`, which
 //                    is a guess, not verified to match — see run.ts's own comment on this)
 //   --history        run a specific DSL string (else generate)
@@ -113,11 +116,19 @@ const { values } = parseArgs({
   },
 });
 
-const nodesList = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
+// "mac" in --nodes is the sole on/off switch for Mac participation — --mac-bin only supplies its
+// binary path (see the header comment above for why this reads more naturally than a separate flag).
+const rawNodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
+const macRequested = rawNodes.includes("mac");
+const nodesList = rawNodes.filter((n) => n !== "mac"); // container names only, from here on
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const network = values.network ?? "obsidian-net";
 const isolatorKind = values.isolator ?? "network";
 const macBin = values["mac-bin"];
+if (macRequested && !macBin) {
+  console.error(`--nodes/NODES includes "mac" but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> or drop "mac" from --nodes.`);
+  process.exit(2);
+}
 const scenario = values.scenario ?? "random";
 const histories = Number(values.histories ?? 1);
 const repeat = Number(values.repeat ?? 10);
@@ -126,12 +137,12 @@ const historyArg = values.history;
 const steps = Number(values.steps ?? 0); // with --history: run only its first N ops (0 = all)
 
 // Normalize a hand-typed --history up front (before any container is touched) so an `M` used
-// without `--mac-bin` fails fast with a clear message instead of crashing deep in runHistory:
-// the DSL grammar accepts `M` regardless of whether the Mac is actually wired up, so nothing
-// else catches this mismatch.
+// without "mac" in --nodes fails fast with a clear message instead of crashing deep in
+// runHistory: the DSL grammar accepts `M` regardless of whether the Mac is actually wired up, so
+// nothing else catches this mismatch.
 const parsedHistory = historyArg ? normalize(parse(historyArg)) : undefined;
-if (parsedHistory && !macBin && usesMac(parsedHistory)) {
-  console.error(`history "${historyArg}" uses M (the Mac node) but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> (and optionally --mac-node-id) or remove M from the history.`);
+if (parsedHistory && !macRequested && usesMac(parsedHistory)) {
+  console.error(`history "${historyArg}" uses M (the Mac node) but "mac" isn't in --nodes/NODES — add it (e.g. --nodes ${[...nodesList, "mac"].join(",")}) or remove M from the history.`);
   process.exit(2);
 }
 
@@ -146,7 +157,7 @@ const genParams: GenParams = {
   turns,
   pauseProb: Number(values["pause-prob"] ?? 0),
   partitionProb: Number(values["partition-prob"] ?? 0),
-  macEnabled: !!macBin,
+  macEnabled: macRequested,
 };
 
 // --generate N: print N generated histories and exit — no nodes, no host check.
@@ -171,8 +182,8 @@ async function obsidianVersion(): Promise<string> {
 // LocalExecutor.exec) — worth recording separately since a real reason to test against a real
 // Mac is likely a DIFFERENT installed version than the containers' pinned build.
 async function macObsidianVersion(): Promise<string | undefined> {
-  if (!macBin) return undefined;
-  const r = await runProcess(macBin, ["version"]);
+  if (!macRequested) return undefined;
+  const r = await runProcess(macBin!, ["version"]);
   return r.stdout.trim() || "?";
 }
 
@@ -180,8 +191,8 @@ async function macObsidianVersion(): Promise<string | undefined> {
 // CLI-vs-filesystem cross-check the containers get, with no manual path to configure or keep in
 // sync with wherever the user's real vault happens to live.
 async function macVaultPath(): Promise<string | undefined> {
-  if (!macBin) return undefined;
-  const r = await runProcess(macBin, ["vault", "info=path"]);
+  if (!macRequested) return undefined;
+  const r = await runProcess(macBin!, ["vault", "info=path"]);
   return r.stdout.trim() || undefined;
 }
 
@@ -193,7 +204,7 @@ const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs"
 // cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.
 const vaultPath = values["vault-path"] ?? "/root/vaults/TestVault";
 const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vaultPath));
-if (macBin) {
+if (macRequested) {
   // The Mac's own Sync-reported device name — oracle.ts's conflict-file `wellFormed` check
   // matches the parsed `(Conflicted copy <device> ...)` name against each driver's own `.node`,
   // so this has to be what Sync itself calls the device, not an arbitrary label. `hostname` is
@@ -201,7 +212,7 @@ if (macBin) {
   // Sync's own naming may not) — override with --mac-node-id if a real conflict later shows a
   // mismatch (wellFormed is informational only, so this doesn't gate the core token oracle).
   const macNodeId = values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim();
-  drivers.push(new ObsidianDriver(new LocalExecutor(macBin, macNodeId), await macVaultPath()));
+  drivers.push(new ObsidianDriver(new LocalExecutor(macBin!, macNodeId), await macVaultPath()));
 }
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
@@ -217,7 +228,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   snapshotTiming: !values["skip-snapshot-timing"], // on by default; --skip-snapshot-timing turns it off
   isolator: isolatorKind,
   obsidianVersion: await obsidianVersion(),
-  macNode: macBin ? drivers.length : undefined, // the Mac driver's own (last) position
+  macNode: macRequested ? drivers.length : undefined, // the Mac driver's own (last) position
   macObsidianVersion: await macObsidianVersion(),
 };
 

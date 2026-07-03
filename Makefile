@@ -11,7 +11,10 @@
 IMAGE      := obsidian-node
 LOGIN      := obsidian-login
 NET        := obsidian-net
-NODES      := n1 n2
+# The literal "mac" here is the on/off switch for the Mac node (DSL's `M`) — MAC_BIN below only
+# supplies its binary path. Drop it (NODES="n1 n2") to exclude the Mac; podman-container targets
+# below use CONTAINER_NODES (NODES minus "mac") so they never try to manage it as a container.
+NODES      := n1 n2 mac
 # Host port for the login VNC (container side is 5900). 5900 clashes with macOS
 # Screen Sharing, so default to 5901; override: make login VNC_PORT=5910
 VNC_PORT   ?= 5901
@@ -20,8 +23,8 @@ SECRETS    := $(CURDIR)/secrets/obsidian
 TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
-# Local Mac's obsidian-cli (much faster than the GUI Obsidian binary) — enables the DSL's `M`
-# node by default. Override/clear: make soak MAC_BIN= (or a different path)
+# Local Mac's obsidian-cli (much faster than the GUI Obsidian binary) — only used when "mac" is
+# in NODES (see above). Override to a different path if needed: make soak MAC_BIN=/other/path
 MAC_BIN    ?= /Users/mija/Applications/Obsidian.app/Contents/MacOS/obsidian-cli
 
 # Bound podman calls in solo-check so a wedged podman API fails fast with a hint
@@ -32,6 +35,11 @@ TIMEOUT_BIN := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/
 PODMAN_GUARD := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) $(PODMAN_TIMEOUT))
 
 NODES_CSV := $(shell echo $(NODES) | tr ' ' ',')
+# Real podman containers only — every container-lifecycle target (containers-up/down, reconnect,
+# clean-notes, solo-check) iterates this, never $(NODES) directly, so "mac" is never mistaken for
+# a container to create/rm/exec-into.
+CONTAINER_NODES     := $(filter-out mac,$(NODES))
+CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 # Knobs forwarded to the CLI. --nodes/--network always (structural); the rest only
 # when you set them — so make's recipe echo is the exact, copy-pasteable command and
 # shows precisely what you overrode (e.g. `make soak TURNS=paced` -> `… --turns paced`).
@@ -147,7 +155,7 @@ node1: build net ## Run a single node (n1) with VNC published, for inspection/de
 
 containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC published per node)
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
-	@port=$(VNC_PORT); for n in $(NODES); do \
+	@port=$(VNC_PORT); for n in $(CONTAINER_NODES); do \
 	  podman rm -f $$n 2>/dev/null || true; \
 	  $(NODE_ADDR); \
 	  echo "starting $$n (VNC localhost:$$port, $$ip)"; \
@@ -155,14 +163,14 @@ containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC publi
 	    -p $$port:5900 -v $(SECRETS):/secrets:ro $(IMAGE); \
 	  port=$$((port+1)); \
 	done
-	@for n in $(NODES); do scripts/wait-node.sh $$n; done
-	@echo "nodes ready: $(NODES). VNC from localhost:$(VNC_PORT) (password: obsidian). Then: make run"
+	@for n in $(CONTAINER_NODES); do scripts/wait-node.sh $$n; done
+	@echo "nodes ready: $(CONTAINER_NODES). VNC from localhost:$(VNC_PORT) (password: obsidian). Then: make run"
 
 solo-check:
 	@echo "solo-check: inspecting containers on $(NET)…$(if $(PODMAN_GUARD),, (no 'timeout' found — install coreutils for a hang guard))"
 	@# Isolation guard: every node shares the same cloned Sync login, so a stray
 	@# container on the test network would confound the run. Abort if anything running
-	@# isn't one of the intended NODES. The podman call is time-bounded ($(PODMAN_GUARD))
+	@# isn't one of the intended CONTAINER_NODES. The podman call is time-bounded ($(PODMAN_GUARD))
 	@# so a wedged podman API fails fast with a hint instead of hanging silently.
 	@names=$$($(PODMAN_GUARD) podman ps --filter network=$(NET) --format '{{.Names}}'); rc=$$?; \
 	  if [ $$rc -eq 124 ]; then \
@@ -170,18 +178,18 @@ solo-check:
 	  if [ $$rc -ne 0 ]; then \
 	    echo "podman ps failed (rc=$$rc) — is the podman machine running? ('podman machine start')"; exit 1; fi; \
 	  for c in $$names; do \
-	    echo " $(NODES) " | grep -q " $$c " || { \
+	    echo " $(CONTAINER_NODES) " | grep -q " $$c " || { \
 	      echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make containers-down')"; exit 1; }; \
 	  done
 	@# Warn when reusing long-lived nodes (accumulated vault/conflict cruft can
 	@# skew a run); 'make containers-up' recreates them fresh from the captured login.
-	@for n in $(NODES); do \
+	@for n in $(CONTAINER_NODES); do \
 	  up=$$($(PODMAN_GUARD) podman ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
-reconnect: ## Reconnect all NODES to the network (fixes a node left detached by an interrupted soak)
-	@for n in $(NODES); do \
+reconnect: ## Reconnect all CONTAINER_NODES to the network (fixes a node left detached by an interrupted soak)
+	@for n in $(CONTAINER_NODES); do \
 	  $(NODE_ADDR); \
 	  $(PODMAN_GUARD) podman network connect --ip $$ip --mac-address $$mac $(NET) $$n 2>/dev/null && echo "reconnected $$n ($$ip)" || echo "$$n already connected (or absent)"; \
 	done
@@ -222,8 +230,8 @@ REPRO_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
 repro: ## Generate a standalone bash script reproducing HISTORY=<dsl> by hand (does not touch nodes)
 	npm run repro -- --history "$(HISTORY)" $(REPRO_FLAGS)
 
-clean-notes: solo-check ## Delete the harness's notes (the bughunt/ folder only) on all nodes (nodes must be up)
-	npm run clean-notes -- --nodes $(NODES_CSV)
+clean-notes: solo-check ## Delete the harness's notes (the bughunt/ folder only) on all container nodes (nodes must be up)
+	npm run clean-notes -- --nodes $(CONTAINER_NODES_CSV)
 
 clean-runs: ## Wipe local run results/logs (rm -rf runs/)
 	rm -rf $(RUNS_DIR)
@@ -234,13 +242,13 @@ clean-data: clean-notes ## Fresh slate for a soak: clear the harness's notes (bu
 trial: containers-up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
 
 containers-down: ## Stop + remove n1/n2
-	-@for n in $(NODES); do podman rm -f $$n 2>/dev/null || true; done
+	-@for n in $(CONTAINER_NODES); do podman rm -f $$n 2>/dev/null || true; done
 
 ps: ## List containers on the test network
 	podman ps --filter network=$(NET)
 
 logs: ## Tail Obsidian's log on the first node
-	podman exec $(firstword $(NODES)) tail -n 80 /var/log/obsidian.log
+	podman exec $(firstword $(CONTAINER_NODES)) tail -n 80 /var/log/obsidian.log
 
 health: ## Print a node's liveness report + save its screenshot to ./_shot.png (NODE=n1)
 	@podman exec $(NODE) /usr/local/bin/obsidian-healthcheck

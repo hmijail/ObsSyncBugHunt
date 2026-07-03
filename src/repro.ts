@@ -6,10 +6,14 @@
 // generated script sources — this file only translates the DSL into a flat call sequence.
 //
 //   --history       DSL string to reproduce                        (required)
-//   --nodes         comma-separated container names                 (default n1,n2)
+//   --nodes         comma-separated container names, plus the literal "mac" to include the Mac
+//                    node — e.g. "n1,n2,mac" (default n1,n2). "mac" is the sole on/off switch for
+//                    the Mac (matches run.ts); --mac-bin only supplies its binary path — required
+//                    iff "mac" is in --nodes, and a history using M without "mac" in --nodes fails
+//                    fast the same way run.ts does
 //   --bin           CLI path inside the container                    (default /opt/obsidian/obsidian-cli)
 //   --network       podman network                                   (default obsidian-net)
-//   --mac-bin       path to a local obsidian-cli binary — required iff --history contains M
+//   --mac-bin       path to a local obsidian-cli binary — only used if "mac" is in --nodes
 //   --mac-node-id   the Mac's own Sync-reported device name           (default: OS `hostname`)
 //   --run-id        slug embedded in note names' trailing history part (default: the history itself)
 //   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
@@ -192,16 +196,29 @@ if (isMain) {
     process.exit(2);
   }
 
+  // "mac" in --nodes is the sole on/off switch for Mac participation, matching run.ts — --mac-bin
+  // only supplies its binary path.
+  const rawNodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
+  const macRequested = rawNodes.includes("mac");
+  const nodes = rawNodes.filter((n) => n !== "mac");
   const macBin = values["mac-bin"];
-  // Only worth a subprocess call when the Mac is actually configured — mirrors run.ts's own
+  if (macRequested && !macBin) {
+    console.error(`--nodes includes "mac" but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> or drop "mac" from --nodes.`);
+    process.exit(2);
+  }
+  // Only worth a subprocess call when the Mac is actually requested — mirrors run.ts's own
   // hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
-  const macNodeId = macBin ? (values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
+  const macNodeId = macRequested ? (values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
 
   let history: History;
   try {
     history = parse(values.history);
   } catch (e) {
     console.error(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
+  if (usesMac(normalize(history)) && !macRequested) {
+    console.error(`history "${values.history}" uses M (the Mac node) but "mac" isn't in --nodes — add it (e.g. --nodes ${[...nodes, "mac"].join(",")}) or remove M from the history.`);
     process.exit(2);
   }
 
@@ -214,10 +231,10 @@ if (isMain) {
   let script: string;
   try {
     script = generateScript(history, {
-      nodes: (values.nodes ?? "n1,n2").split(",").map((s) => s.trim()),
+      nodes,
       bin: values.bin ?? "/opt/obsidian/obsidian-cli",
       network: values.network ?? "obsidian-net",
-      macBin,
+      macBin: macRequested ? macBin : undefined,
       macNodeId,
       runId,
       waitCapSec: values["wait-cap-sec"] ? Number(values["wait-cap-sec"]) : undefined,

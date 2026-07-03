@@ -105,8 +105,8 @@ real, in-use vault, the tester should keep your own notes safe.
 | `PAUSE_PROB` | `--pause-prob` | 0 | chance of a ~10s pause after an edit |
 | `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ nodes) |
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
-| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing |
-| `MAC_BIN` | `--mac-bin` | `.../Obsidian.app/Contents/MacOS/obsidian-cli` | path to a local `obsidian-cli` binary (NOT the GUI `Obsidian` binary — the CLI is much faster per-call) — enables the DSL's `M` node (see the DSL table above); clear it (`MAC_BIN=`) for no Mac participation. A history containing `M` with no `MAC_BIN`/`--mac-bin` fails fast at startup rather than crashing mid-run |
+| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2,mac` / `obsidian-net` / `/opt/…` | container plumbing — the literal `mac` entry is the on/off switch for the Mac node (see below); drop it (`NODES=n1,n2`) for no Mac participation. Container-lifecycle targets (`containers-up`/`down`, `reconnect`, `clean-notes`) always skip `mac` automatically — it's never treated as a podman container |
+| `MAC_BIN` | `--mac-bin` | `.../Obsidian.app/Contents/MacOS/obsidian-cli` | path to a local `obsidian-cli` binary (NOT the GUI `Obsidian` binary — the CLI is much faster per-call), used only when `mac` is in `NODES`/`--nodes`. A history containing `M` with `mac` missing from `NODES` (or `mac` present with no `MAC_BIN`) fails fast at startup rather than crashing mid-run |
 | `MAC_NODE_ID` | `--mac-node-id` | OS `hostname` | the Mac's own Sync-reported device name, used to attribute its conflict files correctly — `hostname` is a guess, not verified to match; override if a real conflict shows a mismatch |
 | `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online checks: the startup preflight *and* the in-settle host-outage wait (set it where outbound TCP is blocked, else a stalled settle would wait forever) |
 | `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
@@ -128,7 +128,7 @@ containerized nodes. Commands are uppercase, parameters lowercase/digits.
 | Command | meaning |
 |---|---|
 | `N<d>` | set the active node (`N1`, `N2`) |
-| `M` | set the active node to the Mac — a real local Obsidian instance, if `MAC_BIN` is configured (see Parameters); **exempt from `D`/`C`** below, it must always stay connected. Its Sync state is checked before every op it performs — if found `paused`/`error`/`stopped`/`offline`, the whole run aborts (not just that rep), since a disconnected Mac invalidates every subsequent rep until fixed |
+| `M` | set the active node to the Mac — a real local Obsidian instance, if `mac` is included in `NODES`/`--nodes` (see Parameters); **exempt from `D`/`C`** below, it must always stay connected. Its Sync state is checked before every op it performs — if found `paused`/`error`/`stopped`/`offline`, the whole run aborts (not just that rep), since a disconnected Mac invalidates every subsequent rep until fixed |
 | `A<x>` | append a uniquely-tagged line to note `x` (`Aa`), by the active node (first touch creates it; also opens it in the GUI so you can watch the history unfold) |
 | `D` / `C` | disconnect / connect the active node from the network |
 | `W`    | wait until the active node reports that the last-edited note is synced |
