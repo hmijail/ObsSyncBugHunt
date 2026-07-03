@@ -12,15 +12,18 @@ test("isConflictFile matches the (Conflicted copy …) pattern", () => {
 
 // Executor that replays a queued list of stdout strings (one per exec call), so we can
 // simulate a node answering `sync:history total` with the transient sync-error a few times
-// before it reconnects and returns a real count.
+// before it reconnects and returns a real count. KILLED simulates an attempt that times out
+// (runRecognized's own bounded per-attempt timeout) rather than answering at all.
 const SYNC_ERR = "Error: Sync is in error state. Check sync settings.\n";
+const KILLED = Symbol("killed");
 class ScriptedExecutor implements Executor {
   id = "n1";
   calls = 0;
-  constructor(private readonly outputs: string[]) {}
+  constructor(private readonly outputs: (string | typeof KILLED)[]) {}
   async exec(args: string[]): Promise<ExecResult> {
-    const stdout = this.outputs[Math.min(this.calls++, this.outputs.length - 1)];
-    return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false };
+    const out = this.outputs[Math.min(this.calls++, this.outputs.length - 1)];
+    const killed = out === KILLED;
+    return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout: killed ? "" : out, stderr: "", startedAt: "", durationMs: 0, killed };
   }
   async shell(argv: string[]): Promise<ExecResult> {
     return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
@@ -65,6 +68,37 @@ test("runRecognized: recognized on the FIRST try stays silent — no recognized-
 
 test("runRecognized: a read that never recovers gives up as CliUnrecognizedOutput naming the recognizer", async () => {
   const d = new ObsidianDriver(new ScriptedExecutor([SYNC_ERR])); // stuck forever
+  d.recognizeBackoffMs = 0;
+  await assert.rejects(
+    () => d.syncVersionsTotal("bughunt/x.md"),
+    (err: unknown) => err instanceof CliUnrecognizedOutput && err.recognizer === "parseTotal",
+  );
+});
+
+test("runRecognized: an attempt that times out (killed) retries via cli-call-timeout-retry then returns the recovered value", async () => {
+  const exec = new ScriptedExecutor([KILLED, KILLED, "7"]); // two timed-out attempts, then a real total
+  const d = new ObsidianDriver(exec);
+  d.recognizeBackoffMs = 0;
+  const events: Record<string, unknown>[] = [];
+  d.onEvent = (e) => events.push(e);
+
+  const r = await d.syncVersionsTotal("bughunt/x.md");
+  assert.equal(r.ok, true);
+  assert.equal(r.value, 7);
+  assert.equal(exec.calls, 3);
+  const timeouts = events.filter((e) => e.kind === "cli-call-timeout-retry");
+  assert.equal(timeouts.length, 2);
+  assert.equal(timeouts[0].recognizer, "parseTotal");
+  assert.equal(typeof timeouts[0].callMs, "number");
+  // Never even reaches recognize() on a killed attempt, so no unrecognized-retry noise mixed in.
+  assert.equal(events.filter((e) => e.kind === "cli-output-unrecognized-retry").length, 0);
+  const recovered = events.filter((e) => e.kind === "cli-output-recognized-after-retry");
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].attempts, 3);
+});
+
+test("runRecognized: an attempt that ALWAYS times out gives up as CliUnrecognizedOutput too, not an infinite wait", async () => {
+  const d = new ObsidianDriver(new ScriptedExecutor([KILLED])); // never once answers in time
   d.recognizeBackoffMs = 0;
   await assert.rejects(
     () => d.syncVersionsTotal("bughunt/x.md"),

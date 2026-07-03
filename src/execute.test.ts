@@ -109,10 +109,18 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
 // uninteresting here; what's under test is which DRIVERS a mid-history `W` hands to
 // waitForSynced, observable via the `states` array length on the settle-poll events it logs.
 class SharedVaultExecutor implements Executor {
-  // `syncStatus`: the word reported on `sync:status`; "killed" simulates a probe that never
-  // returns in time (syncStateProbe reports it as "timeout") rather than a real status word.
+  // `syncStatus`: the word reported on `sync:status` from the SECOND call onward; "killed"
+  // simulates a probe that never returns in time (syncStateProbe reports it as "timeout") rather
+  // than a real status word. The FIRST call always reports "synced", satisfying runHistory's
+  // baseline gate (waitNodesSynced) — both it and the mid-history bounded probe
+  // (syncStateProbe/assertMacSyncOn) now go through the same per-attempt-timeout machinery, so
+  // there's no longer a reliable opts-based signal to tell them apart (nor should there be — a
+  // Mac that's really "paused" from the very start of a rep would fail the real baseline gate
+  // too). Simulating "the Mac was fine at rep-start but became a problem mid-history" — exactly
+  // what assertMacSyncOn exists to catch — needs the baseline gate to clear first either way.
+  private syncStatusCalls = 0;
   constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: string | "killed" = "synced") {}
-  async exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+  async exec(args: string[]): Promise<ExecResult> {
     const r = (stdout: string, killed = false): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed });
     const params = Object.fromEntries(args.slice(1).map((a) => {
       const i = a.indexOf("=");
@@ -121,12 +129,7 @@ class SharedVaultExecutor implements Executor {
     const notFound = (file: string) => r(`Error: File "${file}" not found.`);
     switch (args[0]) {
       case "sync:status":
-        // The strict, retrying path (run()/syncStatus(), called with no timeoutMs — used by
-        // runHistory's baseline gate) always sees a healthy vault; only the BOUNDED probe
-        // (syncStateProbe/assertMacSyncOn, always called WITH a timeoutMs) sees the state under
-        // test. Otherwise a simulated "paused"/unrecognized status would make the baseline gate
-        // itself retry for minutes before this test ever reaches the op under test.
-        if (opts?.timeoutMs === undefined) return r("status: synced");
+        if (this.syncStatusCalls++ === 0) return r("status: synced");
         return this.syncStatus === "killed" ? r("", true) : r(`status: ${this.syncStatus}`);
       case "sync:history": return this.vault.has(params.file) ? r("1") : notFound(params.file);
       case "files": return r([...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
@@ -217,7 +220,8 @@ test("assertMacSyncOn: a Mac whose Sync is paused aborts the whole run, not just
   const noLog = { log() {} } as unknown as RunLogger;
   // A plain Error (not AlarmError) — proving it escapes the per-rep catch in run.ts's runRep
   // rather than becoming a quiet -OBSFAIL, since a Mac with Sync off invalidates every
-  // subsequent rep until a human fixes it.
+  // subsequent rep until a human fixes it. The baseline gate clears on SharedVaultExecutor's
+  // always-"synced" first call, so the abort under test happens in the op loop as intended.
   await assert.rejects(
     () => runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "append", note: "a" }], {
       noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false,

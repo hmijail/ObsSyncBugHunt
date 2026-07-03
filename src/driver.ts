@@ -34,12 +34,22 @@ const UNRESPONSIVE_MAX_RETRIES = 120;
 // settle cap (~120s) so one read can't dominate a settle. Then the rep ends `-UNKNOWN`.
 const RECOGNIZE_BACKOFF_MS = 2_000;
 const RECOGNIZE_MAX_RETRIES = 15;
+// Per-attempt bound for a runRecognized() call — some commands (`sync:history ... total` in
+// particular) can themselves silently block for tens of seconds once Sync hasn't caught up yet
+// (see readTotals's comment in execute.ts), with zero signal while in flight under the old
+// unbounded (120s-default) call. Bounding each attempt turns a long silent stall into a visible,
+// retried sequence — worst case MAX_RETRIES × (CALL_TIMEOUT + BACKOFF) ≈ 15 × 7s ≈ 105s, which
+// is comfortably above the observed real durations (42s, 64s) and a large improvement over the
+// old theoretical worst case (up to ~30 minutes if every attempt took the full 120s default).
+const RECOGNIZE_CALL_TIMEOUT_MS = 5_000;
 
 export class ObsidianDriver {
   /** Optional per-rep sink for cli-unresponsive events (set to RunLogger.log); else console. */
   onEvent?: (event: Record<string, unknown>) => void;
   /** Backoff between recognize-retries; overridable so tests don't wait real seconds. */
   recognizeBackoffMs = RECOGNIZE_BACKOFF_MS;
+  /** Per-attempt timeout inside runRecognized(); overridable for tests. */
+  recognizeCallTimeoutMs = RECOGNIZE_CALL_TIMEOUT_MS;
 
   // `vaultPath` (the vault's on-disk root, e.g. /root/vaults/TestVault) enables the
   // filesystem second-source. Unset (local/dev) → FS cross-checks are skipped.
@@ -81,19 +91,26 @@ export class ObsidianDriver {
   }
 
   /**
-   * Read-only call with retry-for-recovery: run the command and apply `recognize`; if the
-   * output isn't (yet) parseable — e.g. a node mid-(re)connect answering a sync command with
-   * `Error: Sync is in error state.` — wait and re-run, hoping for a recognizable reply.
-   * After RECOGNIZE_MAX_RETRIES it gives up and throws CliUnrecognizedOutput (→ `-UNKNOWN`),
-   * naming the recognizer. SAFE only for idempotent reads — never use for a mutation.
+   * Read-only call with retry-for-recovery: run the command (bounded to recognizeCallTimeoutMs
+   * per attempt — NOT via this.run()'s own much-more-patient untimely-retry, which stays
+   * reserved for mutations, where retrying blind after a long wait is the safe choice; here a
+   * single attempt just gets cut short and retried sooner, which is strictly better for a
+   * read) and apply `recognize`. Two distinct reasons an attempt doesn't yet produce a value,
+   * both retried the same way:
+   *   - the call TIMED OUT (`raw.killed`) — some commands (`sync:history ... total` in
+   *     particular, see execute.ts's readTotals comment) can themselves block for tens of
+   *     seconds once Sync hasn't caught up yet; without a bound, a single such call previously
+   *     produced NO log at all while in flight.
+   *   - the call answered fast but with something UNRECOGNIZED — e.g. a node mid-(re)connect
+   *     answering a sync command with `Error: Sync is in error state.`
+   * After RECOGNIZE_MAX_RETRIES (of either kind, combined) it gives up and throws
+   * CliUnrecognizedOutput (→ `-UNKNOWN`), naming the recognizer. SAFE only for idempotent reads
+   * — never use for a mutation.
    *
-   * Each individual call is timed (`callMs`) — some commands (`sync:history ... total` in
-   * particular, see execute.ts's readTotals comment) can themselves block for tens of seconds
-   * once Sync hasn't caught up yet, well under this.run()'s own much larger unresponsive-kill
-   * timeout, so a single slow-but-eventually-answering call previously produced NO log at all
-   * while in flight, and — since success just returned silently — none afterward either. A
-   * retry sequence that eventually succeeds now logs that too (only when attempt > 0, so the
-   * common "recognized on the first try" case stays exactly as silent as before).
+   * Each individual call is timed (`callMs`). Success after retry was previously silent too
+   * (a plain `return`, no log) — now logged whenever attempt > 0, so a sequence that eventually
+   * recovers leaves a trace of how long it actually took; the common "recognized on the first
+   * try" case stays exactly as silent as before.
    */
   private async runRecognized<T>(
     command: string,
@@ -103,8 +120,17 @@ export class ObsidianDriver {
     const sequenceStart = Date.now();
     for (let attempt = 0; ; attempt++) {
       const callStart = Date.now();
-      const raw = await this.run(command, params); // run() still handles the untimely(killed) retry
+      const raw = await this.executor.exec([command, ...params], { timeoutMs: this.recognizeCallTimeoutMs });
       const callMs = Date.now() - callStart;
+      if (raw.killed) {
+        if (attempt >= RECOGNIZE_MAX_RETRIES) throw new CliUnrecognizedOutput(raw, recognize.name);
+        this.emit({
+          kind: "cli-call-timeout-retry",
+          node: this.node, command, recognizer: recognize.name, attempt: attempt + 1, callMs,
+        });
+        await sleep(this.recognizeBackoffMs);
+        continue;
+      }
       const result = recognize(raw.stdout);
       if (result !== UNRECOGNIZED) {
         if (attempt > 0) {
@@ -262,7 +288,12 @@ export class ObsidianDriver {
     return { ok: true, value: t, raw };
   }
 
-  /** Authoritative sync state — returns the validated status word (e.g. "synced"). */
+  /** Authoritative sync state — returns the validated status word (e.g. "synced"). `sync:status`
+   *  itself blocks until synced, so this retries (via runRecognized) until a valid status word
+   *  comes back — bounded to ~105s total (RECOGNIZE_MAX_RETRIES × (recognizeCallTimeoutMs +
+   *  recognizeBackoffMs)), same budget as every other runRecognized caller; a node that hasn't
+   *  reached a synced baseline within that window surfaces as CliUnrecognizedOutput (→ `-UNKNOWN`)
+   *  to whichever outer polling loop called this (waitNodesSynced/preflight/waitForQuiescence). */
   async syncStatus(): Promise<OpResult> {
     const { value: r, raw } = await this.runRecognized("sync:status", [], parseSyncStatus);
     return { ok: true, value: r.status, raw };
