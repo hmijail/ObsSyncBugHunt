@@ -47,14 +47,24 @@ generated script sources) — deliberately simplistic: one-shot commands, no ret
 settle/quiet-window logic (that's `execute.ts`'s job). The generated script always ends by reconnecting
 any node left disconnected, waiting for everyone to settle, then `Check`ing every appended token against
 every node's (and the Mac's) canonical content and conflict files, printing `OK`/`MISSING` per token — the
-same "did it survive somewhere" rule as the real oracle, just without its settle-timing machinery. Takes
-`RUN_ID`/`WAIT_CAP_SEC`/`WAIT_POLL_SEC`/`OUT` in addition to the usual `NODES`/`NETWORK`/`OBSIDIAN_BIN`/
-`MAC_BIN`/`MAC_NODE_ID`; `make repro HISTORY=...` needs no containers up (it never touches podman itself).
+same "did it survive somewhere" rule as the real oracle, just without its settle-timing machinery. A
+step that genuinely fails (a create that didn't report success, a podman network call that exits
+non-zero) aborts the whole script immediately with a clear `ABORT: ...` message rather than
+cascading into confusing follow-on errors — a `Wait` that simply times out is the one exception,
+since that's often the finding itself, not a broken step. Set `VERBOSE=1` when invoking the
+generated script (e.g. `VERBOSE=1 runs/N1Aa.sh`) to echo every real command to stderr. Notes are
+named `bughunt/<ts>-<letter>-<run-id>`, matching real reps' own convention — the timestamp is
+generated fresh each time the *script* runs (not at generation time), so re-running the same
+script twice never collides with the first run's notes. Takes `RUN_ID`/`WAIT_CAP_SEC`/
+`WAIT_POLL_SEC`/`OUT` in addition to the usual `NODES`/`NETWORK`/`OBSIDIAN_BIN`/`MAC_BIN`/
+`MAC_NODE_ID`; `make repro HISTORY=...` needs no containers up (it never touches podman itself).
 
 Each repeat generates one result file, `runs/<ts>-<history>/<repTs>.jsonl`. It contains the timestamped execution
-trace, opening with a `history` event (the DSL string + parsed ops, the isolator/settle-timing
-config that governed the run, and the Obsidian version(s) involved — including `macObsidianVersion`
-when a Mac node is configured, which can differ from the containers' pinned build) and closing with a
+trace, opening with a `history` event (the DSL string + parsed ops, every configured node's own id —
+`nodes`, so a rep that never happens to select every configured node still records what was actually
+live during it — the isolator/settle-timing config that governed the run, and the Obsidian version(s)
+involved — including `macObsidianVersion` when a Mac node is configured, which can differ from the
+containers' pinned build) and closing with a
 `results` event (the verdict), or `obsfail`/`unknown`. A failing repeat's file is renamed with its outcome suffix
 (`<repTs>-LOST.jsonl`, etc.). The group dir's `<ts>` is when that
 history started executing.

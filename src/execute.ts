@@ -342,6 +342,11 @@ export async function runHistory(
   const str = serialize(history);
   logger.log({
     kind: "history", string: str, ops: history,
+    // Every configured driver's own id (e.g. ["n1","n2"], or [...,"HMMBP.local"] with the Mac) —
+    // recorded so a rep that never happens to touch every configured node still shows what was
+    // actually live during it (a history's own `ops` only shows what it selected, not the full
+    // topology it ran against).
+    nodes: drivers.map((d) => d.node),
     isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, macObsidianVersion: opts.macObsidianVersion,
     wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,

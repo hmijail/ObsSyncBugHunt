@@ -11,10 +11,15 @@
 //   --network       podman network                                   (default obsidian-net)
 //   --mac-bin       path to a local obsidian-cli binary — required iff --history contains M
 //   --mac-node-id   the Mac's own Sync-reported device name           (default: OS `hostname`)
-//   --run-id        slug embedded in note names                      (default: the history itself)
+//   --run-id        slug embedded in note names' trailing history part (default: the history itself)
 //   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
 //   --out           where to write the script (mode 0755); default runs/<run-id>.sh; "-" prints
 //                    to stdout instead of writing a file
+//
+// Note paths follow real reps' own convention, bughunt/<ts>-<letter>-<run-id> — the timestamp is
+// generated fresh each time the SCRIPT ITSELF runs (not at generation time), so re-running the
+// same script twice never collides with the first run's leftovers. Set VERBOSE=1 when invoking
+// the generated script (e.g. `VERBOSE=1 runs/N1Aa.sh`) to echo every real command to stderr.
 //
 //   npm run repro -- --history N1DMAaWN1AaC --mac-bin /path/to/obsidian-cli
 
@@ -75,6 +80,7 @@ export function generateScript(history: History, opts: ReproOpts): string {
     `# ${serialize(h)}`,
     `source ${sq(LIB_PATH)}`,
     "",
+    "VERBOSE=${VERBOSE:-0}", // plain string, not a template literal — must reach bash literally
     `BIN=${sq(opts.bin)}`,
     `NODES=(${opts.nodes.join(" ")})`,
     `NETWORK=${sq(opts.network)}`,
@@ -83,7 +89,14 @@ export function generateScript(history: History, opts: ReproOpts): string {
   if (opts.macBin) {
     lines.push(`MAC_BIN=${sq(opts.macBin)}`, `MAC_NODE_ID=${sq(opts.macNodeId ?? "mac")}`);
   }
-  lines.push(`RUN_ID=${sq(runId)}`, "SEQ=1", `WAIT_CAP_SEC=${waitCapSec}`, `WAIT_POLL_SEC=${waitPollSec}`, "");
+  lines.push(
+    `RUN_ID=${sq(runId)}`,
+    "TS=$(date +%dT%H%M%S)", // fresh per execution (not per generation) — see repro-lib.sh's Append/Check
+    "SEQ=1",
+    `WAIT_CAP_SEC=${waitCapSec}`,
+    `WAIT_POLL_SEC=${waitPollSec}`,
+    "",
+  );
 
   for (let i = 0; i < opts.nodes.length; i++) {
     const { ip, mac } = nodeAddress(opts.nodes[i]);

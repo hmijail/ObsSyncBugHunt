@@ -1,12 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "./dsl.js";
 import { generateScript, type ReproOpts } from "./repro.js";
 
 const baseOpts: ReproOpts = { nodes: ["n1", "n2"], bin: "/opt/obsidian/obsidian-cli", network: "obsidian-net", runId: "repro-test" };
+const LIB_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "repro-lib.sh");
+const reproLib = () => readFileSync(LIB_PATH, "utf8");
 
 test("generateScript: sources the bash library exactly once, near the top", () => {
   const script = generateScript(parse("N1Aa"), baseOpts);
@@ -85,6 +88,33 @@ test("generateScript: an empty history produces just the boilerplate — no Wait
 });
 
 test("scripts/repro-lib.sh is syntactically valid bash (bash -n)", () => {
-  const libPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "repro-lib.sh");
-  assert.doesNotThrow(() => execFileSync("bash", ["-n", libPath]));
+  assert.doesNotThrow(() => execFileSync("bash", ["-n", LIB_PATH]));
+});
+
+test("generateScript: sets VERBOSE (runtime-overridable) and a fresh per-execution TS", () => {
+  const script = generateScript(parse("N1Aa"), baseOpts);
+  assert.match(script, /^VERBOSE=\$\{VERBOSE:-0\}$/m);
+  assert.match(script, /^TS=\$\(date \+%dT%H%M%S\)$/m);
+});
+
+test("scripts/repro-lib.sh: every real command is wrapped in `run` for VERBOSE echoing, except sleep", () => {
+  const lib = reproLib();
+  for (const pattern of [
+    /run \$b append/, /run \$b create/, /run \$b open/, /run \$b sync:status/,
+    /run \$b read file/, /run \$b files folder/, /run \$b read path/,
+    /run podman network disconnect/, /run podman network connect/,
+  ]) {
+    assert.match(lib, pattern);
+  }
+  assert.doesNotMatch(lib, /run sleep/); // deliberately unwrapped — not diagnostically interesting
+});
+
+test("scripts/repro-lib.sh: Append aborts (die) if create doesn't report success", () => {
+  assert.match(reproLib(), /\[\[ "\$out" == Created:\* \]\] \|\| die/);
+});
+
+test("scripts/repro-lib.sh: Disconnect/Connect abort (die) on a nonzero podman exit code", () => {
+  const lib = reproLib();
+  assert.match(lib, /Disconnect\(\) \{ run podman network disconnect .*\|\| die/);
+  assert.match(lib, /Connect\(\)\s+\{ run podman network connect .*\|\| die/);
 });
