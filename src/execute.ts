@@ -373,6 +373,10 @@ export async function runHistory(
   // rationale as the settle's own probe: never block on a not-yet-synced node.
   const probeMs = (opts.probeSec ?? 5) * 1000;
 
+  // NOTE: scripts/repro-lib.sh reimplements a simplified version of this op interpreter in bash,
+  // for `make repro`'s standalone reproduction scripts (see src/repro.ts). If you change how an
+  // op behaves here (append's create-vs-append fallback, disconnect/connect, what counts as
+  // "synced", the token format), check whether scripts/repro-lib.sh needs the same update.
   for (const op of history) {
     switch (op.cmd) {
       case "node":

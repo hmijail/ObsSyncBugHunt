@@ -38,9 +38,14 @@ make repro HISTORY=N1DAaWN2AaC           # print a standalone bash script reprod
 ```
 
 `make repro` bypasses the harness's own execution engine entirely — it prints (or, with `OUT=<path>`,
-writes an executable) a plain bash script of the real `podman`/`obsidian-cli` commands a history implies,
-for manually poking at one specific finding. Deliberately simplistic: one-shot commands, no retries, no
-settle/quiet-window logic (that's `execute.ts`'s job) — just a flat, readable, tweakable transcript. Takes
+writes an executable) a plain bash script for manually poking at one specific finding. The history
+translates into a short, flat sequence of calls to a handful of functions (`Disconnect 1`, `Append 1 a`,
+`Wait 1`, ...) defined once in `scripts/repro-lib.sh` (a small hand-maintained bash library every
+generated script sources) — deliberately simplistic: one-shot commands, no retries, no per-note
+settle/quiet-window logic (that's `execute.ts`'s job). The generated script always ends by reconnecting
+any node left disconnected, waiting for everyone to settle, then `Check`ing every appended token against
+every node's (and the Mac's) canonical content and conflict files, printing `OK`/`MISSING` per token — the
+same "did it survive somewhere" rule as the real oracle, just without its settle-timing machinery. Takes
 `RUN_ID`/`WAIT_CAP_SEC`/`WAIT_POLL_SEC`/`OUT` in addition to the usual `NODES`/`NETWORK`/`OBSIDIAN_BIN`/
 `MAC_BIN`/`MAC_NODE_ID`; `make repro HISTORY=...` needs no containers up (it never touches podman itself).
 
