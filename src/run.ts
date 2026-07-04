@@ -82,7 +82,7 @@ for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
     if (err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput) {
       const d = describeInconsistency(err);
       recordInconsistency(d, runsRoot);
-      console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}${d.command ? `\n  cmd: ${d.command}` : ""}`);
+      console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}${d.command ? `\n  cmd: ${d.command}` : ""}${d.stdout !== undefined ? `\n  out: ${JSON.stringify(d.stdout)}` : ""}`);
     } else {
       console.error(err);
     }
@@ -476,7 +476,26 @@ async function preflight(): Promise<boolean> {
   // fresh `make containers-up` brings nodes up with Sync PAUSED. Resume first — else a
   // perfectly normal just-started node reads as "unhealthy" — then wait for it to
   // settle before judging.
-  for (const d of drivers) await d.syncResume();
+  for (const d of drivers) {
+    try {
+      await d.syncResume();
+    } catch (e) {
+      // The local instance's `sync on` only fails to parse (rather than just reporting an
+      // off-state) when the ACTIVE vault in Obsidian isn't a Sync vault at all — obsidian-cli
+      // acts on whichever vault is currently open there, so this is a real, common mistake
+      // (switched vaults, or Obsidian opened a different one on launch), not a CLI format
+      // change. Name it directly rather than letting it fall through as a generic -UNKNOWN.
+      if (localRequested && d.node === drivers[execBase.localNode! - 1].node && e instanceof CliUnrecognizedOutput) {
+        console.error(
+          `The active local Obsidian vault does not appear to be connected to Sync (resuming Sync failed: ` +
+          `${e.raw.stdout.trim() || "no output"}) — the harness requires the vault open in Obsidian to always ` +
+          `be the one connected to Sync. Switch to it in Obsidian and re-run.`,
+        );
+        process.exit(2);
+      }
+      throw e;
+    }
+  }
 
   // Wait until every node is `synced` (or something is clearly wrong) before trusting a count
   // comparison: during the initial sync, note counts legitimately differ. A node's reported

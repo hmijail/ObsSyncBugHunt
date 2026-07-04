@@ -109,18 +109,19 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
 // uninteresting here; what's under test is which DRIVERS a mid-history `W` hands to
 // waitForSynced, observable via the `states` array length on the settle-poll events it logs.
 class SharedVaultExecutor implements Executor {
-  // `syncStatus`: the word reported on `sync:status` from the SECOND call onward; "killed"
-  // simulates a probe that never returns in time (syncStateProbe reports it as "timeout") rather
-  // than a real status word. The FIRST call always reports "synced", satisfying runHistory's
-  // baseline gate (waitNodesSynced) — both it and the mid-history bounded probe
-  // (syncStateProbe/assertLocalSyncOn) now go through the same per-attempt-timeout machinery, so
-  // there's no longer a reliable opts-based signal to tell them apart (nor should there be — a
-  // local instance that's really "paused" from the very start of a rep would fail the real
-  // baseline gate too). Simulating "the local instance was fine at rep-start but became a
-  // problem mid-history" — exactly what assertLocalSyncOn exists to catch — needs the baseline
-  // gate to clear first either way.
+  // `syncStatus`: the word(s) `sync:status` reports once `startSynced`'s grace period (if any)
+  // has elapsed; "killed" simulates a probe that never returns in time (syncStateProbe reports it
+  // as "timeout") rather than a real status word. A single value repeats forever; an array is
+  // consumed one word per call (in order), holding at its last element once exhausted — for
+  // simulating a driver that recovers after N reads. `startSynced` (default true) makes the FIRST
+  // call report "synced" regardless of `syncStatus` — simulating "this driver was fine when the
+  // rep started, then became a problem" (satisfies both runHistory's upfront local-Sync check and
+  // its baseline gate cleanly, exactly like a real driver that hasn't broken yet). Pass `false`
+  // for a driver that's already broken (or recovering) from the very first read — matching a real
+  // local instance whose Sync is off (or was) when the rep starts, which runHistory's upfront
+  // check must see directly, before ever reaching the baseline gate.
   private syncStatusCalls = 0;
-  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: string | "killed" = "synced") {}
+  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: (string | "killed") | (string | "killed")[] = "synced", private readonly startSynced = true) {}
   async exec(args: string[]): Promise<ExecResult> {
     const r = (stdout: string, killed = false): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed });
     const params = Object.fromEntries(args.slice(1).map((a) => {
@@ -129,9 +130,14 @@ class SharedVaultExecutor implements Executor {
     }));
     const notFound = (file: string) => r(`Error: File "${file}" not found.`);
     switch (args[0]) {
-      case "sync:status":
-        if (this.syncStatusCalls++ === 0) return r("status: synced");
-        return this.syncStatus === "killed" ? r("", true) : r(`status: ${this.syncStatus}`);
+      case "sync:status": {
+        const n = this.syncStatusCalls++;
+        if (this.startSynced && n === 0) return r("status: synced");
+        const seq = Array.isArray(this.syncStatus) ? this.syncStatus : [this.syncStatus];
+        const i = this.startSynced ? n - 1 : n;
+        const word = seq[Math.min(i, seq.length - 1)];
+        return word === "killed" ? r("", true) : r(`status: ${word}`);
+      }
       case "sync:history": return this.vault.has(params.file) ? r("1") : notFound(params.file);
       case "files": return r([...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
       case "read": return this.vault.has(params.file) ? r(this.vault.get(params.file)!) : notFound(params.file);
@@ -217,14 +223,16 @@ test("the D/C defense-in-depth assert fires if a D op is forced through while th
 // --- the local instance's Sync-on guard: abort (not just tag the rep) if it's ever found off ---
 test("assertLocalSyncOn: a local instance whose Sync is paused aborts the whole run, not just the rep", async () => {
   const vault = new Map<string, string>();
-  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "paused"));
+  // startSynced:false — this driver is broken from the very first read, matching a real always-
+  // off local instance (e.g. the wrong vault frontmost): runHistory's upfront local-Sync check
+  // must catch this on its very first probe, before ever reaching the baseline gate.
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "paused", false));
   const noLog = { log() {} } as unknown as RunLogger;
   // A plain Error (not CliInconsistencyError) — proving it escapes the per-rep catch in run.ts's runRep
   // rather than becoming a quiet -OBSFAIL, since the local instance's Sync being off invalidates
   // every subsequent rep until a human fixes it. hostCheck:false disables the host-outage detour,
-  // so this still aborts immediately, same as before that detour existed. The baseline gate
-  // clears on SharedVaultExecutor's always-"synced" first call, so the abort under test happens
-  // in the op loop as intended.
+  // so this still aborts immediately, same as before that detour existed. The abort now happens
+  // in runHistory's upfront check, before the op loop even starts.
   await assert.rejects(
     () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
       noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false,
@@ -242,4 +250,35 @@ test("assertLocalSyncOn: an inconclusive probe (syncing / timed-out / unreadable
       noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
     }); // resolves without throwing for every one of these states
   }
+});
+
+// --- the grace-retry regression: a blip that already ended by the time we checked -------------
+// hostCheck is left ON (not false) for both of these — the exact path that had zero coverage
+// before this fix, since waitForHostReconnect returns false immediately when hostOnline() is
+// already true (the real, uncontrolled case in a test environment with real internet access).
+test("assertLocalSyncOn: an off-state that recovers within the grace window does NOT abort, and flags hostOutage", async () => {
+  const vault = new Map<string, string>();
+  // startSynced:false — off from the very first read (as a real broken-from-rep-start local
+  // instance would be); then recovers after two reads, well within localSyncGraceAttempts below.
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, ["error", "error", "synced"], false));
+  const noLog = { log() {} } as unknown as RunLogger;
+  const result = await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+    noteName: (l) => `bughunt/${l}`, localNode: 1,
+    localSyncGraceMs: 1, localSyncGraceAttempts: 2, // keep the grace window itself fast
+    capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+  }); // must resolve, not throw — this is exactly the bug: it used to throw off the first "error" read
+  assert.equal(result.timings.hostOutage, true, "a rep that needed grace retries should flag its timings as unreliable");
+});
+
+test("assertLocalSyncOn: an off-state that persists through every grace attempt still aborts", async () => {
+  const vault = new Map<string, string>();
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "error", false));
+  const noLog = { log() {} } as unknown as RunLogger;
+  await assert.rejects(
+    () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+      noteName: (l) => `bughunt/${l}`, localNode: 1,
+      localSyncGraceMs: 1, localSyncGraceAttempts: 2,
+    }),
+    /local node's Sync is not on.*"error"/,
+  );
 });

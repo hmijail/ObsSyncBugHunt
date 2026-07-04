@@ -69,6 +69,9 @@ export interface ExecuteOpts {
   // D/C defense-in-depth assert below — undefined means no local instance is configured.
   localNode?: number;
   localObsidianVersion?: string;
+  // Overridable so tests don't wait the real ~15s worst case — see assertLocalSyncOn.
+  localSyncGraceMs?: number;
+  localSyncGraceAttempts?: number;
 }
 
 export interface LostForensic {
@@ -165,12 +168,17 @@ async function waitForHostReconnect(logger: RunLogger, context: Record<string, u
  *
  *  A positively-read off-state gets one more chance before aborting: it's often just the local
  *  symptom of the HOST losing its own internet — wait for connectivity to return (unbounded, same
- *  as the settle loop), then give Sync a short grace window to recover before giving up for real.
- *  Only if it's STILL off after that does this throw a plain Error (not CliInconsistencyError): Sync
- *  genuinely off invalidates every subsequent rep until a human fixes it, so this must escape
- *  runRep's per-rep catch and abort the whole soak, not just tag one rep -OBSFAIL. Returns
- *  whether a host-outage detour actually happened (so the caller can flag this rep's timings as
- *  unreliable even if it goes on to finish normally). */
+ *  as the settle loop) if it's CURRENTLY offline, then unconditionally give Sync a short grace
+ *  window to recover before giving up for real. That grace window is NOT contingent on actually
+ *  catching an active outage: a brief blip can easily have already ended by the time this probe
+ *  runs (this only fires at rep-start and before append/wait ops, not continuously), leaving Sync
+ *  itself still a moment behind clearing its own error state even though connectivity is already
+ *  back — that case still deserves the same grace. Only if it's STILL off after that does this
+ *  throw a plain Error (not CliInconsistencyError): Sync genuinely off invalidates every
+ *  subsequent rep until a human fixes it, so this must escape runRep's per-rep catch and abort
+ *  the whole soak, not just tag one rep -OBSFAIL. Returns whether either detour actually
+ *  happened (so the caller can flag this rep's timings as unreliable even if it goes on to finish
+ *  normally). */
 const LOCAL_SYNC_OFF_STATES = new Set(["paused", "error", "stopped", "offline"]);
 const LOCAL_SYNC_GRACE_ATTEMPTS = 3;
 const LOCAL_SYNC_GRACE_MS = 5_000;
@@ -179,9 +187,12 @@ async function assertLocalSyncOn(driver: ObsidianDriver, opts: ExecuteOpts, logg
   let state = await syncState(driver, probeMs);
   let hostOutage = false;
   if (LOCAL_SYNC_OFF_STATES.has(state) && opts.hostCheck !== false) {
-    hostOutage = await waitForHostReconnect(logger, { node: driver.node });
-    for (let i = 0; i < LOCAL_SYNC_GRACE_ATTEMPTS && hostOutage && LOCAL_SYNC_OFF_STATES.has(state); i++) {
-      await sleep(LOCAL_SYNC_GRACE_MS);
+    hostOutage = await waitForHostReconnect(logger, { node: driver.node }); // waits out an ACTIVE outage, if any
+    const graceMs = opts.localSyncGraceMs ?? LOCAL_SYNC_GRACE_MS;
+    const graceAttempts = opts.localSyncGraceAttempts ?? LOCAL_SYNC_GRACE_ATTEMPTS;
+    for (let i = 0; i < graceAttempts && LOCAL_SYNC_OFF_STATES.has(state); i++) {
+      hostOutage = true; // any grace retry means this rep waited extra recovery time — flag it either way
+      await sleep(graceMs);
       state = await syncState(driver, probeMs);
     }
   }
@@ -400,14 +411,20 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
   return out;
 }
 
-/** Gate the start of a rep on a known-clean baseline: every node reporting `synced`. */
-async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, maxCapSec: number, logger: RunLogger): Promise<void> {
+/** Gate the start of a rep on a known-clean baseline: every node reporting `synced`. Uses the
+ *  BOUNDED probe (syncStateProbe), same as waitForSynced's own poll — NOT the retrying
+ *  syncStatus(), whose own internal retry-until-recognized loop can itself silently consume up
+ *  to ~105s on a single poll attempt (see docs/cli-trust.md), independent of and underneath the
+ *  capSec/maxCapSec liveness tracking below. A poll loop that's meant to be responsive (many
+ *  quick samples, tracking whether state is still changing) needs each individual sample to
+ *  actually be quick and boundable from the outside — an unboundable one defeats the purpose. */
+async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, maxCapSec: number, probeMs: number, logger: RunLogger): Promise<void> {
   const capMs = capSec * 1000;
   const maxCapMs = maxCapSec * 1000;
   const absoluteStart = Date.now();
   let liveness: Liveness = { lastStates: null, lastChangeAt: absoluteStart };
   for (;;) {
-    const states = await Promise.all(drivers.map(async (d) => (await d.syncStatus()).value ?? "?"));
+    const states = await Promise.all(drivers.map((d) => syncState(d, probeMs)));
     const now = Date.now();
     liveness = trackLiveness(liveness, states, now);
     if (states.every((s) => s === "synced")) {
@@ -453,14 +470,34 @@ export async function runHistory(
   for (const d of drivers) d.onEvent = (e) => logger.log(e);
   isolator.onEvent = (e) => logger.log(e);
 
+  const driverOf = (num: number) => drivers[num - 1];
+  // True once any host-connectivity detour actually fired during this rep (settle-loop cap
+  // exhaustion, or the local-Sync guard) — a signal that this rep's timings are inflated by a
+  // real recovery wait and shouldn't be trusted for latency analysis, even though the rep itself
+  // may still finish and judge cleanly.
+  let hostOutage = false;
+  // Per-call cap for any bounded sync-state probe this rep makes outside the settle loop itself
+  // (the upfront local-Sync check below, waitNodesSynced's baseline poll, pause snapshots) — same
+  // knob and rationale as the settle's own probe: never block on a not-yet-synced node.
+  const probeMs = (opts.probeSec ?? 5) * 1000;
+
+  // Check the local instance's Sync health ONCE per rep, unconditionally — not gated on whether
+  // THIS rep's history happens to select "local" as an edit target. It's a live, continuously-
+  // syncing participant in every rep's settle regardless (same reasoning as the `nodes` field
+  // above), so a wrong active vault (or Sync otherwise off) must be caught right here, rather
+  // than silently timing out reps one after another until some future history happens to touch
+  // it. Checked BEFORE waitNodesSynced (the generic, non-throwing baseline gate below) so a
+  // broken local vault fails fast instead of first burning the whole baseline wait.
+  if (opts.localNode !== undefined) {
+    hostOutage = await assertLocalSyncOn(driverOf(opts.localNode), opts, logger);
+  }
+
   // No `sync on` here: the network isolator (the default fault primitive) never calls `sync
   // off`, so resuming would be an unforced call with nothing to undo. `preflight()` already
   // resumed once at harness startup (the real one-time paused state after `make containers-up`);
   // Sync stays on for the whole session from there.
   // Start from a known-clean baseline: don't begin editing until every node is synced.
-  await waitNodesSynced(drivers, opts.capSec ?? 120, opts.maxCapSec ?? 600, logger);
-
-  const driverOf = (num: number) => drivers[num - 1];
+  await waitNodesSynced(drivers, opts.capSec ?? 120, opts.maxCapSec ?? 600, probeMs, logger);
 
   let activeNode = 1;
   let activeNote: string | undefined;
@@ -469,14 +506,6 @@ export async function runHistory(
   const noteLetters = new Map<string, string>(); // concrete note name -> its logical DSL letter
   const acked: AckedEdit[] = [];
   let seq = 0;
-  // True once any host-connectivity detour actually fired during this rep (settle-loop cap
-  // exhaustion, or the local-Sync guard) — a signal that this rep's timings are inflated by a
-  // real recovery wait and shouldn't be trusted for latency analysis, even though the rep itself
-  // may still finish and judge cleanly.
-  let hostOutage = false;
-  // Per-call cap for any mid-history bounded sync-state probe (pause snapshots), same knob and
-  // rationale as the settle's own probe: never block on a not-yet-synced node.
-  const probeMs = (opts.probeSec ?? 5) * 1000;
 
   // NOTE: scripts/repro-lib.sh reimplements a simplified version of this op interpreter in bash,
   // for `make repro`'s standalone reproduction scripts (see src/repro.ts). If you change how an
