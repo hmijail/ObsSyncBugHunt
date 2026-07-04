@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ObsidianDriver } from "./driver.js";
 import { crossCheckFs, waitForSynced, runHistory } from "./execute.js";
-import { AlarmError } from "./alarm.js";
+import { CliInconsistencyError } from "./inconsistency.js";
 import { sameConflictSet } from "./oracle.js";
 import { parse } from "./dsl.js";
 import { NoopIsolator } from "./isolate.js";
@@ -26,19 +26,19 @@ class StubExecutor implements Executor {
 const driver = (cli: string, ls: string, lsCode = 0) =>
   new ObsidianDriver(new StubExecutor(cli, ls, lsCode), "/vault");
 
-test("crossCheckFs: CLI listing matches disk → no alarm", async () => {
+test("crossCheckFs: CLI listing matches disk → no inconsistency", async () => {
   const d = driver("bughunt/a.md\nbughunt/b.md", "a.md\nb.md");
   await crossCheckFs([d], "bughunt"); // resolves without throwing
 });
 
-test("crossCheckFs: CLI reports a file the FS lacks → ALARM (phantom/never-written conflict file)", async () => {
+test("crossCheckFs: CLI reports a file the FS lacks → flagged inconsistency (phantom/never-written conflict file)", async () => {
   const d = driver("bughunt/a.md\nbughunt/a (Conflicted copy n2 202606261451).md", "a.md");
-  await assert.rejects(() => crossCheckFs([d], "bughunt"), AlarmError);
+  await assert.rejects(() => crossCheckFs([d], "bughunt"), CliInconsistencyError);
 });
 
-test("crossCheckFs: FS has a file the CLI omits → ALARM (the 2026-06-26 dropout)", async () => {
+test("crossCheckFs: FS has a file the CLI omits → flagged inconsistency (the 2026-06-26 dropout)", async () => {
   const d = driver("", "a.md\nb.md"); // CLI listing empty, disk non-empty
-  await assert.rejects(() => crossCheckFs([d], "bughunt"), AlarmError);
+  await assert.rejects(() => crossCheckFs([d], "bughunt"), CliInconsistencyError);
 });
 
 test("crossCheckFs: no vault path configured → skipped (no throw)", async () => {
@@ -113,11 +113,12 @@ class SharedVaultExecutor implements Executor {
   // simulates a probe that never returns in time (syncStateProbe reports it as "timeout") rather
   // than a real status word. The FIRST call always reports "synced", satisfying runHistory's
   // baseline gate (waitNodesSynced) — both it and the mid-history bounded probe
-  // (syncStateProbe/assertMacSyncOn) now go through the same per-attempt-timeout machinery, so
+  // (syncStateProbe/assertLocalSyncOn) now go through the same per-attempt-timeout machinery, so
   // there's no longer a reliable opts-based signal to tell them apart (nor should there be — a
-  // Mac that's really "paused" from the very start of a rep would fail the real baseline gate
-  // too). Simulating "the Mac was fine at rep-start but became a problem mid-history" — exactly
-  // what assertMacSyncOn exists to catch — needs the baseline gate to clear first either way.
+  // local instance that's really "paused" from the very start of a rep would fail the real
+  // baseline gate too). Simulating "the local instance was fine at rep-start but became a
+  // problem mid-history" — exactly what assertLocalSyncOn exists to catch — needs the baseline
+  // gate to clear first either way.
   private syncStatusCalls = 0;
   constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: string | "killed" = "synced") {}
   async exec(args: string[]): Promise<ExecResult> {
@@ -175,19 +176,19 @@ test("W only waits on the active node's own driver, not every online driver (fin
   assert.ok(final.every((e) => (e.states as unknown[]).length === 2), "the final settle probed every driver");
 });
 
-// --- the Mac node: another ordinary driver, except D/C must never target it -------------
-test("a Mac-backed third driver: W still scopes to 1, the final settle scopes to all 3", async () => {
+// --- the local node: another ordinary driver, except D/C must never target it -------------
+test("a local-instance-backed third driver: W still scopes to 1, the final settle scopes to all 3", async () => {
   const vault = new Map<string, string>();
   const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
   const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
-  const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault));
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
   const events: Record<string, unknown>[] = [];
   const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
 
-  await runHistory([n1, n2, mac], new NoopIsolator(), logger, parse("AaWMAaW"), {
+  await runHistory([n1, n2, local], new NoopIsolator(), logger, parse("AaWLAaW"), {
     noteName: (l) => `bughunt/${l}`,
     pollSec: 0.01, minFloorSec: 0, capSec: 5, wSettleSec: 0.02, finalSettleSec: 0.02, probeSec: 1,
-    hostCheck: false, macNode: 3,
+    hostCheck: false, localNode: 3,
   });
 
   const polls = events.filter((e) => e.kind === "settle-poll");
@@ -195,48 +196,50 @@ test("a Mac-backed third driver: W still scopes to 1, the final settle scopes to
   const final = polls.filter((e) => e.final === true);
   assert.ok(midWait.length > 0);
   assert.ok(final.length > 0);
-  assert.ok(midWait.every((e) => (e.states as unknown[]).length === 1), "every mid-history W (numbered or Mac) probes only its own driver");
-  assert.ok(final.every((e) => (e.states as unknown[]).length === 3), "the final settle probes all 3 drivers, including the Mac");
+  assert.ok(midWait.every((e) => (e.states as unknown[]).length === 1), "every mid-history W (numbered or local) probes only its own driver");
+  assert.ok(final.every((e) => (e.states as unknown[]).length === 3), "the final settle probes all 3 drivers, including the local instance");
 });
 
-test("the D/C defense-in-depth assert fires if a D op is forced through while the Mac is active (bypassing dsl.ts's normalize-time guarantee on purpose)", async () => {
+test("the D/C defense-in-depth assert fires if a D op is forced through while the local instance is active (bypassing dsl.ts's normalize-time guarantee on purpose)", async () => {
   const vault = new Map<string, string>();
-  const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault));
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
   const noLog = { log() {} } as unknown as RunLogger;
-  // A hand-built op array, never passed through dsl.ts's normalize()/assertMacAlwaysConnected
+  // A hand-built op array, never passed through dsl.ts's normalize()/assertLocalAlwaysConnected
   // — proving the runtime assert in execute.ts is a real, independent second layer, not dead code.
   await assert.rejects(
-    () => runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "disconnect" }], {
-      noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false,
+    () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "disconnect" }], {
+      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false,
     }),
-    /Mac node must never be disconnected/,
+    /local node must never be disconnected/,
   );
 });
 
-// --- the Mac's Sync-on guard: abort (not just tag the rep) if it's ever found off -------------
-test("assertMacSyncOn: a Mac whose Sync is paused aborts the whole run, not just the rep", async () => {
+// --- the local instance's Sync-on guard: abort (not just tag the rep) if it's ever found off ---
+test("assertLocalSyncOn: a local instance whose Sync is paused aborts the whole run, not just the rep", async () => {
   const vault = new Map<string, string>();
-  const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault, "paused"));
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "paused"));
   const noLog = { log() {} } as unknown as RunLogger;
-  // A plain Error (not AlarmError) — proving it escapes the per-rep catch in run.ts's runRep
-  // rather than becoming a quiet -OBSFAIL, since a Mac with Sync off invalidates every
-  // subsequent rep until a human fixes it. The baseline gate clears on SharedVaultExecutor's
-  // always-"synced" first call, so the abort under test happens in the op loop as intended.
+  // A plain Error (not CliInconsistencyError) — proving it escapes the per-rep catch in run.ts's runRep
+  // rather than becoming a quiet -OBSFAIL, since the local instance's Sync being off invalidates
+  // every subsequent rep until a human fixes it. hostCheck:false disables the host-outage detour,
+  // so this still aborts immediately, same as before that detour existed. The baseline gate
+  // clears on SharedVaultExecutor's always-"synced" first call, so the abort under test happens
+  // in the op loop as intended.
   await assert.rejects(
-    () => runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "append", note: "a" }], {
-      noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false,
+    () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false,
     }),
-    /Mac's Sync is not on.*"paused"/,
+    /local node's Sync is not on.*"paused"/,
   );
 });
 
-test("assertMacSyncOn: an inconclusive probe (syncing / timed-out / unreadable) is tolerated, not treated as off", async () => {
+test("assertLocalSyncOn: an inconclusive probe (syncing / timed-out / unreadable) is tolerated, not treated as off", async () => {
   for (const syncStatus of ["syncing", "killed" as const, "bogus-status-word"]) {
     const vault = new Map<string, string>();
-    const mac = new ObsidianDriver(new SharedVaultExecutor("MyMac", vault, syncStatus));
+    const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, syncStatus));
     const noLog = { log() {} } as unknown as RunLogger;
-    await runHistory([mac], new NoopIsolator(), noLog, [{ cmd: "mac" }, { cmd: "append", note: "a" }], {
-      noteName: (l) => `bughunt/${l}`, macNode: 1, hostCheck: false, capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
     }); // resolves without throwing for every one of these states
   }
 });

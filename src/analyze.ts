@@ -1,7 +1,7 @@
 // Offline analyzer for soak runs. Layout is runs/<history-string>/<rep>/, where a
 // failing rep dir carries a `-LOST`/`-UNKNOWN` suffix. Aggregates per history string:
 // reps, losses (split server-dropped vs never-registered — the latter is worse),
-// conflicts, the caught alarm-class outcomes (`-OBSFAIL`/`-UNKNOWN`, read from the dir
+// conflicts, the caught inconsistency outcomes (`-OBSFAIL`/`-UNKNOWN`, read from the dir
 // suffix since they have no verdict), the sync-duration distribution, and — written to
 // <dir>/analysis.md — a markdown table of each rep's whole "global state" (see
 // buildStateCells), grouped first by outcome (PASS/LOST/DUPL/...). Groups are per history
@@ -104,7 +104,7 @@ interface Group {
   lost: number; serverDropped: number; neverRegistered: number;
   duplReps: number; diffReps: number; unsyncedReps: number;
   conflictReps: number; timeouts: number; conv: number[];
-  // Caught alarm-class outcomes (no results.json — counted from the rep dir suffix).
+  // Caught inconsistency outcomes (no results.json — counted from the rep dir suffix).
   obsfail: number; unknown: number;
   categories: Map<string, Map<string, StateEntry>>; // classify() -> stateKey() -> entry
 }
@@ -151,7 +151,7 @@ function tally(g: Group, r: Results, rep: string) {
   else if (r.verdict.notes.some((n) => !n.converged)) g.diffReps++;
 }
 
-// A caught alarm-class rep has no verdict (runHistory threw): it writes meta.json +
+// A caught inconsistency rep has no verdict (runHistory threw): it writes meta.json +
 // <category>.json but no results.json, and its dir carries the -OBSFAIL / -UNKNOWN suffix.
 // Count it first-class from the suffix so it shows up in every tally, not as "skipped" — but
 // there's no verdict/content to put in a states table, so it never reaches `categories`.
@@ -230,7 +230,7 @@ export function main(base: string): void {
       if (!repFile.endsWith(".jsonl")) continue;
       const rep = repFile.slice(0, -".jsonl".length);
       // A rep's file always ENDS with exactly one results/obsfail/unknown event (the success
-      // path's last logger.log call, or the alarm path's — nothing is ever logged after it), so
+      // path's last logger.log call, or the inconsistency path's — nothing is ever logged after it), so
       // the last line alone carries the verdict; no need to scan the whole file.
       const lines = readFileSync(path.join(strDir, repFile), "utf8").split("\n").filter(Boolean);
       let last: Record<string, unknown>;

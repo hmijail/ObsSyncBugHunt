@@ -26,33 +26,35 @@ the U/L (locally-administered) bit set — correct for a made-up, non-vendor-ass
 the first byte carries this constraint; the rest of the address is free to be anything (subject to
 staying valid hex, since the last byte encodes the node number and must stay a 2-hex-digit value).
 
-## The Mac node (`M`): a grammar token, not a parallel code path
+## The local node (`L`): a grammar token, not a parallel code path
 
-Adding a real local macOS Obsidian instance as a harness participant could have meant threading a
-separate `macDriver` parameter through every function that iterates `drivers` — `driverOf`,
-`waitNodesSynced`, the final settle, the oracle. Instead, `M` is a DSL-grammar-level token, but it
-resolves to an ordinary position in the *same* `drivers` array (always pushed last) the instant
-`execute.ts` processes the op — so everything downstream treats it exactly like any other node,
-with zero special-casing. The grammar-level distinction exists for exactly one reason: the Mac
-must never be disconnected (no safe network-isolation primitive exists for the user's own physical
-machine — see below), and that invariant is easiest to guarantee by making it structurally
-inexpressible in the DSL (`dsl.ts`'s `assertMacAlwaysConnected`), backed by a second,
-independent runtime assert in `execute.ts` in case the grammar-level guarantee is ever bypassed.
+Adding a real Obsidian instance running directly on the host as a harness participant could have
+meant threading a separate `localDriver` parameter through every function that iterates `drivers`
+— `driverOf`, `waitNodesSynced`, the final settle, the oracle. Instead, `L` is a DSL-grammar-level
+token, but it resolves to an ordinary position in the *same* `drivers` array (always pushed last)
+the instant `execute.ts` processes the op — so everything downstream treats it exactly like any
+other node, with zero special-casing. The grammar-level distinction exists for exactly one reason:
+the local instance must never be disconnected (no safe network-isolation primitive exists for the
+user's own physical machine — see below), and that invariant is easiest to guarantee by making it
+structurally inexpressible in the DSL (`dsl.ts`'s `assertLocalAlwaysConnected`), backed by a
+second, independent runtime assert in `execute.ts` in case the grammar-level guarantee is ever
+bypassed.
 
-**Rejected alternative: reuse node number `0` for the Mac instead of a new token.** `dsl.ts`'s
-`dropRedundantNodes` already uses `active = 0` as a sentinel meaning "nothing selected yet" — a
-real node `0` would collide with that sentinel, silently dropping the very first `N0` selection in
-any history. This is exactly the kind of thing worth writing down here rather than rediscovering
-by hitting the bug again: the collision isn't obvious from reading `dropRedundantNodes` in
-isolation, only from knowing the historical reason `0` was chosen as the sentinel in the first
-place.
+**Rejected alternative: reuse node number `0` for the local instance instead of a new token.**
+`dsl.ts`'s `dropRedundantNodes` already uses `active = 0` as a sentinel meaning "nothing selected
+yet" — a real node `0` would collide with that sentinel, silently dropping the very first `N0`
+selection in any history. This is exactly the kind of thing worth writing down here rather than
+rediscovering by hitting the bug again: the collision isn't obvious from reading
+`dropRedundantNodes` in isolation, only from knowing the historical reason `0` was chosen as the
+sentinel in the first place.
 
-## Real network isolation for the Mac: rejected for now, not forever
+## Real network isolation for the local node: rejected for now, not forever
 
 Every other fault primitive in this harness (`D`/`C`) works by detaching a *container* from its
-podman network — safe, because the blast radius of a mistake is a disposable container. The Mac
-node is the user's real physical laptop, so the same primitive isn't available, and the
-alternatives considered so far all have real problems:
+podman network — safe, because the blast radius of a mistake is a disposable container. The local
+node is the user's real physical machine, so the same primitive isn't available, and the
+alternatives considered so far all have real problems (framed around macOS, since that's the host
+this has actually been run on so far):
 
 - **macOS's Application Firewall (`socketfilterfw`)** — the wrong tool entirely, not just a
   slower one: it only gates *incoming* connections, and Obsidian Sync is a client-initiated
@@ -64,8 +66,8 @@ alternatives considered so far all have real problems:
   affect the user's real networking, not just Obsidian. A narrowly-scoped anchor (blocking only
   `sync-*.obsidian.md` traffic, not a broad default-deny) plus a session-scoped sudoers grant
   (set up/torn down per soak, not a standing grant) meaningfully narrows this risk — worth
-  revisiting as a real feature later, but it reverses this round's "Mac always connected"
-  premise, so it needs its own design pass, not a bolt-on.
+  revisiting as a real feature later, but it reverses this round's "local instance always
+  connected" premise, so it needs its own design pass, not a bolt-on.
 - **A macOS sandbox** (`sandbox-exec`) to run Obsidian without network access, then restart it
   outside the sandbox — process-scoped (no shared host state to leak, unlike `pfctl`), but
   Apple-deprecated with no public docs, and restarting the whole app to move it in/out of the
@@ -77,7 +79,8 @@ alternatives considered so far all have real problems:
   same `Virtualization.framework` the podman machine already uses for the Linux containers,
   container-like in workflow (`tart clone`/`tart run`). This removes the actual objection to
   network isolation (risk to the user's *physical* host, not a fundamental objection to isolating
-  the Mac at all) — the blast radius of a mistake becomes the disposable VM, not the real laptop.
+  the local instance at all) — the blast radius of a mistake becomes the disposable VM, not the
+  real laptop.
   Provisioning looked harder than it turned out to be: an Obsidian developer's own forum comment
   says Sync credentials live in IndexedDB inside the app's own appdata folder, not the OS
   Keychain — meaning a fresh VM likely just needs that folder copied in, not an interactive
@@ -85,7 +88,8 @@ alternatives considered so far all have real problems:
   bakes in a logged-in state. Still a real, separate undertaking (its own VM lifecycle to build),
   but the biggest assumed blocker turned out not to be one.
 
-For now: no network fault primitive for the Mac at all. It's a real, always-connected participant
-— `assertMacSyncOn` (`execute.ts`) checks its Sync state before every op it performs and aborts
-the whole run (not just the rep) if it's ever found off, since a genuinely disconnected Mac
-invalidates every subsequent rep until a human notices and fixes it.
+For now: no network fault primitive for the local node at all. It's a real, always-connected
+participant — `assertLocalSyncOn` (`execute.ts`) checks its Sync state before every op it
+performs; a host-internet blip gets a chance to recover first (see the settle loop's own
+host-outage handling), but a genuinely off Sync state aborts the whole run (not just the rep),
+since it invalidates every subsequent rep until a human notices and fixes it.

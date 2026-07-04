@@ -8,8 +8,8 @@
 //   1. is bounded by a HARD timeout; if killed (untimely) we log `cli-unresponsive` and RETRY
 //      (wait for recovery) — we never judge on a stalled read.
 //   2. once timely, its output must be POSITIVELY identified by a recognizer (see cli-parse.ts);
-//      anything unrecognized throws CliUnrecognizedOutput, which the run turns into a loud ALARM
-//      and abort (so a future obsidian-cli format change fails loudly, not silently).
+//      anything unrecognized throws CliUnrecognizedOutput, which the run turns into a flagged
+//      inconsistency and abort (so a future obsidian-cli format change fails loudly, not silently).
 
 import assert from "node:assert/strict";
 import type { Executor } from "./exec.js";
@@ -19,12 +19,12 @@ import {
   parseRead, parseFilesList, parseSyncStatus, parseTotal, parseSyncRead,
   parseSyncVersions, parseFileVersions, parseMutation, parseSyncHistory, isNotFoundError,
 } from "./cli-parse.js";
-import { AlarmError } from "./alarm.js";
+import { CliInconsistencyError } from "./inconsistency.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Wait-for-recovery bounds for an unresponsive CLI: retry every BACKOFF up to MAX_RETRIES
-// (~10 min), then it's a permanent outage → ALARM.
+// (~10 min), then it's a permanent outage — flagged as a CliInconsistencyError.
 const UNRESPONSIVE_BACKOFF_MS = 5_000;
 const UNRESPONSIVE_MAX_RETRIES = 120;
 
@@ -73,7 +73,7 @@ export class ObsidianDriver {
       if (!raw.killed) return raw;
       this.emit({ kind: "cli-unresponsive", node: this.node, command, attempt, durationMs: raw.durationMs });
       if (attempt >= UNRESPONSIVE_MAX_RETRIES) {
-        throw new AlarmError("cli-permanently-unresponsive", { node: this.node, command, attempts: attempt });
+        throw new CliInconsistencyError("cli-permanently-unresponsive", { node: this.node, command, attempts: attempt });
       }
       await sleep(UNRESPONSIVE_BACKOFF_MS);
     }
@@ -151,7 +151,7 @@ export class ObsidianDriver {
       if (!raw.killed) return raw;
       this.emit({ kind: "cli-unresponsive", node: this.node, command: argv[0], attempt, durationMs: raw.durationMs });
       if (attempt >= UNRESPONSIVE_MAX_RETRIES) {
-        throw new AlarmError("cli-permanently-unresponsive", { node: this.node, command: argv[0], attempts: attempt });
+        throw new CliInconsistencyError("cli-permanently-unresponsive", { node: this.node, command: argv[0], attempts: attempt });
       }
       await sleep(UNRESPONSIVE_BACKOFF_MS);
     }
@@ -300,7 +300,7 @@ export class ObsidianDriver {
    * positively-confirmed reply, only the fact that it didn't return in time; an unreadable
    * reply → "?" (logged once, caller keeps polling — the settle cap bounds a persistently-bad
    * node as `-TIMEOUT`). Unlike `run`, a timeout here is EXPECTED, not an outage, so it never
-   * reaches the killed→ALARM path.
+   * reaches the killed→CliInconsistencyError path.
    */
   async syncStateProbe(timeoutMs: number): Promise<string> {
     assert(timeoutMs > 0, "syncStateProbe needs a positive timeout");

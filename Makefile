@@ -11,15 +11,15 @@
 IMAGE      := obsidian-node
 LOGIN      := obsidian-login
 NET        := obsidian-net
-# The literal "mac" here is the on/off switch for the Mac node (DSL's `M`) — MAC_BIN below only
-# supplies its binary path. Drop it (NODES="n1 n2") to exclude the Mac; podman-container targets
-# below use CONTAINER_NODES (NODES minus "mac") so they never try to manage it as a container.
-NODES      := n1 n2 mac
+# The literal "l" here is the on/off switch for the local instance (DSL's `L`) — LOCAL_BIN below
+# only supplies its binary path. Drop it (NODES="n1 n2") to exclude it; podman-container targets
+# below use CONTAINER_NODES (NODES minus "l") so they never try to manage it as a container.
+NODES      := n1 n2 l
 # NODES is space-separated internally (NODES_CSV below comma-joins it for the CLI flag) — but
-# `make soak NODES=n1,mac` (comma-separated, matching how the CLI itself takes --nodes) is a
-# completely natural thing to type, and silently produced a single mangled word ("n1,mac") that
+# `make soak NODES=n1,l` (comma-separated, matching how the CLI itself takes --nodes) is a
+# completely natural thing to type, and silently produced a single mangled word ("n1,l") that
 # made every container-lifecycle target misbehave (e.g. solo-check flagging 'n1' itself as a
-# stray container, since " n1 " never appears inside " n1,mac "). Accept either form by
+# stray container, since " n1 " never appears inside " n1,l "). Accept either form by
 # normalizing commas to spaces right after NODES is set, whether from the default above or a
 # command-line override (needs `override` — a plain `:=` here would be shadowed by the override).
 empty :=
@@ -34,9 +34,10 @@ SECRETS    := $(CURDIR)/secrets/obsidian
 TEST_VAULT ?= Throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
-# Local Mac's obsidian-cli (much faster than the GUI Obsidian binary) — only used when "mac" is
-# in NODES (see above). Override to a different path if needed: make soak MAC_BIN=/other/path
-MAC_BIN    ?= /Users/mija/Applications/Obsidian.app/Contents/MacOS/obsidian-cli
+# The host's own obsidian-cli, only used when "l" is in NODES (see above). Bare command name,
+# relying on the normal install/activation flow putting it on PATH (confirmed on both macOS and
+# Linux) — override to a full path if it isn't: make soak LOCAL_BIN=/other/path
+LOCAL_BIN  ?= obsidian
 
 # Bound podman calls in solo-check so a wedged podman API fails fast with a hint
 # instead of hanging silently. Uses `timeout` (or `gtimeout` from coreutils on macOS)
@@ -47,9 +48,9 @@ PODMAN_GUARD := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) $(PODMAN_TIMEOUT))
 
 NODES_CSV := $(shell echo $(NODES) | tr ' ' ',')
 # Real podman containers only — every container-lifecycle target (containers-up/down, reconnect,
-# clean-notes, solo-check) iterates this, never $(NODES) directly, so "mac" is never mistaken for
+# clean-notes, solo-check) iterates this, never $(NODES) directly, so "l" is never mistaken for
 # a container to create/rm/exec-into.
-CONTAINER_NODES     := $(filter-out mac,$(NODES))
+CONTAINER_NODES     := $(filter-out l,$(NODES))
 CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 # Knobs forwarded to the CLI. --nodes/--network always (structural); the rest only
 # when you set them — so make's recipe echo is the exact, copy-pasteable command and
@@ -57,8 +58,8 @@ CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
   $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
-  $(if $(MAC_BIN),--mac-bin $(MAC_BIN)) \
-  $(if $(MAC_NODE_ID),--mac-node-id $(MAC_NODE_ID)) \
+  $(if $(LOCAL_BIN),--local-bin $(LOCAL_BIN)) \
+  $(if $(LOCAL_NODE_ID),--local-node-id $(LOCAL_NODE_ID)) \
   $(if $(SCENARIO),--scenario $(SCENARIO)) \
   $(if $(HISTORY),--history $(HISTORY)) \
   $(if $(STEPS),--steps $(STEPS)) \
@@ -73,6 +74,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(POLL_SEC),--poll-sec $(POLL_SEC)) \
   $(if $(MIN_FLOOR_SEC),--min-floor-sec $(MIN_FLOOR_SEC)) \
   $(if $(CAP_SEC),--cap-sec $(CAP_SEC)) \
+  $(if $(MAX_CAP_SEC),--max-cap-sec $(MAX_CAP_SEC)) \
   $(if $(W_SETTLE_SEC),--w-settle-sec $(W_SETTLE_SEC)) \
   $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
   $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
@@ -231,8 +233,8 @@ generate: ## Print N generated histories without running them (N=20; honours TUR
 # HISTORY, hence its own smaller flags var.
 REPRO_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
-  $(if $(MAC_BIN),--mac-bin $(MAC_BIN)) \
-  $(if $(MAC_NODE_ID),--mac-node-id $(MAC_NODE_ID)) \
+  $(if $(LOCAL_BIN),--local-bin $(LOCAL_BIN)) \
+  $(if $(LOCAL_NODE_ID),--local-node-id $(LOCAL_NODE_ID)) \
   $(if $(RUN_ID),--run-id $(RUN_ID)) \
   $(if $(WAIT_CAP_SEC),--wait-cap-sec $(WAIT_CAP_SEC)) \
   $(if $(WAIT_POLL_SEC),--wait-poll-sec $(WAIT_POLL_SEC)) \

@@ -98,33 +98,34 @@ test("partitions: D/C balanced, healed by the end, and can overlap (all-offline)
   assert.ok(sawConcurrent, "expected at least one history with 2+ nodes offline at once");
 });
 
-test("macEnabled: the Mac is picked as an edit target but is NEVER a D/C target, even under heavy partitioning", () => {
+test("localEnabled: the local instance is picked as an edit target but is NEVER a D/C target, even under heavy partitioning", () => {
   // normalize() (called internally by generateHistory) throws if a D/C is ever emitted while
-  // the Mac is the active selector — see dsl.ts's assertMacAlwaysConnected. So simply calling
-  // generateHistory without it throwing, across many seeds/configs, IS the property test: any
-  // violation of "the Mac is never disconnected" would surface as an uncaught exception here.
-  let sawMac = false;
+  // the local instance is the active selector — see dsl.ts's assertLocalAlwaysConnected. So
+  // simply calling generateHistory without it throwing, across many seeds/configs, IS the
+  // property test: any violation of "the local instance is never disconnected" would surface
+  // as an uncaught exception here.
+  let sawLocal = false;
   for (let s = 1; s <= 40; s++) {
-    const h = generateHistory({ nodes: 3, ops: [6, 14], partitionProb: 0.6, macEnabled: true, rng: mulberry32(s) });
-    if (h.some((o) => o.cmd === "mac")) sawMac = true;
+    const h = generateHistory({ nodes: 3, ops: [6, 14], partitionProb: 0.6, localEnabled: true, rng: mulberry32(s) });
+    if (h.some((o) => o.cmd === "local")) sawLocal = true;
   }
-  assert.ok(sawMac, "expected at least one generated history to select the Mac as an edit target");
+  assert.ok(sawLocal, "expected at least one generated history to select the local instance as an edit target");
 });
 
-test("partitions: a single numbered node + the Mac still partitions (the Mac counts as a second participant)", () => {
+test("partitions: a single numbered node + the local instance still partitions (it counts as a second participant)", () => {
   // Regression guard: partitioning used to gate on nodeCount>1 alone, so a single numbered node
-  // (nodes: 1) with macEnabled never partitioned at all, regardless of partitionProb — even
-  // though the Mac staying online while that one node disconnects is exactly the interesting
-  // case (matches --nodes n1,mac in practice).
+  // (nodes: 1) with localEnabled never partitioned at all, regardless of partitionProb — even
+  // though the local instance staying online while that one node disconnects is exactly the
+  // interesting case (matches --nodes n1,l in practice).
   let sawPartition = false;
   for (let s = 1; s <= 30; s++) {
-    const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, macEnabled: true, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, localEnabled: true, rng: mulberry32(s) });
     if (h.some((o) => o.cmd === "disconnect")) sawPartition = true;
   }
-  assert.ok(sawPartition, "expected at least one partition with nodes:1 + macEnabled:true");
+  assert.ok(sawPartition, "expected at least one partition with nodes:1 + localEnabled:true");
 });
 
-test("partitions: a single numbered node with NO Mac still never partitions (only one participant, nothing to stay online)", () => {
+test("partitions: a single numbered node with NO local instance still never partitions (only one participant, nothing to stay online)", () => {
   for (let s = 1; s <= 20; s++) {
     const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, rng: mulberry32(s) });
     assert.ok(!h.some((o) => o.cmd === "disconnect"), `unexpected partition with only 1 participant: ${serialize(h)}`);

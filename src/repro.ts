@@ -6,15 +6,15 @@
 // generated script sources — this file only translates the DSL into a flat call sequence.
 //
 //   --history       DSL string to reproduce                        (required)
-//   --nodes         comma-separated container names, plus the literal "mac" to include the Mac
-//                    node — e.g. "n1,n2,mac" (default n1,n2). "mac" is the sole on/off switch for
-//                    the Mac (matches run.ts); --mac-bin only supplies its binary path — required
-//                    iff "mac" is in --nodes, and a history using M without "mac" in --nodes fails
-//                    fast the same way run.ts does
+//   --nodes         comma-separated container names, plus the literal "l" to include the local
+//                    instance — e.g. "n1,n2,l" (default n1,n2). "l" is the sole on/off switch for
+//                    the local instance (matches run.ts); --local-bin only supplies its binary
+//                    path — required iff "l" is in --nodes, and a history using L without "l" in
+//                    --nodes fails fast the same way run.ts does
 //   --bin           CLI path inside the container                    (default /opt/obsidian/obsidian-cli)
 //   --network       podman network                                   (default obsidian-net)
-//   --mac-bin       path to a local obsidian-cli binary — only used if "mac" is in --nodes
-//   --mac-node-id   the Mac's own Sync-reported device name           (default: OS `hostname`)
+//   --local-bin     path to a local obsidian-cli binary — only used if "l" is in --nodes
+//   --local-node-id the local instance's own Sync-reported device name (default: OS `hostname`)
 //   --run-id        slug embedded in note names' trailing history part (default: the history itself)
 //   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
 //   --out           where to write the script (mode 0755); default runs/<run-id>.sh; "-" prints
@@ -25,13 +25,13 @@
 // same script twice never collides with the first run's leftovers. Set VERBOSE=1 when invoking
 // the generated script (e.g. `VERBOSE=1 runs/N1Aa.sh`) to echo every real command to stderr.
 //
-//   npm run repro -- --history N1DMAaWN1AaC --mac-bin /path/to/obsidian-cli
+//   npm run repro -- --history N1DLAaWN1AaC --local-bin /path/to/obsidian-cli
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { parse, serialize, normalize, usesMac, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesLocal, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
 import { nodeAddress } from "./isolate.js";
 import { formatToken, NOTE_DIR } from "./types.js";
 import { runProcess } from "./exec.js";
@@ -40,8 +40,8 @@ export interface ReproOpts {
   nodes: string[]; // container names, e.g. ["n1","n2"] (index 0 = node 1, etc.)
   bin: string; // container CLI path
   network: string; // podman network
-  macBin?: string; // Mac CLI path; required iff the history uses M
-  macNodeId?: string; // the Mac's own node id, embedded in its tokens (same role as d.node)
+  localBin?: string; // local-instance CLI path; required iff the history uses L
+  localNodeId?: string; // the local instance's own node id, embedded in its tokens (same role as d.node)
   runId?: string; // slug embedded in note names; default: the (normalized) history string itself
   waitCapSec?: number; // bounded poll cap for Wait, default 60
   waitPollSec?: number; // poll interval, default 2
@@ -62,11 +62,11 @@ function sq(s: string): string {
 /** Turn a (possibly un-normalized) DSL history into a standalone bash script that sources
  *  scripts/repro-lib.sh and calls its functions in sequence. Pure/synchronous — no I/O, no side
  *  effects. Throws a plain Error (message meant to be printed as-is, not a stack trace) for a
- *  malformed --run-id or a history that uses M without a configured Mac. */
+ *  malformed --run-id or a history that uses L without a configured local instance. */
 export function generateScript(history: History, opts: ReproOpts): string {
   const h = normalize(history); // same canonicalization every history goes through before running
-  if (usesMac(h) && !opts.macBin) {
-    throw new Error(`history "${serialize(h)}" uses M (the Mac node) but no --mac-bin was given — pass --mac-bin <path> or remove M from the history.`);
+  if (usesLocal(h) && !opts.localBin) {
+    throw new Error(`history "${serialize(h)}" uses L (the local node) but no --local-bin was given — pass --local-bin <path> or remove L from the history.`);
   }
   // Default to the history itself (already known safe as a filename/note-path component — the
   // DSL's own alphabet is a subset of RUN_ID_RE) rather than a timestamp, so both the script's
@@ -90,8 +90,8 @@ export function generateScript(history: History, opts: ReproOpts): string {
     `NETWORK=${sq(opts.network)}`,
     `NOTE_DIR=${sq(NOTE_DIR)}`,
   ];
-  if (opts.macBin) {
-    lines.push(`MAC_BIN=${sq(opts.macBin)}`, `MAC_NODE_ID=${sq(opts.macNodeId ?? "mac")}`);
+  if (opts.localBin) {
+    lines.push(`LOCAL_BIN=${sq(opts.localBin)}`, `LOCAL_NODE_ID=${sq(opts.localNodeId ?? "local")}`);
   }
   lines.push(
     `RUN_ID=${sq(runId)}`,
@@ -109,14 +109,14 @@ export function generateScript(history: History, opts: ReproOpts): string {
   lines.push("");
 
   const allSelectors = opts.nodes.map((_, i) => String(i + 1));
-  if (opts.macBin) allSelectors.push("M");
+  if (opts.localBin) allSelectors.push("L");
   lines.push(`ALL_NODES=(${allSelectors.join(" ")})`, "");
 
-  let activeNode: number | "mac" = 1;
+  let activeNode: number | "local" = 1;
   let anyAppendYet = false;
   const offline = new Set<number>(); // node numbers left disconnected so far
   const tokensByLetter = new Map<string, string[]>(); // DSL letter -> tokens appended to it, in order
-  const sel = (n: number | "mac") => (n === "mac" ? "M" : String(n));
+  const sel = (n: number | "local") => (n === "local" ? "L" : String(n));
   let seq = 0;
 
   for (const op of h) {
@@ -124,8 +124,8 @@ export function generateScript(history: History, opts: ReproOpts): string {
       case "node":
         activeNode = op.node!;
         break;
-      case "mac":
-        activeNode = "mac";
+      case "local":
+        activeNode = "local";
         break;
       case "pause":
         lines.push(`Pause ${op.seconds ?? DEFAULT_PAUSE_SEC}`, "");
@@ -150,7 +150,7 @@ export function generateScript(history: History, opts: ReproOpts): string {
         const letter = op.note!;
         lines.push(`Append ${sel(activeNode)} ${letter}`, "");
         seq++;
-        const id = activeNode === "mac" ? (opts.macNodeId ?? "mac") : opts.nodes[activeNode - 1];
+        const id = activeNode === "local" ? (opts.localNodeId ?? "local") : opts.nodes[activeNode - 1];
         const token = formatToken({ node: id, seq, note: letter });
         const list = tokensByLetter.get(letter);
         if (list) list.push(token); else tokensByLetter.set(letter, [token]);
@@ -161,7 +161,7 @@ export function generateScript(history: History, opts: ReproOpts): string {
 
   // Final: reconnect anything still left offline (always — a disconnected node is a footgun
   // regardless of whether anything was ever appended); then, only if there's something to
-  // verify, wait for every configured node/Mac to settle and check every appended token.
+  // verify, wait for every configured node/local instance to settle and check every appended token.
   for (const n of offline) lines.push(`Connect ${n}`, "");
   if (anyAppendYet) {
     for (const n of allSelectors) lines.push(`Wait ${n}`, "");
@@ -182,8 +182,8 @@ if (isMain) {
       nodes: { type: "string" },
       bin: { type: "string" },
       network: { type: "string" },
-      "mac-bin": { type: "string" },
-      "mac-node-id": { type: "string" },
+      "local-bin": { type: "string" },
+      "local-node-id": { type: "string" },
       "run-id": { type: "string" },
       "wait-cap-sec": { type: "string" },
       "wait-poll-sec": { type: "string" },
@@ -192,23 +192,23 @@ if (isMain) {
   });
 
   if (!values.history) {
-    console.error("Pass --history <dsl> (e.g. --history N1DMAaWN1AaC).");
+    console.error("Pass --history <dsl> (e.g. --history N1DLAaWN1AaC).");
     process.exit(2);
   }
 
-  // "mac" in --nodes is the sole on/off switch for Mac participation, matching run.ts — --mac-bin
-  // only supplies its binary path.
+  // "l" in --nodes is the sole on/off switch for local-instance participation, matching run.ts —
+  // --local-bin only supplies its binary path.
   const rawNodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
-  const macRequested = rawNodes.includes("mac");
-  const nodes = rawNodes.filter((n) => n !== "mac");
-  const macBin = values["mac-bin"];
-  if (macRequested && !macBin) {
-    console.error(`--nodes includes "mac" but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> or drop "mac" from --nodes.`);
+  const localRequested = rawNodes.includes("l");
+  const nodes = rawNodes.filter((n) => n !== "l");
+  const localBin = values["local-bin"];
+  if (localRequested && !localBin) {
+    console.error(`--nodes includes "l" but --local-bin/LOCAL_BIN wasn't provided — pass --local-bin <path> or drop "l" from --nodes.`);
     process.exit(2);
   }
-  // Only worth a subprocess call when the Mac is actually requested — mirrors run.ts's own
-  // hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
-  const macNodeId = macRequested ? (values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
+  // Only worth a subprocess call when the local instance is actually requested — mirrors run.ts's
+  // own hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
+  const localNodeId = localRequested ? (values["local-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
 
   let history: History;
   try {
@@ -217,8 +217,8 @@ if (isMain) {
     console.error(e instanceof Error ? e.message : String(e));
     process.exit(2);
   }
-  if (usesMac(normalize(history)) && !macRequested) {
-    console.error(`history "${values.history}" uses M (the Mac node) but "mac" isn't in --nodes — add it (e.g. --nodes ${[...nodes, "mac"].join(",")}) or remove M from the history.`);
+  if (usesLocal(normalize(history)) && !localRequested) {
+    console.error(`history "${values.history}" uses L (the local node) but "l" isn't in --nodes — add it (e.g. --nodes ${[...nodes, "l"].join(",")}) or remove L from the history.`);
     process.exit(2);
   }
 
@@ -234,8 +234,8 @@ if (isMain) {
       nodes,
       bin: values.bin ?? "/opt/obsidian/obsidian-cli",
       network: values.network ?? "obsidian-net",
-      macBin: macRequested ? macBin : undefined,
-      macNodeId,
+      localBin: localRequested ? localBin : undefined,
+      localNodeId,
       runId,
       waitCapSec: values["wait-cap-sec"] ? Number(values["wait-cap-sec"]) : undefined,
       waitPollSec: values["wait-poll-sec"] ? Number(values["wait-poll-sec"]) : undefined,

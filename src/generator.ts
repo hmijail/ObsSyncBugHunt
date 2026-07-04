@@ -18,14 +18,14 @@ import { DEFAULT_PAUSE_SEC, normalize, type History } from "./dsl.js";
 export type Turns = "barrier" | "paced" | "concurrent";
 
 export interface GenParams {
-  nodes: number; // node count (>=1) — numbered nodes only, the Mac is layered on top, see macEnabled
+  nodes: number; // node count (>=1) — numbered nodes only, the local instance is layered on top, see localEnabled
   ops: [number, number]; // inclusive range for the number of edits (counts `A` only)
   notes?: number; // distinct notes (default 1 = max contention)
   turns?: Turns; // cross-node coordination (default "barrier")
   pauseProb?: number; // chance of a default-length pause after an edit (default 0)
   partitionProb?: number; // chance per edit-step of opening a network partition (needs 2+ total
-                           // participants — numbered nodes + Mac if enabled; default 0)
-  macEnabled?: boolean; // include the Mac (M) as an edit target; NEVER a D/C target (default false)
+                           // participants — numbered nodes + local instance if enabled; default 0)
+  localEnabled?: boolean; // include the local instance (L) as an edit target; NEVER a D/C target (default false)
   rng?: () => number; // default Math.random; injectable for tests
 }
 
@@ -44,21 +44,21 @@ export function generateHistory(params: GenParams): History {
   const turns = params.turns ?? "barrier";
   const pauseProb = params.pauseProb ?? 0;
   const partitionProb = params.partitionProb ?? 0;
-  const macEnabled = params.macEnabled ?? false;
+  const localEnabled = params.localEnabled ?? false;
   const letters = LETTERS.slice(0, Math.max(1, params.notes ?? 1));
   const count = randInt(rng, params.ops[0], params.ops[1]);
 
   const ops: History = [];
-  let curNode: number | "mac" = 0;
-  let prevEditor: number | "mac" = 0;
-  // Partition state stays strictly numbered-node-only — the Mac never enters it (see
+  let curNode: number | "local" = 0;
+  let prevEditor: number | "local" = 0;
+  // Partition state stays strictly numbered-node-only — the local instance never enters it (see
   // isOffline below), which is what keeps it structurally unselectable as a D/C target.
   const offline = new Set<number>();
   const offlineSince = new Map<number, number>(); // node -> edit index it went offline
-  const isOffline = (x: number | "mac") => x !== "mac" && offline.has(x);
+  const isOffline = (x: number | "local") => x !== "local" && offline.has(x);
 
-  const setNode = (n: number | "mac") => {
-    if (n !== curNode) { ops.push(n === "mac" ? { cmd: "mac" } : { cmd: "node", node: n }); curNode = n; }
+  const setNode = (n: number | "local") => {
+    if (n !== curNode) { ops.push(n === "local" ? { cmd: "local" } : { cmd: "node", node: n }); curNode = n; }
   };
   const disconnect = (v: number, at: number) => { setNode(v); ops.push({ cmd: "disconnect" }); offline.add(v); offlineSince.set(v, at); };
   const reconnect = (v: number) => {
@@ -73,15 +73,16 @@ export function generateHistory(params: GenParams): History {
 
   for (let i = 0; i < count; i++) {
     // Maybe open a partition on a random currently-online NUMBERED node — multiple (up to
-    // all) can be offline at once. The Mac is never in this pool (see GenParams.macEnabled).
+    // all) can be offline at once. The local instance is never in this pool (see GenParams.localEnabled).
     // A partition is only meaningful if some OTHER participant can stay online to diverge
-    // against — that other participant can be a second numbered node, or the Mac (it's always
-    // online), so the gate is on total participants, not nodeCount alone: with just one numbered
-    // node and the Mac enabled, disconnecting that one node while the Mac keeps editing is
-    // exactly the interesting case, and nodeCount>1 alone would wrongly rule it out.
+    // against — that other participant can be a second numbered node, or the local instance (it's
+    // always online), so the gate is on total participants, not nodeCount alone: with just one
+    // numbered node and the local instance enabled, disconnecting that one node while the local
+    // instance keeps editing is exactly the interesting case, and nodeCount>1 alone would wrongly
+    // rule it out.
     const onlineNodes: number[] = [];
     for (let x = 1; x <= nodeCount; x++) if (!offline.has(x)) onlineNodes.push(x);
-    const totalParticipants = nodeCount + (macEnabled ? 1 : 0);
+    const totalParticipants = nodeCount + (localEnabled ? 1 : 0);
     if (partitionProb > 0 && totalParticipants > 1 && onlineNodes.length > 0 && rng() < partitionProb) {
       disconnect(pick(rng, onlineNodes), i);
     }
@@ -92,11 +93,11 @@ export function generateHistory(params: GenParams): History {
       if (i > since && (i - since >= 2 || rng() < 0.4)) reconnect(v);
     }
 
-    // Edit target: nodeCount numbered slots, plus one extra "mac" slot when enabled —
-    // the Mac gets roughly the same per-node representation as any numbered node here,
+    // Edit target: nodeCount numbered slots, plus one extra "local" slot when enabled —
+    // the local instance gets roughly the same per-node representation as any numbered node here,
     // even though it's excluded entirely from the disconnect-target draw above.
-    const draw = randInt(rng, 1, nodeCount + (macEnabled ? 1 : 0));
-    const n: number | "mac" = draw <= nodeCount ? draw : "mac";
+    const draw = randInt(rng, 1, nodeCount + (localEnabled ? 1 : 0));
+    const n: number | "local" = draw <= nodeCount ? draw : "local";
     const note = pick(rng, letters);
     setNode(n);
     // Coordinate a cross-node edit per `turns`, but only while both editors are

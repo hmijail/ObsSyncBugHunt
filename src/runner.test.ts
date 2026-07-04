@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ObsidianDriver } from "./driver.js";
 import { gatherObservation } from "./runner.js";
-import { AlarmError } from "./alarm.js";
+import { CliInconsistencyError } from "./inconsistency.js";
 import type { Executor } from "./exec.js";
 import type { ExecResult } from "./types.js";
 
@@ -20,7 +20,7 @@ class StubExecutor implements Executor {
 
 const NOTE = "bughunt/x";
 
-test("gatherObservation: consistent read+listing → observation, no alarm", async () => {
+test("gatherObservation: consistent read+listing → observation, no inconsistency", async () => {
   const d = new ObsidianDriver(new StubExecutor((args) => {
     if (args[0] === "read") return "(op-n1-1)";
     if (args[0] === "files") return `${NOTE}.md\nbughunt/other.md`;
@@ -31,13 +31,13 @@ test("gatherObservation: consistent read+listing → observation, no alarm", asy
   assert.deepEqual(obs.conflicts, []);
 });
 
-test("gatherObservation: note reads present but missing from listing → ALARM (the 2026-06-26 shape)", async () => {
+test("gatherObservation: note reads present but missing from listing → flagged inconsistency (the 2026-06-26 shape)", async () => {
   const d = new ObsidianDriver(new StubExecutor((args) => {
     if (args[0] === "read") return "(op-n1-1)"; // present
     if (args[0] === "files") return "";          // empty listing — inconsistent!
     return "";
   }));
-  await assert.rejects(() => gatherObservation(d, NOTE), AlarmError);
+  await assert.rejects(() => gatherObservation(d, NOTE), CliInconsistencyError);
 });
 
 test("gatherObservation: absent note (not-found) → canonical null, no anchor check", async () => {

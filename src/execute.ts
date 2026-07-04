@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { formatToken, NOTE_DIR, type NodeId } from "./types.js";
 import { isConflictFile, type ObsidianDriver } from "./driver.js";
-import { AlarmError } from "./alarm.js";
+import { CliInconsistencyError } from "./inconsistency.js";
 import type { Isolator } from "./isolate.js";
 import type { RunLogger } from "./history.js";
 import { sleep, gatherObservation } from "./runner.js";
@@ -29,7 +29,12 @@ export interface ExecuteOpts {
   noteName: (letter: string) => string; // DSL note letter -> concrete vault note name (per-rep)
   pollSec?: number; // observation poll cadence (default 1)
   minFloorSec?: number; // observe at least this long (catches slow-to-start syncs after C; default 3)
-  capSec?: number; // soft cap on a wait (default 120)
+  capSec?: number; // how long a driver's reported sync state may stay completely unchanging before
+                    // it's presumed wedged (default 120) — see trackLiveness/isWedged
+  // Absolute outer ceiling on a settle/baseline wait, regardless of activity (default 600 = 10min):
+  // a node whose state keeps changing (see capSec above) is granted more time than capSec alone,
+  // but not forever — this bounds the worst case.
+  maxCapSec?: number;
   // Settled = every node reports `synced` AND the observed state has been unchanged
   // for this window. Convergence is judged separately by the oracle, so a stable but
   // divergent state finishes here (as `-SYNCBAD`) instead of waiting out the cap. The
@@ -41,11 +46,11 @@ export interface ExecuteOpts {
   // synced, so this bounds it into a pollable "synced yet?" — a timeout means "still syncing".
   // Must stay comfortably above a synced node's instant reply, well below the settle window.
   probeSec?: number;
-  // When the settle cap elapses, tell a Sync failure apart from a host-internet
-  // outage: if the host itself is offline, wait for connectivity to return and restart
-  // the window instead of recording a false timeout. Disabled by --skip-host-check —
-  // a sandbox with no outbound TCP would otherwise treat the cap as a permanent outage
-  // and wait forever. Default on.
+  // When a settle/baseline wait is about to give up (capSec/maxCapSec exhausted), tell a Sync
+  // failure apart from a host-internet outage: if the host itself is offline, wait for
+  // connectivity to return and restart the window instead of recording a false timeout. Disabled
+  // by --skip-host-check — a sandbox with no outbound TCP would otherwise treat the cap as a
+  // permanent outage and wait forever. Default on.
   hostCheck?: boolean;
   // Per-call `ms` timing on the pause-snapshot (debug/observability aid — see the "pause"
   // case, useful for spotting a slow snapshot call). Default ON; --skip-snapshot-timing turns
@@ -57,13 +62,13 @@ export interface ExecuteOpts {
   // travel WITH the rep's own trace, not just live in the invocation's separate run log.
   isolator?: string; // "network" | "sync" — which fault primitive drove this run's D/C
   obsidianVersion?: string; // the CLI's own self-reported version, queried once at startup
-  // The Mac (DSL `M`), when configured: its 1-based position within `drivers` (it's just
-  // another element of that array, always last — see run.ts) and its own self-reported
-  // Obsidian version (likely different from the containers' pinned build, which is the
-  // whole point of testing against it). `macNode` drives both `case "mac"`'s resolution
-  // and the D/C defense-in-depth assert below — undefined means no Mac is configured.
-  macNode?: number;
-  macObsidianVersion?: string;
+  // The local instance (DSL `L`), when configured: its 1-based position within `drivers` (it's
+  // just another element of that array, always last — see run.ts) and its own self-reported
+  // Obsidian version (likely different from the containers' pinned build, which is the whole
+  // point of testing against it). `localNode` drives both `case "local"`'s resolution and the
+  // D/C defense-in-depth assert below — undefined means no local instance is configured.
+  localNode?: number;
+  localObsidianVersion?: string;
 }
 
 export interface LostForensic {
@@ -77,7 +82,7 @@ export interface RunResult {
   verdict: RunVerdict;
   acked: AckedEdit[];
   observations: NodeObservation[];
-  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean };
+  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean; hostOutage: boolean };
   forensics: LostForensic[];
 }
 
@@ -111,21 +116,79 @@ async function syncState(d: ObsidianDriver, probeMs: number): Promise<string> {
   return d.syncStateProbe(probeMs);
 }
 
-/** The Mac has no network-level isolation (see dsl.ts's assertMacAlwaysConnected) — its Sync
- *  being on is the whole load-bearing assumption of testing against it. Checked before every op
- *  that actually touches it (append/wait), using the same bounded, non-blocking probe the settle
- *  uses. Only a POSITIVELY-read off-state aborts; a probe "timeout"/"?" (inconclusive, e.g.
- *  mid-sync) is tolerated — never manufacture a failure from an inconclusive bounded probe (same
- *  philosophy as syncStateProbe itself). Throws a plain Error (not AlarmError): a Mac with Sync
- *  off invalidates every subsequent rep until a human fixes it, so this must escape runRep's
- *  per-rep catch and abort the whole soak, not just tag one rep -OBSFAIL. */
-const MAC_SYNC_OFF_STATES = new Set(["paused", "error", "stopped", "offline"]);
-async function assertMacSyncOn(driver: ObsidianDriver, opts: ExecuteOpts): Promise<void> {
-  const probeMs = (opts.probeSec ?? 5) * 1000;
-  const state = await syncState(driver, probeMs);
-  if (MAC_SYNC_OFF_STATES.has(state)) {
-    throw new Error(`the Mac's Sync is not on (observed "${state}") — the harness requires the Mac to stay always-connected. Check Sync on the Mac and re-run.`);
+// --- liveness tracking: "is it still visibly doing something, or wedged?" -----------------
+//
+// The same question comes up in three places (waitForSynced, waitNodesSynced, and run.ts's
+// preflight): a node stuck reporting the SAME non-synced state forever is a real problem, but a
+// node whose reported state keeps CHANGING (even cycling through "error") is evidence it's still
+// alive — just slow, e.g. recovering from a reconnect or waiting on a busy Sync server. Treating
+// every state change as liveness (not just "syncing") means a flat capSec deadline no longer
+// mistakes that kind of churn for a wedge; maxCapSec is the separate, absolute backstop so a node
+// that flaps forever without ever landing on "synced" still eventually gives up.
+export interface Liveness { lastStates: string[] | null; lastChangeAt: number }
+export function trackLiveness(prev: Liveness, states: string[], now: number): Liveness {
+  const changed = prev.lastStates === null
+    || states.length !== prev.lastStates.length
+    || states.some((s, i) => s !== prev.lastStates![i]);
+  return { lastStates: states, lastChangeAt: changed ? now : prev.lastChangeAt };
+}
+export function isWedged(liveness: Liveness, now: number, capMs: number): boolean {
+  return now - liveness.lastChangeAt > capMs; // no state activity for a full capMs window
+}
+
+const HOST_RECHECK_MS = 5_000; // recheck host connectivity every 5s while it's down
+
+/** If the host (the machine running the harness — not any node) is currently offline, wait for
+ *  it to come back, logging each phase: host-offline (start), host-reconnect-probe (each retry,
+ *  while still down), host-online (recovered). Unbounded — an internet outage isn't a Sync
+ *  problem, so we wait it out rather than manufacture a failure. Returns whether it actually had
+ *  to wait (false = host was already online, a no-op). */
+async function waitForHostReconnect(logger: RunLogger, context: Record<string, unknown> = {}): Promise<boolean> {
+  if (await hostOnline()) return false;
+  logger.log({ kind: "host-offline", ...context });
+  for (let attempt = 1; ; attempt++) {
+    await sleep(HOST_RECHECK_MS);
+    const online = await hostOnline();
+    logger.log({ kind: "host-reconnect-probe", attempt, online, ...context });
+    if (online) break;
   }
+  logger.log({ kind: "host-online", ...context });
+  return true;
+}
+
+/** The local instance has no network-level isolation (see dsl.ts's assertLocalAlwaysConnected) —
+ *  its Sync being on is the whole load-bearing assumption of testing against it. Checked before
+ *  every op that actually touches it (append/wait), using the same bounded, non-blocking probe
+ *  the settle uses. Only a POSITIVELY-read off-state is treated as a problem; a probe
+ *  "timeout"/"?" (inconclusive, e.g. mid-sync) is tolerated — never manufacture a failure from an
+ *  inconclusive bounded probe (same philosophy as syncStateProbe itself).
+ *
+ *  A positively-read off-state gets one more chance before aborting: it's often just the local
+ *  symptom of the HOST losing its own internet — wait for connectivity to return (unbounded, same
+ *  as the settle loop), then give Sync a short grace window to recover before giving up for real.
+ *  Only if it's STILL off after that does this throw a plain Error (not CliInconsistencyError): Sync
+ *  genuinely off invalidates every subsequent rep until a human fixes it, so this must escape
+ *  runRep's per-rep catch and abort the whole soak, not just tag one rep -OBSFAIL. Returns
+ *  whether a host-outage detour actually happened (so the caller can flag this rep's timings as
+ *  unreliable even if it goes on to finish normally). */
+const LOCAL_SYNC_OFF_STATES = new Set(["paused", "error", "stopped", "offline"]);
+const LOCAL_SYNC_GRACE_ATTEMPTS = 3;
+const LOCAL_SYNC_GRACE_MS = 5_000;
+async function assertLocalSyncOn(driver: ObsidianDriver, opts: ExecuteOpts, logger: RunLogger): Promise<boolean> {
+  const probeMs = (opts.probeSec ?? 5) * 1000;
+  let state = await syncState(driver, probeMs);
+  let hostOutage = false;
+  if (LOCAL_SYNC_OFF_STATES.has(state) && opts.hostCheck !== false) {
+    hostOutage = await waitForHostReconnect(logger, { node: driver.node });
+    for (let i = 0; i < LOCAL_SYNC_GRACE_ATTEMPTS && hostOutage && LOCAL_SYNC_OFF_STATES.has(state); i++) {
+      await sleep(LOCAL_SYNC_GRACE_MS);
+      state = await syncState(driver, probeMs);
+    }
+  }
+  if (LOCAL_SYNC_OFF_STATES.has(state)) {
+    throw new Error(`the local node's Sync is not on (observed "${state}") — the harness requires it to stay always-connected. Check Sync on ${driver.node} and re-run.`);
+  }
+  return hostOutage;
 }
 
 /**
@@ -138,8 +201,8 @@ async function assertMacSyncOn(driver: ObsidianDriver, opts: ExecuteOpts): Promi
  * something to wait out to the cap (which would mislabel it `-TIMEOUT`). The quiet
  * window means we never stop mid-propagation; `minFloorSec` guards the just-after-
  * connect case where a sync hasn't started yet. No blind dwell — this is the explicit
- * wait. Only a node that never reaches `synced`, or content that never stops changing,
- * actually times out.
+ * wait. Only a node that never reaches `synced` while ALSO showing no further state
+ * activity (see isWedged), or content that never stops changing, actually times out.
  */
 export async function waitForSynced(
   drivers: ObsidianDriver[],
@@ -148,13 +211,16 @@ export async function waitForSynced(
   opts: ExecuteOpts,
   logger: RunLogger,
   context: Record<string, unknown> = {},
-): Promise<{ seconds: number; timedOut: boolean; unsynced: boolean; observations: NodeObservation[] }> {
+): Promise<{ seconds: number; timedOut: boolean; unsynced: boolean; observations: NodeObservation[]; hostOutage: boolean }> {
   const pollMs = (opts.pollSec ?? 1) * 1000;
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
+  const maxCapMs = (opts.maxCapSec ?? 600) * 1000;
   const probeMs = (opts.probeSec ?? 5) * 1000;
-  if (notes.length === 0 || drivers.length === 0) return { seconds: 0, timedOut: false, unsynced: false, observations: [] };
+  if (notes.length === 0 || drivers.length === 0) {
+    return { seconds: 0, timedOut: false, unsynced: false, observations: [], hostOutage: false };
+  }
 
   // Baseline server-version counts (the `from` reference) are read LAZILY, the first time
   // every node is synced — NOT up front. `sync:history total` blocks until the queried node has
@@ -162,10 +228,13 @@ export async function waitForSynced(
   // settle before the bounded-probe loop even starts (full story: docs/cli-trust.md). Gate on
   // the probe instead.
   let baseline: Record<string, number> | null = null;
-  let start = Date.now();
+  const absoluteStart = Date.now();
+  let start = absoluteStart;
   let lastSig: string | null = null;
   let lastChange = start;
   let obs: NodeObservation[] = []; // last SYNCED snapshot; the verdict reuses it
+  let liveness: Liveness = { lastStates: null, lastChangeAt: start };
+  let hostOutage = false;
   for (;;) {
     // 1. Bounded sync-state probe FIRST. We must NOT read content from a still-syncing node:
     //    the read blocks (~70s) AND returns mid-flux content, which fabricated a -SYNCBAD. The
@@ -175,6 +244,7 @@ export async function waitForSynced(
     const states = await Promise.all(drivers.map((d) => syncState(d, probeMs)));
     const everySynced = states.every((s) => s === "synced");
     const probeWallMs = Date.now() - tProbe;
+    liveness = trackLiveness(liveness, states, Date.now());
 
     // 2. Only once every node is synced do we read content and re-sample the signature, so the
     //    quiet window is measured over synced, genuinely re-sampled snapshots (not a stale one).
@@ -193,6 +263,7 @@ export async function waitForSynced(
     const now = Date.now();
     const quietMs = everySynced ? now - lastChange : 0;
     const elapsed = now - start;
+    const sinceActivityMs = now - liveness.lastChangeAt;
     // Settled = every node `synced` AND the observed state (canonical + conflict sets) quiet for
     // the window. Convergence is NOT required — a stable, synced disagreement is a real `-SYNCBAD`
     // for the oracle, not something to wait out to the cap. floorMs covers the just-after-connect
@@ -202,23 +273,35 @@ export async function waitForSynced(
     // Per-poll trace so the settle's time-spend is visible: repeated states with probeMs≈cap and a
     // node reading "timeout" is genuine sync latency (the probe keeps getting killed at the cap
     // because the node genuinely isn't synced yet); a large gatherMs means a content read blocked.
-    logger.log({ kind: "settle-poll", elapsedSec: Math.round(elapsed / 1000), states, everySynced, sigChanged, quietSec: Math.round(quietMs / 1000), probeMs: probeWallMs, gatherMs: gatherWallMs, ...context });
+    // sinceActivitySec makes the liveness tracking itself visible: it stays low while a node's
+    // reported state keeps changing (even through "error"), and only grows once it's truly wedged.
+    logger.log({
+      kind: "settle-poll", elapsedSec: Math.round(elapsed / 1000), states, everySynced, sigChanged,
+      quietSec: Math.round(quietMs / 1000), probeMs: probeWallMs, gatherMs: gatherWallMs,
+      sinceActivitySec: Math.round(sinceActivityMs / 1000), ...context,
+    });
 
     // Cap elapsed without quiescence. Before recording a Sync timeout, rule out a HOST
     // outage: if the host can't reach the internet, the container can't sync for
     // reasons that aren't Obsidian's. Wait for connectivity to return, then restart the
     // settle window and keep waiting rather than logging a false timeout.
-    if (!done && elapsed > capMs && opts.hostCheck !== false && !(await hostOnline())) {
-      logger.log({ kind: "host-offline", waitingForHost: true, ...context });
-      while (!(await hostOnline())) await sleep(Math.max(pollMs, 2000));
-      logger.log({ kind: "host-online", resumed: true, ...context });
-      start = Date.now();
-      lastChange = start;
-      lastSig = null;
-      obs = [];
-      continue;
+    if (!done && elapsed > capMs && opts.hostCheck !== false) {
+      if (await waitForHostReconnect(logger, context)) {
+        hostOutage = true;
+        start = Date.now();
+        lastChange = start;
+        lastSig = null;
+        obs = [];
+        liveness = { lastStates: null, lastChangeAt: start };
+        continue;
+      }
     }
-    const timedOut = !done && elapsed > capMs;
+    // Liveness leniency: a node whose reported state keeps changing isn't wedged, just slow —
+    // don't time out while it's still visibly active, only once maxCapMs (the absolute ceiling,
+    // measured from this call's true start, never reset by a host-reconnect) is exhausted too.
+    const wedged = isWedged(liveness, now, capMs);
+    const hitCeiling = now - absoluteStart >= maxCapMs;
+    const timedOut = !done && elapsed > capMs && (wedged || hitCeiling);
     if (done || timedOut) {
       // On a timeout before any synced snapshot, take one best-effort observation so the verdict
       // and forensics aren't empty-handed (the one place we read a node that isn't synced).
@@ -265,7 +348,7 @@ export async function waitForSynced(
       // unchanged across the whole settle window, so it's confirmed across many reads.
       // Callers must use it rather than a fresh re-read — a single `files` listing can
       // transiently drop a conflict file and fabricate a "loss".
-      return { seconds, timedOut, unsynced, observations: obs };
+      return { seconds, timedOut, unsynced, observations: obs, hostOutage };
     }
     await sleep(pollMs);
   }
@@ -276,7 +359,7 @@ export async function waitForSynced(
  * reports in `folder` must EXACTLY match what's actually on disk (`ls`). A file the CLI
  * reports that the FS lacks is the forum "conflict file was never really created" bug; a file
  * on disk the CLI omits is the empty-listing bug docs/cli-trust.md opens with. Either way →
- * ALARM. Skipped when the driver has no vault path (local/dev). Run only once settled, so a
+ * a flagged inconsistency. Skipped when the driver has no vault path (local/dev). Run only once settled, so a
  * mid-sync difference can't fire.
  */
 export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): Promise<void> {
@@ -288,7 +371,7 @@ export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): P
     const cliReportedButNotOnDisk = [...cli].filter((x) => !onDisk.has(x));
     const onDiskButNotReported = [...onDisk].filter((x) => !cli.has(x));
     if (cliReportedButNotOnDisk.length || onDiskButNotReported.length) {
-      throw new AlarmError("cli-fs-disagreement", {
+      throw new CliInconsistencyError("cli-fs-disagreement", {
         node: d.node, folder,
         cliReportedButNotOnDisk: cliReportedButNotOnDisk.slice(0, 10), cliOnlyCount: cliReportedButNotOnDisk.length,
         onDiskButNotReported: onDiskButNotReported.slice(0, 10), fsOnlyCount: onDiskButNotReported.length,
@@ -318,16 +401,27 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
 }
 
 /** Gate the start of a rep on a known-clean baseline: every node reporting `synced`. */
-async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, logger: RunLogger): Promise<void> {
-  const deadline = Date.now() + capSec * 1000;
+async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, maxCapSec: number, logger: RunLogger): Promise<void> {
+  const capMs = capSec * 1000;
+  const maxCapMs = maxCapSec * 1000;
+  const absoluteStart = Date.now();
+  let liveness: Liveness = { lastStates: null, lastChangeAt: absoluteStart };
   for (;;) {
     const states = await Promise.all(drivers.map(async (d) => (await d.syncStatus()).value ?? "?"));
+    const now = Date.now();
+    liveness = trackLiveness(liveness, states, now);
     if (states.every((s) => s === "synced")) {
       const notes = await Promise.all(drivers.map(async (d) => (await d.listFiles()).value?.length ?? 0));
       logger.log({ kind: "baseline-synced", states, notes });
       return;
     }
-    if (Date.now() > deadline) { logger.log({ kind: "baseline-sync-timeout", states }); return; }
+    // Same liveness leniency as waitForSynced: a node still visibly changing state (even
+    // cycling through "error") isn't wedged, just slow — only give up once it's been unchanging
+    // for a full capSec window, or maxCapSec elapses regardless.
+    if (isWedged(liveness, now, capMs) || now - absoluteStart >= maxCapMs) {
+      logger.log({ kind: "baseline-sync-timeout", states });
+      return;
+    }
     await sleep(1000);
   }
 }
@@ -343,15 +437,15 @@ export async function runHistory(
   const str = serialize(history);
   logger.log({
     kind: "history", string: str, ops: history,
-    // Every configured driver's own id (e.g. ["n1","n2"], or [...,"HMMBP.local"] with the Mac) —
-    // recorded so a rep that never happens to touch every configured node still shows what was
-    // actually live during it (a history's own `ops` only shows what it selected, not the full
-    // topology it ran against).
+    // Every configured driver's own id (e.g. ["n1","n2"], or [...,"HMMBP.local"] with the local
+    // instance) — recorded so a rep that never happens to touch every configured node still
+    // shows what was actually live during it (a history's own `ops` only shows what it selected,
+    // not the full topology it ran against).
     nodes: drivers.map((d) => d.node),
-    isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, macObsidianVersion: opts.macObsidianVersion,
+    isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, localObsidianVersion: opts.localObsidianVersion,
     wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
-    capSec: opts.capSec ?? 120, probeSec: opts.probeSec ?? 5,
+    capSec: opts.capSec ?? 120, maxCapSec: opts.maxCapSec ?? 600, probeSec: opts.probeSec ?? 5,
   });
 
   // Route the driver's cli-unresponsive (wait-for-recovery) events, and the isolator's own
@@ -364,7 +458,7 @@ export async function runHistory(
   // resumed once at harness startup (the real one-time paused state after `make containers-up`);
   // Sync stays on for the whole session from there.
   // Start from a known-clean baseline: don't begin editing until every node is synced.
-  await waitNodesSynced(drivers, opts.capSec ?? 120, logger);
+  await waitNodesSynced(drivers, opts.capSec ?? 120, opts.maxCapSec ?? 600, logger);
 
   const driverOf = (num: number) => drivers[num - 1];
 
@@ -375,6 +469,11 @@ export async function runHistory(
   const noteLetters = new Map<string, string>(); // concrete note name -> its logical DSL letter
   const acked: AckedEdit[] = [];
   let seq = 0;
+  // True once any host-connectivity detour actually fired during this rep (settle-loop cap
+  // exhaustion, or the local-Sync guard) — a signal that this rep's timings are inflated by a
+  // real recovery wait and shouldn't be trusted for latency analysis, even though the rep itself
+  // may still finish and judge cleanly.
+  let hostOutage = false;
   // Per-call cap for any mid-history bounded sync-state probe (pause snapshots), same knob and
   // rationale as the settle's own probe: never block on a not-yet-synced node.
   const probeMs = (opts.probeSec ?? 5) * 1000;
@@ -388,11 +487,11 @@ export async function runHistory(
       case "node":
         activeNode = op.node!;
         break;
-      case "mac":
-        // opts.macNode is the Mac driver's own position within `drivers` (run.ts appends it
+      case "local":
+        // opts.localNode is the local driver's own position within `drivers` (run.ts appends it
         // last) — from here on it's indistinguishable from any other numbered node to the
         // rest of this function, except D/C refuse it (see the asserts below).
-        activeNode = opts.macNode!;
+        activeNode = opts.localNode!;
         break;
       case "pause": {
         // Logged at START: a pause has no result to report beyond "I did the thing" (just the
@@ -457,9 +556,9 @@ export async function runHistory(
         break;
       }
       case "disconnect":
-        // Defense-in-depth: dsl.ts's assertMacAlwaysConnected already makes this unreachable
-        // via any real history, but never trust a single layer for "never disconnect the Mac".
-        assert(activeNode !== opts.macNode, "the Mac node must never be disconnected");
+        // Defense-in-depth: dsl.ts's assertLocalAlwaysConnected already makes this unreachable
+        // via any real history, but never trust a single layer for "never disconnect the local instance".
+        assert(activeNode !== opts.localNode, "the local node must never be disconnected");
         // Logged at START: no result of its own beyond "I did the thing" — the actual outcome
         // (each reachability attempt, and how long it took) is network-probe's job, at ITS finish.
         logger.log({ kind: "disconnecting", node: driverOf(activeNode).node });
@@ -467,7 +566,7 @@ export async function runHistory(
         offline.add(activeNode);
         break;
       case "connect":
-        assert(activeNode !== opts.macNode, "the Mac node must never be disconnected");
+        assert(activeNode !== opts.localNode, "the local node must never be disconnected");
         logger.log({ kind: "connecting", node: driverOf(activeNode).node });
         await isolator.connect(driverOf(activeNode).node);
         offline.delete(activeNode);
@@ -478,17 +577,18 @@ export async function runHistory(
         // client reports, not what other nodes/the network are seeing (that whole-system
         // "god's-eye" check is what the FINAL settle is for, across every node and note).
         // A W on a disconnected node can't make progress — NOP it rather than block.
-        // (waitForSynced is also hard-bounded by capSec, so a W never hangs even online.)
+        // (waitForSynced is also hard-bounded by capSec/maxCapSec, so a W never hangs even online.)
         if (offline.has(activeNode)) {
           logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
           break;
         }
-        if (activeNode === opts.macNode) await assertMacSyncOn(driverOf(activeNode), opts);
-        await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
+        if (activeNode === opts.localNode) hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
+        const w = await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
+        hostOutage ||= w.hostOutage;
         break;
       }
       case "append": {
-        if (activeNode === opts.macNode) await assertMacSyncOn(driverOf(activeNode), opts);
+        if (activeNode === opts.localNode) hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
         const noteLetter = op.note!;
         activeNote = opts.noteName(noteLetter); // logical letter -> concrete vault note (also the W target)
         touched.add(activeNote);
@@ -548,6 +648,7 @@ export async function runHistory(
   // converged and quiescent for the long window — explicitly waiting out the
   // conflict file's own ~2-round-trip sync rather than dwelling blindly.
   const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 15, opts, logger, { final: true });
+  hostOutage ||= stab.hostOutage;
 
   // Judge from the settle's window-confirmed observation, NOT a fresh re-read: a single
   // `files folder=…` listing can transiently omit a conflict file, which would fabricate
@@ -555,7 +656,7 @@ export async function runHistory(
   // incident, same failure mode).
   const observations = stab.observations;
   // Independent FS second-source: at this settled point, what the CLI lists under bughunt/
-  // must exactly match what's on disk — or ALARM (catches phantom/never-written conflict
+  // must exactly match what's on disk — or flag an inconsistency (catches phantom/never-written conflict
   // files and listing dropouts alike).
   await crossCheckFs(drivers, NOTE_DIR);
   const verdict = checkRun(acked, observations);
@@ -579,6 +680,7 @@ export async function runHistory(
     convergenceSec: stab.seconds,
     syncTimedOut: stab.timedOut,
     unsynced: stab.unsynced,
+    hostOutage,
   };
   logger.log({ kind: "timings", ...timings });
   logger.log({ kind: "results", history: str, timings, acked, observations, verdict, forensics, noteLetters: Object.fromEntries(noteLetters) });

@@ -18,8 +18,8 @@ test("generateScript: sources the bash library exactly once, near the top", () =
 
 test("generateScript: without --run-id, RUN_ID defaults to the history string itself, not a timestamp", () => {
   const { runId: _unused, ...noRunId } = baseOpts;
-  const script = generateScript(parse("N1DMAaWN1AaC"), { ...noRunId, macBin: "/path/to/obsidian-cli" });
-  assert.match(script, /^RUN_ID='N1DMAaWN1AaC'$/m); // note paths are built at runtime from NOTE_DIR/RUN_ID inside repro-lib.sh
+  const script = generateScript(parse("N1DLAaWN1AaC"), { ...noRunId, localBin: "/path/to/obsidian-cli" });
+  assert.match(script, /^RUN_ID='N1DLAaWN1AaC'$/m); // note paths are built at runtime from NOTE_DIR/RUN_ID inside repro-lib.sh
 });
 
 test("generateScript: a plain append is a single, explicit function call — no inline shell", () => {
@@ -45,16 +45,16 @@ test("generateScript: a bare W with nothing appended yet is a no-op (matches exe
   assert.match(real, /^Wait 1$/m);
 });
 
-test("generateScript: a Mac op calls the same functions with selector \"M\", and MAC_BIN/MAC_NODE_ID are set", () => {
-  const script = generateScript(parse("MAa"), { ...baseOpts, macBin: "/path/to/obsidian-cli", macNodeId: "MyMac" });
-  assert.match(script, /^MAC_BIN='\/path\/to\/obsidian-cli'$/m);
-  assert.match(script, /^MAC_NODE_ID='MyMac'$/m);
-  assert.match(script, /^Append M a$/m);
-  assert.match(script, /^ALL_NODES=\(1 2 M\)$/m);
+test("generateScript: a local-instance op calls the same functions with selector \"L\", and LOCAL_BIN/LOCAL_NODE_ID are set", () => {
+  const script = generateScript(parse("LAa"), { ...baseOpts, localBin: "/path/to/obsidian-cli", localNodeId: "MyLocal" });
+  assert.match(script, /^LOCAL_BIN='\/path\/to\/obsidian-cli'$/m);
+  assert.match(script, /^LOCAL_NODE_ID='MyLocal'$/m);
+  assert.match(script, /^Append L a$/m);
+  assert.match(script, /^ALL_NODES=\(1 2 L\)$/m);
 });
 
-test("generateScript: a history using M without a configured Mac throws a clear error, not a broken script", () => {
-  assert.throws(() => generateScript(parse("MAa"), baseOpts), /uses M \(the Mac node\) but no --mac-bin was given/);
+test("generateScript: a history using L without a configured local instance throws a clear error, not a broken script", () => {
+  assert.throws(() => generateScript(parse("LAa"), baseOpts), /uses L \(the local node\) but no --local-bin was given/);
 });
 
 test("generateScript: an invalid --run-id is rejected", () => {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AlarmError, categoryOf, quoteArgv, siteOf, describeAlarm } from "./alarm.js";
+import { CliInconsistencyError, categoryOf, quoteArgv, siteOf, describeInconsistency } from "./inconsistency.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
 import type { ExecResult } from "./types.js";
 
@@ -25,28 +25,28 @@ test("quoteArgv: embedded single quotes are escaped", () => {
 });
 
 test("categoryOf: CLI/FS + listing disagreements are obsfail, the rest unknown", () => {
-  assert.equal(categoryOf(new AlarmError("cli-fs-disagreement")), "obsfail");
-  assert.equal(categoryOf(new AlarmError("cli-listing-inconsistent")), "obsfail");
-  assert.equal(categoryOf(new AlarmError("cli-permanently-unresponsive")), "unknown");
+  assert.equal(categoryOf(new CliInconsistencyError("cli-fs-disagreement")), "obsfail");
+  assert.equal(categoryOf(new CliInconsistencyError("cli-listing-inconsistent")), "obsfail");
+  assert.equal(categoryOf(new CliInconsistencyError("cli-permanently-unresponsive")), "unknown");
   assert.equal(categoryOf(new CliUnrecognizedOutput(fakeExec(["files"], "???"))), "unknown");
 });
 
 test("siteOf: returns the throw site in src/, not the error-class file", () => {
-  // Thrown here so the top non-alarm/cli-parse frame is THIS test file under src/.
+  // Thrown here so the top non-inconsistency/cli-parse frame is THIS test file under src/.
   let err: Error;
-  try { throw new AlarmError("cli-fs-disagreement"); } catch (e) { err = e as Error; }
+  try { throw new CliInconsistencyError("cli-fs-disagreement"); } catch (e) { err = e as Error; }
   const site = siteOf(err);
   assert.ok(site, "expected a site");
   assert.match(site!, /^src\/.+:\d+:\d+$/);
-  assert.doesNotMatch(site!, /alarm\.ts|cli-parse\.ts/);
+  assert.doesNotMatch(site!, /inconsistency\.ts|cli-parse\.ts/);
 });
 
-test("describeAlarm: an unrecognized output → -UNKNOWN naming the recognizer + copy-paste command + raw stdout", () => {
+test("describeInconsistency: an unrecognized output → -UNKNOWN naming the recognizer + copy-paste command + raw stdout", () => {
   const raw = fakeExec(
     ["podman", "exec", "n1", "/opt/obsidian/obsidian-cli", "sync:history", "file=bughunt/x.md", "total"],
     "Error: Sync is in error state. Check sync settings.",
   );
-  const d = describeAlarm(new CliUnrecognizedOutput(raw, "parseTotal"));
+  const d = describeInconsistency(new CliUnrecognizedOutput(raw, "parseTotal"));
   assert.equal(d.category, "unknown");
   assert.equal(d.suffix, "-UNKNOWN");
   assert.equal(d.recognizer, "parseTotal"); // the cli-parse.ts function to teach the new shape
@@ -67,8 +67,8 @@ test("siteOf: the ObsidianDriver.expect plumbing frame is skipped (lands on the 
   assert.equal(siteOf(err), "src/driver.ts:265:25");
 });
 
-test("describeAlarm: a CLI/FS disagreement → -OBSFAIL carrying its structured detail", () => {
-  const d = describeAlarm(new AlarmError("cli-fs-disagreement", { node: "n1", cliOnlyCount: 1 }));
+test("describeInconsistency: a CLI/FS disagreement → -OBSFAIL carrying its structured detail", () => {
+  const d = describeInconsistency(new CliInconsistencyError("cli-fs-disagreement", { node: "n1", cliOnlyCount: 1 }));
   assert.equal(d.category, "obsfail");
   assert.equal(d.suffix, "-OBSFAIL");
   assert.deepEqual(d.detail, { node: "n1", cliOnlyCount: 1 });

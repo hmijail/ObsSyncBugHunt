@@ -71,8 +71,8 @@ answer on its own; it must be confirmed by an independent source:
 - **Anchor (the verdict path, implemented).** At the final observation, the rep's own canonical notes
   are known present (we created them and `read` just confirmed them). The listing is valid **iff it
   contains those anchor notes**; a listing that omits a note we can read is self-inconsistent and
-  throws `AlarmError("cli-listing-inconsistent")` → the rep ends `-OBSFAIL`. This makes the 2026-06-26
-  shape (empty `files` while reads succeed) impossible to mis-score. It is effectively a
+  throws `CliInconsistencyError("cli-listing-inconsistent")` → the rep ends `-OBSFAIL`. This makes the
+  2026-06-26 shape (empty `files` while reads succeed) impossible to mis-score. It is effectively a
   `read`-vs-`files` cross-check.
 - **Filesystem second-source (implemented).** `ObsidianDriver.listDirFs` does a direct `ls` of the
   vault folder (`<vaultPath>/<folder>`, via `Executor.shell`); `ls` positively distinguishes empty-
@@ -84,11 +84,11 @@ answer on its own; it must be confirmed by an independent source:
   when no `vaultPath` is configured (local/dev). `vaultPath` defaults to `/root/vaults/TestVault`
   (override `--vault-path`).
 
-## Alarm-class conditions are per-rep outcomes (not a soak-killer)
+## Flagged-inconsistency conditions are per-rep outcomes (not a soak-killer)
 A correctness-assumption violation is **not fatal** — it's just another possible result of a rep, so a
 night-long soak keeps running. `runRep` (run.ts) is the single choke point every rep funnels through;
-it catches `AlarmError` / `CliUnrecognizedOutput`, classifies it (`alarm.ts`), tags the rep dir, and
-moves on. Two categories:
+it catches `CliInconsistencyError` / `CliUnrecognizedOutput`, classifies it (`inconsistency.ts`), tags
+the rep dir, and moves on. Two categories:
 
 - **`-OBSFAIL`** — a client **misreports its own vault**: a real finding. Covers
   `cli-fs-disagreement` (obsidian-cli's `files` listing vs a direct `ls` of the vault dir disagree —
@@ -104,6 +104,6 @@ top-level index named after the label — **`runs/OBSFAIL.log`** / **`runs/UNKNO
 offending **CLI line in copy-paste-runnable form** (`quoteArgv(raw.argv)`, e.g.
 `podman exec n1 /opt/obsidian/obsidian-cli read 'file=…'`) and the **`src/file:line`** throw site
 (`siteOf`, parsed from the stack); a compact console line; and a `<category>.json` dropped in the rep
-dir. The morning-after triage file name already says which kind it was. An alarm that escapes the rep
-loop entirely (e.g. preflight against an unparseable baseline) has no rep to attach to, so the
+dir. The morning-after triage file name already says which kind it was. An inconsistency that escapes
+the rep loop entirely (e.g. preflight against an unparseable baseline) has no rep to attach to, so the
 top-level handler records it the same way and exits.

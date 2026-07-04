@@ -2,29 +2,31 @@
 // against the containerized nodes, and tallies. Each history string is a
 // directory; each repeat is a sub-run named by epoch6. A non-OK rep dir is
 // suffixed -NOUPLOAD / -TIMEOUT / -LOST / -DUPL / -SYNCBAD (verdict outcomes) or
-// -OBSFAIL / -UNKNOWN (a caught alarm-class condition — see alarm.ts), and a
+// -OBSFAIL / -UNKNOWN (a caught CLI inconsistency — see inconsistency.ts), and a
 // history dir gets -BAD<pct> (share of non-OK reps).
 //
 // Params are CLI args (args-only — env is not read). Use `make` (which maps
 // `make soak TURNS=paced` to the flags below), or run directly: `npm run start -- <flags>`.
 //
-//   --nodes          comma-separated container names, plus the literal "mac" to include the Mac
-//                    node — e.g. "n1,n2,mac" (default n1,n2). "mac" is the sole on/off switch for
-//                    the DSL's `M` node (a real, always-connected local instance; never a D/C
-//                    target, see dsl.ts) — --mac-bin only supplies its binary path, so "mac" in
-//                    --nodes without --mac-bin/MAC_BIN set fails fast at startup rather than
-//                    crashing mid-run (and vice versa: a history using `M` without "mac" in
-//                    --nodes also fails fast). Its Sync state is also checked before every op it
-//                    performs (paused/error/stopped/offline aborts the whole run — see execute.ts's
-//                    assertMacSyncOn); its vault path is self-reported (`vault info=path`), which
-//                    enables the same FS cross-check the containers get, with nothing to configure.
+//   --nodes          comma-separated container names, plus the literal "l" to include the local
+//                    instance — e.g. "n1,n2,l" (default n1,n2). "l" is the sole on/off switch for
+//                    the DSL's `L` node (a real, always-connected Obsidian instance running
+//                    directly on this host; never a D/C target, see dsl.ts) — --local-bin only
+//                    supplies its binary path, so "l" in --nodes without --local-bin/LOCAL_BIN set
+//                    fails fast at startup rather than crashing mid-run (and vice versa: a history
+//                    using `L` without "l" in --nodes also fails fast). Its Sync state is also
+//                    checked before every op it performs (paused/error/stopped/offline aborts the
+//                    whole run — see execute.ts's assertLocalSyncOn, though a host-internet blip
+//                    gets a chance to recover first); its vault path is self-reported (`vault
+//                    info=path`), which enables the same FS cross-check the containers get, with
+//                    nothing to configure.
 //   --bin            CLI path inside the container           (default /opt/obsidian/obsidian-cli)
 //   --isolator       network | sync                          (default network)
 //   --network        podman network                          (default obsidian-net)
-//   --mac-bin        path to a local obsidian-cli binary (NOT the GUI Obsidian binary — the CLI
-//                    is much faster per-call) — only used if "mac" is in --nodes; see above
-//   --mac-node-id    the Mac's own Sync-reported device name (default: OS `hostname`, which
-//                    is a guess, not verified to match — see run.ts's own comment on this)
+//   --local-bin      path to a local obsidian-cli binary (NOT the container's path — only used if
+//                    "l" is in --nodes; see above
+//   --local-node-id  the local instance's own Sync-reported device name (default: OS `hostname`,
+//                    which is a guess, not verified to match — see run.ts's own comment on this)
 //   --history        run a specific DSL string (else generate)
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --scenario       random | stale                          (default random)
@@ -33,14 +35,18 @@
 //   --turns          barrier | paced | concurrent            (default barrier)
 //   --pause-prob     chance of a ~10s pause after an edit     (default 0)
 //   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
-//                    participants — numbered nodes + Mac if "mac" is in --nodes)
+//                    participants — numbered nodes + local instance if "l" is in --nodes)
 //   --repeat         reps per history                         (default 10)
 //   --histories      number of histories to run (<=0 = until killed) (default 1)
 //   --duration-min   run for N minutes instead of a count
 //   --generate       print N generated histories and exit (no nodes touched)
 //   --skip-host-check  skip the host-online preflight
 //   --vault-path     vault's on-disk root for the FS cross-check (default /root/vaults/TestVault)
-//   --poll-sec / --min-floor-sec / --cap-sec / --w-settle-sec / --final-settle-sec  sync-wait tuning
+//   --poll-sec / --min-floor-sec / --cap-sec / --max-cap-sec / --w-settle-sec / --final-settle-sec
+//                    sync-wait tuning — cap-sec/max-cap-sec: see execute.ts's Liveness tracking
+//                    (a node whose sync state keeps changing isn't wedged, just slow; cap-sec is
+//                    how long it may go completely unchanging before we give up, max-cap-sec is
+//                    the absolute outer ceiling regardless of activity)
 //   --probe-sec      per-call cap on the settle's sync:status probe (default 5; it blocks until synced)
 //   --runs-prefix    parent dir for runs/ (default: cwd, i.e. plain ./runs)
 //   --skip-snapshot-timing  omit the pause-snapshot's per-call `ms` fields (debug aid, on by default)
@@ -57,13 +63,13 @@ import { PodmanExecutor, LocalExecutor, runProcess } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
-import { runHistory, type ExecuteOpts } from "./execute.js";
+import { runHistory, trackLiveness, isWedged, type ExecuteOpts, type Liveness } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
-import { parse, serialize, normalize, usesMac, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesLocal, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
-import { AlarmError, describeAlarm, recordAlarm } from "./alarm.js";
+import { CliInconsistencyError, describeInconsistency, recordInconsistency } from "./inconsistency.js";
 import { NOTE_DIR } from "./types.js";
 
 // Correctness-assumption violations are thrown deep in the driver/oracle; they're handled
@@ -73,9 +79,9 @@ import { NOTE_DIR } from "./types.js";
 // Other errors keep the normal crash behavior.
 for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
   process.on(ev, (err: unknown) => {
-    if (err instanceof AlarmError || err instanceof CliUnrecognizedOutput) {
-      const d = describeAlarm(err);
-      recordAlarm(d, runsRoot);
+    if (err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput) {
+      const d = describeInconsistency(err);
+      recordInconsistency(d, runsRoot);
       console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}${d.command ? `\n  cmd: ${d.command}` : ""}`);
     } else {
       console.error(err);
@@ -90,8 +96,8 @@ const { values } = parseArgs({
     bin: { type: "string" },
     network: { type: "string" },
     isolator: { type: "string" },
-    "mac-bin": { type: "string" },
-    "mac-node-id": { type: "string" },
+    "local-bin": { type: "string" },
+    "local-node-id": { type: "string" },
     scenario: { type: "string" },
     histories: { type: "string" },
     repeat: { type: "string" },
@@ -107,6 +113,7 @@ const { values } = parseArgs({
     "poll-sec": { type: "string" },
     "min-floor-sec": { type: "string" },
     "cap-sec": { type: "string" },
+    "max-cap-sec": { type: "string" },
     "w-settle-sec": { type: "string" },
     "final-settle-sec": { type: "string" },
     "probe-sec": { type: "string" },
@@ -117,17 +124,18 @@ const { values } = parseArgs({
   },
 });
 
-// "mac" in --nodes is the sole on/off switch for Mac participation — --mac-bin only supplies its
-// binary path (see the header comment above for why this reads more naturally than a separate flag).
+// "l" in --nodes is the sole on/off switch for local-instance participation — --local-bin only
+// supplies its binary path (see the header comment above for why this reads more naturally than
+// a separate flag).
 const rawNodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
-const macRequested = rawNodes.includes("mac");
-const nodesList = rawNodes.filter((n) => n !== "mac"); // container names only, from here on
+const localRequested = rawNodes.includes("l");
+const nodesList = rawNodes.filter((n) => n !== "l"); // container names only, from here on
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const network = values.network ?? "obsidian-net";
 const isolatorKind = values.isolator ?? "network";
-const macBin = values["mac-bin"];
-if (macRequested && !macBin) {
-  console.error(`--nodes/NODES includes "mac" but --mac-bin/MAC_BIN wasn't provided — pass --mac-bin <path> or drop "mac" from --nodes.`);
+const localBin = values["local-bin"];
+if (localRequested && !localBin) {
+  console.error(`--nodes/NODES includes "l" but --local-bin/LOCAL_BIN wasn't provided — pass --local-bin <path> or drop "l" from --nodes.`);
   process.exit(2);
 }
 const scenario = values.scenario ?? "random";
@@ -137,13 +145,13 @@ const durationMin = Number(values["duration-min"] ?? 0);
 const historyArg = values.history;
 const steps = Number(values.steps ?? 0); // with --history: run only its first N ops (0 = all)
 
-// Normalize a hand-typed --history up front (before any container is touched) so an `M` used
-// without "mac" in --nodes fails fast with a clear message instead of crashing deep in
-// runHistory: the DSL grammar accepts `M` regardless of whether the Mac is actually wired up, so
-// nothing else catches this mismatch.
+// Normalize a hand-typed --history up front (before any container is touched) so an `L` used
+// without "l" in --nodes fails fast with a clear message instead of crashing deep in
+// runHistory: the DSL grammar accepts `L` regardless of whether the local instance is actually
+// wired up, so nothing else catches this mismatch.
 const parsedHistory = historyArg ? normalize(parse(historyArg)) : undefined;
-if (parsedHistory && !macRequested && usesMac(parsedHistory)) {
-  console.error(`history "${historyArg}" uses M (the Mac node) but "mac" isn't in --nodes/NODES — add it (e.g. --nodes ${[...nodesList, "mac"].join(",")}) or remove M from the history.`);
+if (parsedHistory && !localRequested && usesLocal(parsedHistory)) {
+  console.error(`history "${historyArg}" uses L (the local node) but "l" isn't in --nodes/NODES — add it (e.g. --nodes ${[...nodesList, "l"].join(",")}) or remove L from the history.`);
   process.exit(2);
 }
 
@@ -158,7 +166,7 @@ const genParams: GenParams = {
   turns,
   pauseProb: Number(values["pause-prob"] ?? 0),
   partitionProb: Number(values["partition-prob"] ?? 0),
-  macEnabled: macRequested,
+  localEnabled: localRequested,
 };
 
 // --generate N: print N generated histories and exit — no nodes, no host check.
@@ -179,21 +187,21 @@ async function obsidianVersion(): Promise<string> {
   return r.stdout.trim() || "?";
 }
 
-// Same idea for the Mac, queried directly (no podman wrapping — same construction as
+// Same idea for the local instance, queried directly (no podman wrapping — same construction as
 // LocalExecutor.exec) — worth recording separately since a real reason to test against a real
-// Mac is likely a DIFFERENT installed version than the containers' pinned build.
-async function macObsidianVersion(): Promise<string | undefined> {
-  if (!macRequested) return undefined;
-  const r = await runProcess(macBin!, ["version"]);
+// local Obsidian install is likely a DIFFERENT installed version than the containers' pinned build.
+async function localObsidianVersion(): Promise<string | undefined> {
+  if (!localRequested) return undefined;
+  const r = await runProcess(localBin!, ["version"]);
   return r.stdout.trim() || "?";
 }
 
-// The Mac's own vault root, self-reported (`obsidian-cli vault info=path`) — enables the same
-// CLI-vs-filesystem cross-check the containers get, with no manual path to configure or keep in
-// sync with wherever the user's real vault happens to live.
-async function macVaultPath(): Promise<string | undefined> {
-  if (!macRequested) return undefined;
-  const r = await runProcess(macBin!, ["vault", "info=path"]);
+// The local instance's own vault root, self-reported (`obsidian-cli vault info=path`) — enables
+// the same CLI-vs-filesystem cross-check the containers get, with no manual path to configure or
+// keep in sync with wherever the user's real vault happens to live.
+async function localVaultPath(): Promise<string | undefined> {
+  if (!localRequested) return undefined;
+  const r = await runProcess(localBin!, ["vault", "info=path"]);
   return r.stdout.trim() || undefined;
 }
 
@@ -205,19 +213,20 @@ const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs"
 // cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.
 const vaultPath = values["vault-path"] ?? "/root/vaults/TestVault";
 const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vaultPath));
-if (macRequested) {
-  // The Mac's own Sync-reported device name — oracle.ts's conflict-file `wellFormed` check
-  // matches the parsed `(Conflicted copy <device> ...)` name against each driver's own `.node`,
-  // so this has to be what Sync itself calls the device, not an arbitrary label. `hostname` is
-  // a reasonable GUESS, not verified to match (e.g. a `.local` suffix hostname includes that
-  // Sync's own naming may not) — override with --mac-node-id if a real conflict later shows a
-  // mismatch (wellFormed is informational only, so this doesn't gate the core token oracle).
-  const macNodeId = values["mac-node-id"] ?? (await runProcess("hostname", [])).stdout.trim();
-  drivers.push(new ObsidianDriver(new LocalExecutor(macBin!, macNodeId), await macVaultPath()));
-  // execBase.macNode below is `drivers.length`, i.e. "whatever the Mac driver's position is,
+if (localRequested) {
+  // The local instance's own Sync-reported device name — oracle.ts's conflict-file `wellFormed`
+  // check matches the parsed `(Conflicted copy <device> ...)` name against each driver's own
+  // `.node`, so this has to be what Sync itself calls the device, not an arbitrary label.
+  // `hostname` is a reasonable GUESS, not verified to match (e.g. a `.local` suffix hostname
+  // includes that Sync's own naming may not) — override with --local-node-id if a real conflict
+  // later shows a mismatch (wellFormed is informational only, so this doesn't gate the core
+  // token oracle).
+  const localNodeId = values["local-node-id"] ?? (await runProcess("hostname", [])).stdout.trim();
+  drivers.push(new ObsidianDriver(new LocalExecutor(localBin!, localNodeId), await localVaultPath()));
+  // execBase.localNode below is `drivers.length`, i.e. "whatever the local driver's position is,
   // it must be last" — true by construction right here, but silent if a future edit ever
   // reorders driver construction. Make that assumption loud instead.
-  assert(drivers[drivers.length - 1].node === macNodeId, "Mac driver must be pushed last so macNode: drivers.length resolves to it");
+  assert(drivers[drivers.length - 1].node === localNodeId, "local driver must be pushed last so localNode: drivers.length resolves to it");
 }
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
@@ -226,6 +235,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
   minFloorSec: Number(values["min-floor-sec"] ?? 3),
   capSec: Number(values["cap-sec"] ?? 120),
+  maxCapSec: Number(values["max-cap-sec"] ?? 600),
   wSettleSec: Number(values["w-settle-sec"] ?? 4),
   finalSettleSec: Number(values["final-settle-sec"] ?? 15),
   probeSec: Number(values["probe-sec"] ?? 5),
@@ -233,8 +243,8 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   snapshotTiming: !values["skip-snapshot-timing"], // on by default; --skip-snapshot-timing turns it off
   isolator: isolatorKind,
   obsidianVersion: await obsidianVersion(),
-  macNode: macRequested ? drivers.length : undefined, // the Mac driver's own (last) position
-  macObsidianVersion: await macObsidianVersion(),
+  localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
+  localObsidianVersion: await localObsidianVersion(),
 };
 
 // Human-readable wall-clock stamp DDTHHMMSS (local time), e.g. 25T181530 — used for both the
@@ -264,7 +274,8 @@ let pass = 0;
 let fail = 0; // real oracle failures (NOUPLOAD/TIMEOUT/LOST/DUPL/SYNCBAD)
 let obsfail = 0; // client misreported its vault (-OBSFAIL)
 let unknown = 0; // couldn't judge — unparseable/unresponsive CLI, or ladder catch-all (-UNKNOWN)
-let conflicts = 0;
+let conflicts = 0; // reps where Obsidian Sync's own (Conflicted copy ...) mechanism fired
+let hostOutages = 0; // reps where a host-connectivity blip forced a recovery wait (timings unreliable)
 const failures: string[] = [];
 const startedAt = Date.now();
 // The group dir currently accruing reps, so a Ctrl-C mid-soak can still tag it with -BAD<pct>
@@ -273,7 +284,8 @@ let activeGroup: { strDir: string; groupName: string } | null = null;
 
 const nonOk = () => fail + obsfail + unknown;
 const tally = () =>
-  `\n=== TALLY: PASS=${pass} FAIL=${fail} OBSFAIL=${obsfail} UNKNOWN=${unknown} reps=${pass + nonOk()}  (reps with any conflict: ${conflicts}) ===` +
+  `\n=== TALLY: PASS=${pass} FAIL=${fail} OBSFAIL=${obsfail} UNKNOWN=${unknown} reps=${pass + nonOk()}` +
+  `  (reps with conflict files: ${conflicts}) (reps with a host-outage detour: ${hostOutages}) ===` +
   (failures.length ? "\nfailing reps:\n" + failures.map((f) => "  " + f).join("\n") : "");
 
 // Permanent bottom status bar, TTY only. We reserve the last terminal row with a VT100
@@ -358,9 +370,9 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   try {
     outcome = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
   } catch (err) {
-    if (!(err instanceof AlarmError || err instanceof CliUnrecognizedOutput)) throw err; // a real crash
-    const d = describeAlarm(err);
-    recordAlarm(d, runsRoot);
+    if (!(err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput)) throw err; // a real crash
+    const d = describeInconsistency(err);
+    recordInconsistency(d, runsRoot);
     logger.log({ kind: d.category, ...d });
     const repPath = tagRep(logger.path, d.suffix);
     failures.push(repPath);
@@ -375,6 +387,8 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   }
   const { verdict, timings, forensics } = outcome;
 
+  if (timings.hostOutage) hostOutages++;
+
   const lost = verdict.notes.flatMap((n) => n.lost);
   const duplicated = verdict.notes.flatMap((n) => n.duplicated);
   const diverged = verdict.notes.some((n) => !n.converged);
@@ -388,7 +402,8 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   if (verdict.ok && !timings.unsynced && !timings.syncTimedOut) {
     pass++;
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
-    console.log(`  rep ${id}: PASS${tag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
+    const hostTag = timings.hostOutage ? " (host-outage — timings unreliable)" : "";
+    console.log(`  rep ${id}: PASS${tag}${hostTag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
   } else {
     // Ranked, most-severe-first: never-uploaded > inconclusive timeout > real loss >
     // duplication > divergence. -UNKNOWN is a catch-all that should never fire here (a true
@@ -448,7 +463,7 @@ async function readState(d: ObsidianDriver): Promise<PreflightRow> {
   } catch (e) {
     // A down/absent container fails at the exec layer (podman exit ≠ 0, empty stdout) →
     // report unreachable so preflight aborts with a friendly message. A *code-0* unknown
-    // output is a real format problem, not a down node — let it propagate to the ALARM.
+    // output is a real format problem, not a down node — let it propagate as a flagged inconsistency.
     if (e instanceof CliUnrecognizedOutput && e.raw.code !== 0) {
       return { node: d.node, reachable: false, state: "unreachable", notes: -1 };
     }
@@ -463,19 +478,27 @@ async function preflight(): Promise<boolean> {
   // settle before judging.
   for (const d of drivers) await d.syncResume();
 
-  // Wait until every node is `synced` (or something is clearly wrong) before trusting
-  // a count comparison: during the initial sync, note counts legitimately differ.
+  // Wait until every node is `synced` (or something is clearly wrong) before trusting a count
+  // comparison: during the initial sync, note counts legitimately differ. A node's reported
+  // state may transiently show "error" right after `containers-up` (e.g. while it's still
+  // settling in) — that's not treated as fatal on its own; only a node whose state stays
+  // completely unchanging for a full `cap` window (isWedged), or the absolute `maxCap`
+  // ceiling, ends the wait early (same liveness tracking as execute.ts's settle loop).
   const cap = execBase.capSec ?? 120;
-  const deadline = Date.now() + cap * 1000;
+  const maxCap = execBase.maxCapSec ?? 600;
+  const absoluteStart = Date.now();
   let rows = await Promise.all(drivers.map(readState));
+  let liveness: Liveness = { lastStates: null, lastChangeAt: absoluteStart };
+  liveness = trackLiveness(liveness, rows.map((r) => r.state), Date.now());
   while (
     rows.every((r) => r.reachable) &&
-    !rows.some((r) => r.state === "error") &&
     !rows.every((r) => r.state === "synced") &&
-    Date.now() < deadline
+    !isWedged(liveness, Date.now(), cap * 1000) &&
+    Date.now() - absoluteStart < maxCap * 1000
   ) {
     await sleep(2000);
     rows = await Promise.all(drivers.map(readState));
+    liveness = trackLiveness(liveness, rows.map((r) => r.state), Date.now());
   }
   for (const r of rows) console.log(`preflight ${r.node}: status=${r.state} notes=${r.notes}`);
 
@@ -484,8 +507,8 @@ async function preflight(): Promise<boolean> {
     console.log("preflight FAILED — a node is unreachable (is `make containers-up` done?). Aborting.");
     return false;
   }
-  // A node that won't reach `synced` (stuck `error`, or still `syncing`/paused past the
-  // cap) is a sick baseline — soaking on it just burns reps into -TIMEOUTs. Abort so
+  // A node that won't reach `synced` (wedged on a stuck state, or still `syncing`/paused past
+  // the cap) is a sick baseline — soaking on it just burns reps into -TIMEOUTs. Abort so
   // it's recreated/healed first rather than silently degrading the run.
   const unhealthy = rows.filter((r) => r.state !== "synced");
   if (unhealthy.length > 0) {

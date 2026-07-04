@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parse, serialize, normalize, usesMac, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesLocal, type History } from "./dsl.js";
 
 test("parses the worked example N1DAaC", () => {
   const h = parse("N1DAaC");
@@ -24,14 +24,14 @@ test("parse ignores whitespace and parses pauses", () => {
 });
 
 test("round-trips serialize(parse(s)) for canonical strings", () => {
-  for (const s of ["N1DAaC", "N1AaN2Aa", "N1DAaWCWN2W", "AaP30C", "N2Ab", "MAaN1DC"]) {
+  for (const s of ["N1DAaC", "N1AaN2Aa", "N1DAaWCWN2W", "AaP30C", "N2Ab", "LAaN1DC"]) {
     assert.equal(serialize(parse(s)), s);
   }
 });
 
-test("parses and serializes M (the Mac selector) like a bare token, same as D/C/W", () => {
-  assert.deepEqual(parse("MAaW"), [{ cmd: "mac" }, { cmd: "append", note: "a" }, { cmd: "wait" }]);
-  assert.equal(serialize([{ cmd: "mac" }]), "M");
+test("parses and serializes L (the local selector) like a bare token, same as D/C/W", () => {
+  assert.deepEqual(parse("LAaW"), [{ cmd: "local" }, { cmd: "append", note: "a" }, { cmd: "wait" }]);
+  assert.equal(serialize([{ cmd: "local" }]), "L");
 });
 
 test("round-trips parse(serialize(h))", () => {
@@ -83,28 +83,28 @@ test("normalize is idempotent", () => {
   }
 });
 
-// --- the Mac selector (M) ------------------------------------------------------
+// --- the local selector (L) ------------------------------------------------------
 
-test("normalize: M and N are a unified selector — an unused N1 (overwritten by M before use) drops, and a redundant re-select of M drops too", () => {
-  assert.equal(norm("N1MAaM"), "MAa"); // N1 never used (M overwrites it); the trailing M is a no-op re-select
+test("normalize: L and N are a unified selector — an unused N1 (overwritten by L before use) drops, and a redundant re-select of L drops too", () => {
+  assert.equal(norm("N1LAaL"), "LAa"); // N1 never used (L overwrites it); the trailing L is a no-op re-select
 });
 
-test("normalize: M collapses redundantly just like N does", () => {
-  assert.equal(norm("MMAa"), "MAa");
+test("normalize: L collapses redundantly just like N does", () => {
+  assert.equal(norm("LLAa"), "LAa");
 });
 
-test("normalize: D/C while the Mac is active is rejected — the Mac must always stay connected", () => {
-  assert.throws(() => normalize(parse("MD")), /Mac node.*always-connected/);
-  assert.throws(() => normalize(parse("MC")), /Mac node.*always-connected/);
-  assert.throws(() => normalize(parse("N1DCMD")), /Mac node.*always-connected/); // a numbered D/C is fine; the one after M isn't
+test("normalize: D/C while the local instance is active is rejected — it must always stay connected", () => {
+  assert.throws(() => normalize(parse("LD")), /local node.*always-connected/);
+  assert.throws(() => normalize(parse("LC")), /local node.*always-connected/);
+  assert.throws(() => normalize(parse("N1DCLD")), /local node.*always-connected/); // a numbered D/C is fine; the one after L isn't
 });
 
-test("normalize: D/C on a numbered node is unaffected by the Mac-safety check", () => {
+test("normalize: D/C on a numbered node is unaffected by the local-instance safety check", () => {
   assert.equal(norm("N1DC"), "N1DC");
-  assert.equal(norm("N1DCMW"), "N1DCMW"); // disconnecting N1, THEN selecting the Mac, is fine
+  assert.equal(norm("N1DCLW"), "N1DCLW"); // disconnecting N1, THEN selecting the local instance, is fine
 });
 
-test("usesMac: true iff the history ever selects the Mac", () => {
-  assert.equal(usesMac(parse("N1AaN2Ab")), false);
-  assert.equal(usesMac(parse("N1AaMAaN2Ab")), true);
+test("usesLocal: true iff the history ever selects the local instance", () => {
+  assert.equal(usesLocal(parse("N1AaN2Ab")), false);
+  assert.equal(usesLocal(parse("N1AaLAaN2Ab")), true);
 });

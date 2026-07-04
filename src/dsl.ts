@@ -7,8 +7,9 @@ import assert from "node:assert/strict";
 // reads as what the USER does — the user never "syncs", they only Wait and hope it happens.
 //
 //   N<d>   set active node           (N1, N2)
-//   M      set active node to the Mac (a real local Obsidian instance, if configured) —
-//          exempt from D/C: it must always stay connected, see assertMacAlwaysConnected below
+//   L      set active node to the local instance (a real Obsidian instance running directly on
+//          this host, if configured) — exempt from D/C: it must always stay connected, see
+//          assertLocalAlwaysConnected below
 //   A<x>   append a line to note <x> by the active node (first touch of a note creates it)
 //   D      disconnect the active node (network)
 //   C      connect the active node
@@ -19,7 +20,7 @@ import assert from "node:assert/strict";
 // string is exactly what executes (see normalize). Trailing waits are implicit (the
 // executor always settles before judging); timing is otherwise string-controlled.
 
-export type Cmd = "node" | "mac" | "append" | "disconnect" | "connect" | "wait" | "pause";
+export type Cmd = "node" | "local" | "append" | "disconnect" | "connect" | "wait" | "pause";
 
 export interface Op {
   cmd: Cmd;
@@ -65,7 +66,7 @@ export function parse(s: string): History {
       case "D": ops.push({ cmd: "disconnect" }); break;
       case "C": ops.push({ cmd: "connect" }); break;
       case "W": ops.push({ cmd: "wait" }); break;
-      case "M": ops.push({ cmd: "mac" }); break;
+      case "L": ops.push({ cmd: "local" }); break;
       case "P": {
         const n = digits();
         ops.push({ cmd: "pause", seconds: n ? Number(n) : DEFAULT_PAUSE_SEC });
@@ -84,7 +85,7 @@ export function serialize(h: History): string {
     .map((op) => {
       switch (op.cmd) {
         case "node": return `N${op.node}`;
-        case "mac": return "M";
+        case "local": return "L";
         case "append": return `A${op.note}`;
         case "disconnect": return "D";
         case "connect": return "C";
@@ -99,13 +100,13 @@ export function serialize(h: History): string {
 //
 // `normalize` is the single canonical preprocessing applied to EVERY history (generated or
 // typed). Three passes, in order, then a safety check:
-//   1. floatPauses        — a pause only matters next to an action (D/C/A). One sandwiched
-//                           between non-actions is moved to just before the next action (or
-//                           dropped if there is none); carried pauses sum.
-//   2. dropRedundantNodes — an N/M overwritten before use, or re-selecting the active
-//                           node/Mac, goes.
-//   3. collapseAdjacent   — dedup adjacent A(same note)/D/C/W; sum adjacent pauses.
-//   4. assertMacAlwaysConnected — the Mac must never be D/C'd; throws otherwise.
+//   1. floatPauses          — a pause only matters next to an action (D/C/A). One sandwiched
+//                             between non-actions is moved to just before the next action (or
+//                             dropped if there is none); carried pauses sum.
+//   2. dropRedundantNodes   — an N/L overwritten before use, or re-selecting the active
+//                             node/local instance, goes.
+//   3. collapseAdjacent     — dedup adjacent A(same note)/D/C/W; sum adjacent pauses.
+//   4. assertLocalAlwaysConnected — the local instance must never be D/C'd; throws otherwise.
 
 /** Move "floating" pauses (not adjacent to an action) forward to the next action. */
 function floatPauses(h: History): History {
@@ -133,17 +134,17 @@ function floatPauses(h: History): History {
   return out;
 }
 
-/** Drop selector ops that are never used: re-selecting the active node/Mac, or overwritten by
- *  the next selector before any selector-using op (anything but a pause). `node` and `mac` are
- *  both selectors — a unified `active` key covers "no selector picked twice in a row and nothing
- *  wasted" regardless of which kind. `0` is a safe "nothing selected yet" sentinel: it can never
- *  collide with a real (1-based) node number or with the "mac" string. */
+/** Drop selector ops that are never used: re-selecting the active node/local instance, or
+ *  overwritten by the next selector before any selector-using op (anything but a pause). `node`
+ *  and `local` are both selectors — a unified `active` key covers "no selector picked twice in a
+ *  row and nothing wasted" regardless of which kind. `0` is a safe "nothing selected yet"
+ *  sentinel: it can never collide with a real (1-based) node number or with the "local" string. */
 function dropRedundantNodes(h: History): History {
   const out: History = [];
-  let active: number | "mac" = 0;
-  const isSelector = (op: Op) => op.cmd === "node" || op.cmd === "mac";
-  const keyOf = (op: Op): number | "mac" => {
-    if (op.cmd === "mac") return "mac";
+  let active: number | "local" = 0;
+  const isSelector = (op: Op) => op.cmd === "node" || op.cmd === "local";
+  const keyOf = (op: Op): number | "local" => {
+    if (op.cmd === "local") return "local";
     assert(op.node !== undefined, "'node' op must carry a node field");
     assert(op.node !== 0, "node numbers are 1-based — 0 is normalize's internal-only sentinel");
     return op.node;
@@ -162,21 +163,22 @@ function dropRedundantNodes(h: History): History {
   return out;
 }
 
-/** The Mac (when selected via `M`) must stay always-connected — no isolation primitive is ever
- *  applied to it (see run.ts: it's a real local Obsidian instance, not a disposable container).
- *  Walks the FINAL normalized ops (default active node is 1, matching execute.ts's own runtime
- *  default) and throws if a D/C op is ever reached while the Mac is the active selector — the
- *  DSL-grammar-level half of that guarantee (execute.ts also asserts it at runtime). */
-function assertMacAlwaysConnected(h: History): void {
-  let active: number | "mac" = 1;
+/** The local instance (when selected via `L`) must stay always-connected — no isolation
+ *  primitive is ever applied to it (see run.ts: it's a real Obsidian instance running on this
+ *  host, not a disposable container). Walks the FINAL normalized ops (default active node is 1,
+ *  matching execute.ts's own runtime default) and throws if a D/C op is ever reached while the
+ *  local instance is the active selector — the DSL-grammar-level half of that guarantee
+ *  (execute.ts also asserts it at runtime). */
+function assertLocalAlwaysConnected(h: History): void {
+  let active: number | "local" = 1;
   for (const op of h) {
     if (op.cmd === "node") {
       assert(op.node !== undefined, "'node' op must carry a node field");
       assert(op.node !== 0, "node numbers are 1-based — 0 is normalize's internal-only sentinel");
       active = op.node;
-    } else if (op.cmd === "mac") active = "mac";
-    else if ((op.cmd === "disconnect" || op.cmd === "connect") && active === "mac") {
-      throw new Error(`history disconnects/connects the Mac node, which must stay always-connected: ${serialize(h)}`);
+    } else if (op.cmd === "local") active = "local";
+    else if ((op.cmd === "disconnect" || op.cmd === "connect") && active === "local") {
+      throw new Error(`history disconnects/connects the local node, which must stay always-connected: ${serialize(h)}`);
     }
   }
 }
@@ -203,12 +205,13 @@ function collapseAdjacent(h: History): History {
 /** Canonicalize a history so the printed/serialized form is exactly what executes. */
 export function normalize(h: History): History {
   const result = collapseAdjacent(dropRedundantNodes(floatPauses(h)));
-  assertMacAlwaysConnected(result);
+  assertLocalAlwaysConnected(result);
   return result;
 }
 
-/** Whether a history ever selects the Mac — callers use this to require `--mac-bin` before
- *  running/generating anything for it, rather than failing deep inside execute.ts/repro.ts. */
-export function usesMac(h: History): boolean {
-  return h.some((op) => op.cmd === "mac");
+/** Whether a history ever selects the local instance — callers use this to require
+ *  `--local-bin` before running/generating anything for it, rather than failing deep inside
+ *  execute.ts/repro.ts. */
+export function usesLocal(h: History): boolean {
+  return h.some((op) => op.cmd === "local");
 }

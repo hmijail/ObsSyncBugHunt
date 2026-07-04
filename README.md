@@ -46,7 +46,7 @@ translates into a short, flat sequence of calls to a handful of functions (`Disc
 generated script sources) — deliberately simplistic: one-shot commands, no retries, no per-note
 settle/quiet-window logic (that's `execute.ts`'s job). The generated script always ends by reconnecting
 any node left disconnected, waiting for everyone to settle, then `Check`ing every appended token against
-every node's (and the Mac's) canonical content and conflict files, printing `OK`/`MISSING` per token — the
+every node's (and the local instance's) canonical content and conflict files, printing `OK`/`MISSING` per token — the
 same "did it survive somewhere" rule as the real oracle, just without its settle-timing machinery. A
 step that genuinely fails (a create that didn't report success, a podman network call that exits
 non-zero) aborts the whole script immediately with a clear `ABORT: ...` message rather than
@@ -56,14 +56,14 @@ generated script (e.g. `VERBOSE=1 runs/N1Aa.sh`) to echo every real command to s
 named `bughunt/<ts>-<letter>-<run-id>`, matching real reps' own convention — the timestamp is
 generated fresh each time the *script* runs (not at generation time), so re-running the same
 script twice never collides with the first run's notes. Takes `RUN_ID`/`WAIT_CAP_SEC`/
-`WAIT_POLL_SEC`/`OUT` in addition to the usual `NODES`/`NETWORK`/`OBSIDIAN_BIN`/`MAC_BIN`/
-`MAC_NODE_ID`; `make repro HISTORY=...` needs no containers up (it never touches podman itself).
+`WAIT_POLL_SEC`/`OUT` in addition to the usual `NODES`/`NETWORK`/`OBSIDIAN_BIN`/`LOCAL_BIN`/
+`LOCAL_NODE_ID`; `make repro HISTORY=...` needs no containers up (it never touches podman itself).
 
 Each repeat generates one result file, `runs/<ts>-<history>/<repTs>.jsonl`. It contains the timestamped execution
 trace, opening with a `history` event (the DSL string + parsed ops, every configured node's own id —
 `nodes`, so a rep that never happens to select every configured node still records what was actually
 live during it — the isolator/settle-timing config that governed the run, and the Obsidian version(s)
-involved — including `macObsidianVersion` when a Mac node is configured, which can differ from the
+involved — including `localObsidianVersion` when a local node is configured, which can differ from the
 containers' pinned build) and closing with a
 `results` event (the verdict), or `obsfail`/`unknown`. A failing repeat's file is renamed with its outcome suffix
 (`<repTs>-LOST.jsonl`, etc.). The group dir's `<ts>` is when that
@@ -103,15 +103,16 @@ real, in-use vault, the tester should keep your own notes safe.
 | `NOTES` | `--notes` | 1 | distinct notes per history (1 = max contention) |
 | `TURNS` | `--turns` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
 | `PAUSE_PROB` | `--pause-prob` | 0 | chance of a ~10s pause after an edit |
-| `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ total participants — numbered nodes + the Mac if `mac` is in `NODES`; a single numbered node plus the Mac is enough) |
+| `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ total participants — numbered nodes + the local instance if `l` is in `NODES`; a single numbered node plus the local instance is enough) |
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
-| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2,mac` / `obsidian-net` / `/opt/…` | container plumbing — the literal `mac` entry is the on/off switch for the Mac node (see below); drop it (`NODES=n1,n2`) for no Mac participation. Container-lifecycle targets (`containers-up`/`down`, `reconnect`, `clean-notes`) always skip `mac` automatically — it's never treated as a podman container |
-| `MAC_BIN` | `--mac-bin` | `.../Obsidian.app/Contents/MacOS/obsidian-cli` | path to a local `obsidian-cli` binary (NOT the GUI `Obsidian` binary — the CLI is much faster per-call), used only when `mac` is in `NODES`/`--nodes`. A history containing `M` with `mac` missing from `NODES` (or `mac` present with no `MAC_BIN`) fails fast at startup rather than crashing mid-run |
-| `MAC_NODE_ID` | `--mac-node-id` | OS `hostname` | the Mac's own Sync-reported device name, used to attribute its conflict files correctly — `hostname` is a guess, not verified to match; override if a real conflict shows a mismatch |
+| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2,l` / `obsidian-net` / `/opt/…` | container plumbing — the literal `l` entry is the on/off switch for the local node (see below); drop it (`NODES=n1,n2`) for no local-instance participation. Container-lifecycle targets (`containers-up`/`down`, `reconnect`, `clean-notes`) always skip `l` automatically — it's never treated as a podman container |
+| `LOCAL_BIN` | `--local-bin` | `obsidian` (bare, relies on PATH) | path to a local `obsidian-cli` binary (NOT the container's path — used only when `l` is in `NODES`/`--nodes`. A history containing `L` with `l` missing from `NODES` (or `l` present with no `LOCAL_BIN`) fails fast at startup rather than crashing mid-run |
+| `LOCAL_NODE_ID` | `--local-node-id` | OS `hostname` | the local instance's own Sync-reported device name, used to attribute its conflict files correctly — `hostname` is a guess, not verified to match; override if a real conflict shows a mismatch |
 | `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online checks: the startup preflight *and* the in-settle host-outage wait (set it where outbound TCP is blocked, else a stalled settle would wait forever) |
 | `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
 | `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
-| `CAP_SEC` | `--cap-sec` | 120 | hard ceiling on any single wait; exceeding it is a `-TIMEOUT` (inconclusive) |
+| `CAP_SEC` | `--cap-sec` | 120 | how long a node's reported sync state may stay completely unchanging before it's presumed wedged — a state still cycling (even through `error`) is granted more time, up to `MAX_CAP_SEC` |
+| `MAX_CAP_SEC` | `--max-cap-sec` | 600 | absolute outer ceiling on any single wait, regardless of activity; exceeding it is a `-TIMEOUT` (inconclusive) |
 | `W_SETTLE_SEC` | `--w-settle-sec` | 4 | for the `W` command: how long the `synced` state must hold |
 | `FINAL_SETTLE_SEC` | `--final-settle-sec` | 15 | end-of-history settle window; needs to cover a potential round-trip sync |
 | `PROBE_SEC` | `--probe-sec` | 5 | per-call cap on the settle's `sync:status` probe — it blocks until synced, so this bounds it into a pollable "synced yet?" (a timeout reads as *still syncing*) |
@@ -128,7 +129,7 @@ containerized nodes. Commands are uppercase, parameters lowercase/digits.
 | Command | meaning |
 |---|---|
 | `N<d>` | set the active node (`N1`, `N2`) |
-| `M` | set the active node to the Mac — a real local Obsidian instance, if `mac` is included in `NODES`/`--nodes` (see Parameters); **exempt from `D`/`C`** below, it must always stay connected. Its Sync state is checked before every op it performs — if found `paused`/`error`/`stopped`/`offline`, the whole run aborts (not just that rep), since a disconnected Mac invalidates every subsequent rep until fixed |
+| `L` | set the active node to the local instance — a real Obsidian instance running directly on this host, if `l` is included in `NODES`/`--nodes` (see Parameters); **exempt from `D`/`C`** below, it must always stay connected. Its Sync state is checked before every op it performs — if found `paused`/`error`/`stopped`/`offline`, it gets a chance to recover (a host-internet blip is tolerated, see `SKIP_HOST_CHECK`) before the whole run aborts (not just that rep), since it staying genuinely disconnected invalidates every subsequent rep until fixed |
 | `A<x>` | append a uniquely-tagged line to note `x` (`Aa`), by the active node (first touch creates it; also opens it in the GUI so you can watch the history unfold) |
 | `D` / `C` | disconnect / connect the active node from the network |
 | `W`    | wait until the active node reports that the last-edited note is synced |
@@ -144,7 +145,7 @@ Histories can be auto-generated or typed manually. They are run through a `norma
 
 Timings are necessarily variable between repetitions of a history, since we don't have control of the Sync server, timing of the client's retries, network state, etc. This can cause results to change every time you repeat the history. Therefore histories are run `REPEAT` times to sample the distribution of end results. Also, to minimize variability in a given history, command W waits until Obsidian itself reports the node is synced.
 
-Note that the harness models a single user using Obsidian across `NODES` devices (plus the Mac, when configured), so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing, while Obsidian might be doing its thing. Similarly, W waits for the current node to report it's synced, but this also implies that the other nodes wait until that happens.
+Note that the harness models a single user using Obsidian across `NODES` devices (plus the local instance, when configured), so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing, while Obsidian might be doing its thing. Similarly, W waits for the current node to report it's synced, but this also implies that the other nodes wait until that happens.
 
 At the end of the history, the harness reconnects all nodes to the network,  waits for them all to report synced, and still waits for a settling window to ensure that no further changes happen. Only then the end result is judged.
 
@@ -206,6 +207,11 @@ The result of each repetition of the history is recorded in a JSONL file under t
 | `-OBSFAIL` | obsidian-cli reports something but the filesystem disagrees |
 | `-UNKNOWN` | some situation couldn't be recognised |
 
+A settle only gives up when a node's reported sync state has been completely unchanging for
+`CAP_SEC`; a node still visibly cycling through states (even through `error`, e.g. right after a
+reconnect) is presumed alive and granted more time, up to `MAX_CAP_SEC` overall — so `-TIMEOUT`
+means "genuinely wedged or too slow even accounting for that," not "briefly touched `error` once."
+
 
 OBSFAIL and UNKNOWN mean that something is seriously wrong and needs special handling, so they are additionally logged to runs/OBSFAIL.log and runs/UNKNOWN.log, with data to reproduce the error.
 
@@ -236,7 +242,7 @@ src/
   oracle.ts      token-survival / convergence verdict         (oracle.test.ts)
   driver.ts      Obsidian CLI wrapper                         (driver.test.ts)
   cli-parse.ts   positively-recognized-output-only CLI parsers (cli-parse.test.ts; see docs/cli-trust.md)
-  alarm.ts       classify + log a correctness-assumption violation (-OBSFAIL/-UNKNOWN) (alarm.test.ts)
+  inconsistency.ts  classify + log a correctness-assumption violation (-OBSFAIL/-UNKNOWN) (inconsistency.test.ts)
   exec.ts        Local / Podman executors
   isolate.ts     fault primitives (network partition / sync toggle)
   net.ts         host-internet connectivity probe (tells a Sync stall apart from a host outage)
@@ -266,8 +272,8 @@ Makefile         podman lifecycle: build -> login -> capture -> containers-up ->
 - Stopping Sync from working via network vs via obsidian-cli commands changes the behavior (and the bugs found). What if we also fully restarted Obsidian as a history command? (as it can happen in e.g. iOS because of memory pressure)
 - The Obsidian Sync driving code could be made generic to work on other sync backends. Would e.g. Obsidian-on-iCloud lose more or less data? What about Syncthing, etc?
 - In fact, the very Obsidian driving could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *lossy* it was.
-- The Mac node (`M`) currently works on the (assumed Mac) host's Obsidian instance, which limits what can be done with it: e.g., no network faults. It could be interesting to use `tart` to have a macOS VM and treat it as another container — provisioning it might be simpler than it sounds: an Obsidian developer's own forum comment says Sync credentials live in IndexedDB inside the app's appdata folder (not the OS Keychain), so copying that folder into a fresh VM may carry the login over, similar to how the container image already bakes one in.
-- A nearer-term alternative for real network isolation without a VM: a narrowly-scoped `pfctl` anchor blocking only Obsidian Sync's own traffic (not a broad default-deny), paired with a session-scoped sudoers grant set up/torn down per soak (`make pf-setup`/`make pf-teardown`, restricted to exact `pfctl` args) and an exit hook to flush it on any normal exit. Would reverse the current "Mac always connected" premise, so it needs its own design pass.
+- The local node (`L`) currently works directly on the host's own Obsidian instance (in practice, so far, a Mac), which limits what can be done with it: e.g., no network faults. It could be interesting to use `tart` to have a macOS VM and treat it as another container — provisioning it might be simpler than it sounds: an Obsidian developer's own forum comment says Sync credentials live in IndexedDB inside the app's appdata folder (not the OS Keychain), so copying that folder into a fresh VM may carry the login over, similar to how the container image already bakes one in.
+- A nearer-term alternative for real network isolation without a VM (on macOS specifically): a narrowly-scoped `pfctl` anchor blocking only Obsidian Sync's own traffic (not a broad default-deny), paired with a session-scoped sudoers grant set up/torn down per soak (`make pf-setup`/`make pf-teardown`, restricted to exact `pfctl` args) and an exit hook to flush it on any normal exit. Would reverse the current "local instance always connected" premise, so it needs its own design pass.
 
 
 ## Tooling

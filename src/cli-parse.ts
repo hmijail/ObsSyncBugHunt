@@ -4,7 +4,7 @@
 // valid answer to the exact question asked (a known success shape, or the canonical
 // "absent" form). Anything else — empty where unexpected, an unknown `Error:`, junk, or a
 // shape we don't model — returns the UNRECOGNIZED sentinel. The driver turns UNRECOGNIZED
-// into a fatal CliUnrecognizedOutput → ALARM/abort, so a future obsidian-cli format change
+// into a fatal CliUnrecognizedOutput → flagged inconsistency/abort, so a future obsidian-cli format change
 // halts loudly instead of silently mis-scoring. "Looks like it isn't an error" is NOT
 // enough; the output must affirmatively match a known answer.
 

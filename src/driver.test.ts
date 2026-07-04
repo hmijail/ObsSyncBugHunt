@@ -123,7 +123,7 @@ class FixedExecutor implements Executor {
 test("syncStateProbe: a timed-out (killed) sync:status reads as 'timeout', not an outage or an inferred state", async () => {
   const exec = new FixedExecutor({ killed: true });
   const d = new ObsidianDriver(exec);
-  assert.equal(await d.syncStateProbe(5000), "timeout"); // never enters the killed→ALARM path; no unconfirmed guess
+  assert.equal(await d.syncStateProbe(5000), "timeout"); // never enters the killed→CliInconsistencyError path; no unconfirmed guess
   assert.equal(exec.lastTimeoutMs, 5000); // the short cap was actually applied to the call
 });
 

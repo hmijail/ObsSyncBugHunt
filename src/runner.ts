@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import { formatToken, type NodeId } from "./types.js";
 import { ObsidianDriver, isConflictFile } from "./driver.js";
-import { AlarmError } from "./alarm.js";
+import { CliInconsistencyError } from "./inconsistency.js";
 import type { Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import {
@@ -92,7 +92,7 @@ async function waitForQuiescence(
 
     // syncStatus()'s own contract guarantees a value or a throw (see the comment above) — this
     // is checking OUR OWN code held that contract, not a new black-box inconsistency, so assert
-    // is the right tool (unlike gatherObservation's AlarmError below, which IS a real finding).
+    // is the right tool (unlike gatherObservation's CliInconsistencyError below, which IS a real finding).
     for (const p of probes) assert(p.state !== null, `syncStatus on ${p.node} returned no status`);
 
     consecutiveSynced = probes.every((p) => p.state === "synced") ? consecutiveSynced + 1 : 0;
@@ -108,9 +108,9 @@ export async function gatherObservation(d: ObsidianDriver, note: string): Promis
   // Anchor (positive identification of the listing): if the note reads as PRESENT, the
   // folder listing MUST contain it. A listing that omits a note we just read is self-
   // inconsistent and can fabricate a false "loss" (see docs/cli-trust.md's founding incident) —
-  // don't trust such a listing; raise a loud ALARM instead.
+  // don't trust such a listing; flag it as an inconsistency instead.
   if (canonical !== null && !files.includes(`${note}.md`)) {
-    throw new AlarmError("cli-listing-inconsistent", {
+    throw new CliInconsistencyError("cli-listing-inconsistent", {
       node: d.node, note, listedCount: files.length,
       detail: "note read as present but absent from `files` listing — listing untrustworthy",
     });
