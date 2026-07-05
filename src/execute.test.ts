@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ObsidianDriver } from "./driver.js";
 import { crossCheckFs, waitForSynced, runHistory } from "./execute.js";
 import { CliInconsistencyError } from "./inconsistency.js";
@@ -101,6 +104,44 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
   const byNode = (n: string) => observations.find((o) => o.node === n)!;
   assert.ok(sameConflictSet(byNode("n1").conflicts, byNode("n2").conflicts), "both nodes' conflict sets agree at the settle");
   assert.equal(byNode("n2").conflicts.length, 1, "the lagging node caught up before the settle returned");
+});
+
+// --- the SYNCBAD-masks-LOST fix: a stable DISAGREEMENT must not finalize as "done" -------------
+// Both nodes report `synced` the ENTIRE time (so `everySynced` is always true) but disagree on
+// canonical content for a while — stable, so the OLD code (stability-only `done`) would have
+// finalized immediately and mislabeled this -SYNCBAD. It only converges after `agreeAtMs`.
+class DisagreeingExecutor implements Executor {
+  private start = Date.now();
+  constructor(readonly id: string, private readonly ownContent: string, private readonly agreedContent: string, private readonly agreeAtMs: number, private readonly note: string = NOTE) {}
+  private elapsed() { return Date.now() - this.start; }
+  async exec(args: string[]): Promise<ExecResult> {
+    const r = (stdout: string): ExecResult => ({ argv: ["podman", "exec", this.id, "obs", ...args], code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
+    const cmd = args[0];
+    if (cmd === "sync:status") return r("status: synced"); // always synced — the whole point
+    if (cmd === "sync:history") return r("3");
+    if (cmd === "files") return r(`${this.note}.md`); // the note this driver's read() actually answers for
+    if (cmd === "read") return r(this.elapsed() < this.agreeAtMs ? this.ownContent : this.agreedContent);
+    return r("");
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+test("waitForSynced: a stable but DIVERGED state does not finalize as done — keeps polling until real convergence", async () => {
+  const n1 = new ObsidianDriver(new DisagreeingExecutor("n1", "(n1-1-a)", "(agreed-a)", 150));
+  const n2 = new ObsidianDriver(new DisagreeingExecutor("n2", "(n2-1-a)", "(agreed-a)", 150));
+  const noLog = { log() {} } as unknown as RunLogger;
+  const { observations, timedOut, unsynced } = await waitForSynced(
+    [n1, n2], [NOTE], 0.05, // 50ms quiet window — plenty of polls fit inside the 150ms divergence
+    { noteName: (l) => l, pollSec: 0.02, minFloorSec: 0, probeSec: 0.03, capSec: 5, hostCheck: false },
+    noLog,
+  );
+  assert.equal(timedOut, false); // never gives up — see the settle's own doc comment
+  assert.equal(unsynced, false);
+  const byNode = (n: string) => observations.find((o) => o.node === n)!;
+  assert.equal(byNode("n1").canonical, "(agreed-a)", "waited past the stable disagreement for real convergence");
+  assert.equal(byNode("n2").canonical, "(agreed-a)");
 });
 
 // --- W's scope: the active node + active note only, not every online driver -------------
@@ -242,12 +283,17 @@ test("assertLocalSyncOn: a local instance whose Sync is paused aborts the whole 
 });
 
 test("assertLocalSyncOn: an inconclusive probe (syncing / timed-out / unreadable) is tolerated, not treated as off", async () => {
-  for (const syncStatus of ["syncing", "killed" as const, "bogus-status-word"]) {
+  for (const value of ["syncing", "killed" as const, "bogus-status-word"]) {
     const vault = new Map<string, string>();
-    const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, syncStatus));
+    // Sequenced, not constant: "synced" (satisfies waitNodesSynced's own poll), then the
+    // inconclusive value ONCE (assertLocalSyncOn's append-triggered probe must tolerate it, not
+    // treat it as off), then back to "synced" (so the final settle — now unbounded, no give-up —
+    // actually completes; a driver that never resolves would hang forever by design, which is
+    // correct in production but untestable here).
+    const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, ["synced", value, "synced"], true));
     const noLog = { log() {} } as unknown as RunLogger;
     await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
-      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
     }); // resolves without throwing for every one of these states
   }
 });
@@ -281,4 +327,128 @@ test("assertLocalSyncOn: an off-state that persists through every grace attempt 
     }),
     /local node's Sync is not on.*"error"/,
   );
+});
+
+// --- opt-in would-fail snapshot judgment (P and W) --------------------------------------
+// A single-driver in-memory vault whose content "vanishes" (files/read start reporting
+// not-found) after `vanishAtMs` — simulates an acked token going missing, observable at a LATER
+// P/W snapshot. A single driver trivially "converges" with itself, so the final settle always
+// completes normally regardless (no hang risk from Fix 1/2's unbounded/convergence-gated wait).
+class VanishingExecutor implements Executor {
+  id = "n1";
+  private vault = new Map<string, string>();
+  private start = Date.now();
+  constructor(private readonly vanishAtMs: number) {}
+  private elapsed() { return Date.now() - this.start; }
+  private gone() { return this.elapsed() >= this.vanishAtMs; }
+  async exec(args: string[]): Promise<ExecResult> {
+    const r = (stdout: string): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
+    const params = Object.fromEntries(args.slice(1).map((a) => {
+      const i = a.indexOf("=");
+      return i < 0 ? [a, ""] : [a.slice(0, i), a.slice(i + 1)];
+    }));
+    const notFound = (file: string) => r(`Error: File "${file}" not found.`);
+    switch (args[0]) {
+      case "sync:status": return r("status: synced");
+      case "sync:history": return !this.gone() && this.vault.has(params.file) ? r("1") : notFound(params.file);
+      case "files": return r(this.gone() ? "" : [...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
+      case "read": return !this.gone() && this.vault.has(params.file) ? r(this.vault.get(params.file)!) : notFound(params.file);
+      case "create": {
+        const file = params.path ? params.path.replace(/\.md$/, "") : params.name;
+        this.vault.set(file, params.content ?? "");
+        return r(`Created: ${file}`);
+      }
+      case "append": {
+        const prev = this.vault.get(params.file) ?? "";
+        this.vault.set(params.file, prev ? `${prev}\n${params.content}` : params.content);
+        return r(`Appended to: ${params.file}`);
+      }
+      case "open": return r(`Opened: ${params.file}`);
+      default: return r("");
+    }
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+test("checkWouldFail: a P snapshot reports would-fail (LOST) when enabled, and writes WOULDFAIL.log", async () => {
+  const tmpRunsDir = mkdtempSync(path.join(os.tmpdir(), "jepsen-wouldfail-"));
+  try {
+    const d = new ObsidianDriver(new VanishingExecutor(30));
+    const events: Record<string, unknown>[] = [];
+    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }], {
+      noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
+      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
+    });
+    const wf = events.filter((e) => e.kind === "would-fail");
+    assert.equal(wf.length, 1);
+    assert.equal(wf[0].suffix, "-LOST");
+  } finally {
+    rmSync(tmpRunsDir, { recursive: true, force: true });
+  }
+});
+
+test("checkWouldFail: a W also reports would-fail (LOST) when enabled", async () => {
+  const tmpRunsDir = mkdtempSync(path.join(os.tmpdir(), "jepsen-wouldfail-"));
+  try {
+    const d = new ObsidianDriver(new VanishingExecutor(30));
+    const events: Record<string, unknown>[] = [];
+    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }, { cmd: "wait" }], {
+      noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
+      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
+    });
+    const wf = events.filter((e) => e.kind === "would-fail");
+    assert.ok(wf.length >= 1);
+    assert.equal(wf[0].suffix, "-LOST");
+  } finally {
+    rmSync(tmpRunsDir, { recursive: true, force: true });
+  }
+});
+
+test("checkWouldFail: off by default — no would-fail event even for the exact same vanishing content", async () => {
+  const d = new ObsidianDriver(new VanishingExecutor(30));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }], {
+    noteName: (l) => `bughunt/${l}`, // wouldFailCheck not set — defaults off
+    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
+  });
+  assert.equal(events.filter((e) => e.kind === "would-fail").length, 0);
+});
+
+test("checkWouldFail: a stable node-vs-node DISAGREEMENT (SYNCBAD-shaped) is never reported, even when enabled", async () => {
+  const tmpRunsDir = mkdtempSync(path.join(os.tmpdir(), "jepsen-wouldfail-"));
+  try {
+    // Each node holds only its OWN token until agreeAtMs — nothing is missing everywhere (not
+    // LOST) and nothing repeats (not DUPL); the two disagree, which is exactly the shape
+    // checkWouldFail must ignore. agreeAtMs is set well AFTER the pause's would-fail check but
+    // still short, so the final settle (which requires real convergence — Fix 2) completes
+    // normally instead of racing/abandoning a genuinely unbounded wait. Tokens match exactly
+    // what execute.ts's real append loop will compute (formatToken's `seq` is a GLOBAL counter
+    // across the whole history, not per-node — n1's append is seq 1, n2's is seq 2 — so `read()`
+    // already "sees" the right token from its very first check and never needs create/append to
+    // do anything real).
+    // Agreed content keeps BOTH real tokens (merged) — the final verdict must be a clean PASS
+    // once converged, not a real LOST (which would trigger lostForensics' own server-history
+    // reads, unmodeled by this stub and irrelevant to what this test is actually checking).
+    const agreed = "(n1-1-a)\n(n2-2-a)";
+    const n1 = new ObsidianDriver(new DisagreeingExecutor("n1", "(n1-1-a)", agreed, 150, "bughunt/a"));
+    const n2 = new ObsidianDriver(new DisagreeingExecutor("n2", "(n2-2-a)", agreed, 150, "bughunt/a"));
+    const events: Record<string, unknown>[] = [];
+    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    await runHistory([n1, n2], new NoopIsolator(), logger, [
+      { cmd: "node", node: 1 }, { cmd: "append", note: "a" },
+      { cmd: "node", node: 2 }, { cmd: "append", note: "a" },
+      { cmd: "pause", seconds: 0.02 }, // fires well before agreeAtMs — still disagreeing here
+    ], {
+      noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
+      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
+    });
+    assert.equal(events.filter((e) => e.kind === "would-fail").length, 0);
+  } finally {
+    rmSync(tmpRunsDir, { recursive: true, force: true });
+  }
 });

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ObsidianDriver, isConflictFile } from "./driver.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
+import { CliInconsistencyError } from "./inconsistency.js";
 import type { Executor } from "./exec.js";
 import type { ExecResult } from "./types.js";
 
@@ -104,6 +105,19 @@ test("runRecognized: an attempt that ALWAYS times out gives up as CliUnrecognize
     () => d.syncVersionsTotal("bughunt/x.md"),
     (err: unknown) => err instanceof CliUnrecognizedOutput && err.recognizer === "parseTotal",
   );
+});
+
+test("appendLine: a timed-out attempt throws immediately as cli-mutation-unresponsive, NEVER retried", async () => {
+  // Unlike runRecognized/run, a mutation timeout must not be silently retried: confirmed live,
+  // retrying an append whose first attempt actually landed (just too slowly to report back)
+  // duplicated the token on disk. A single killed attempt here must throw right away.
+  const exec = new ScriptedExecutor([KILLED, "Appended to: bughunt/x"]); // the 2nd entry must NEVER be reached
+  const d = new ObsidianDriver(exec);
+  await assert.rejects(
+    () => d.appendLine("bughunt/x", "(n1-1-a)"),
+    (err: unknown) => err instanceof CliInconsistencyError && err.reason === "cli-mutation-unresponsive",
+  );
+  assert.equal(exec.calls, 1, "must not retry a mutation that may have already taken effect");
 });
 
 // One canned ExecResult for every exec — used to drive the bounded sync:status probe.

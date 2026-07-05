@@ -144,6 +144,22 @@ export class ObsidianDriver {
     }
   }
 
+  /** Like `run`, but for a non-idempotent content mutation (append/create/prepend): a timeout
+   *  here means we genuinely don't know whether the mutation already took effect before the
+   *  CLI's response was lost — retrying blindly risks silently duplicating content (confirmed
+   *  live: an append that timed out at the ~120s default, then succeeded on retry 5s later,
+   *  left its token appended TWICE — a harness-caused duplicate that would otherwise misattribute
+   *  a real Obsidian bug). Never retries: a single timeout throws immediately, ending this rep as
+   *  -UNKNOWN rather than risking a silent duplicate. `open`/`deleteNote`/`syncResume`/
+   *  `syncPause` stay on `run()` — genuinely idempotent, safe to retry. */
+  private async runMutationOnce(command: string, params: string[] = []): Promise<ExecResult> {
+    const raw = await this.executor.exec([command, ...params]);
+    if (raw.killed) {
+      throw new CliInconsistencyError("cli-mutation-unresponsive", { node: this.node, command, durationMs: raw.durationMs });
+    }
+    return raw;
+  }
+
   /** Like `run`, but for a raw node-shell command (FS second-source); same untimely-retry. */
   private async runShell(argv: string[]): Promise<ExecResult> {
     for (let attempt = 1; ; attempt++) {
@@ -178,21 +194,21 @@ export class ObsidianDriver {
     // (with the .md extension). read/append/open/delete take `file=` with the folder path.
     const p = name.includes("/") ? [`path=${name}.md`] : [`name=${name}`];
     if (content) p.push(`content=${content}`);
-    const raw = await this.run("create", p);
+    const raw = await this.runMutationOnce("create", p);
     this.expect(raw, parseMutation);
     return { ok: true, value: raw.stdout.trim(), raw };
   }
 
   /** Appends `line` plus a trailing newline. */
   async appendLine(name: string, line: string): Promise<OpResult> {
-    const raw = await this.run("append", [`file=${name}`, `content=${line}`]);
+    const raw = await this.runMutationOnce("append", [`file=${name}`, `content=${line}`]);
     this.expect(raw, parseMutation);
     return { ok: true, value: raw.stdout.trim(), raw };
   }
 
   /** Prepends `line` to the top of the note. */
   async prependLine(name: string, line: string): Promise<OpResult> {
-    const raw = await this.run("prepend", [`file=${name}`, `content=${line}`]);
+    const raw = await this.runMutationOnce("prepend", [`file=${name}`, `content=${line}`]);
     this.expect(raw, parseMutation);
     return { ok: true, value: raw.stdout.trim(), raw };
   }

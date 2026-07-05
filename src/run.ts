@@ -42,14 +42,19 @@
 //   --generate       print N generated histories and exit (no nodes touched)
 //   --skip-host-check  skip the host-online preflight
 //   --vault-path     vault's on-disk root for the FS cross-check (default /root/vaults/TestVault)
-//   --poll-sec / --min-floor-sec / --cap-sec / --max-cap-sec / --w-settle-sec / --final-settle-sec
-//                    sync-wait tuning — cap-sec/max-cap-sec: see execute.ts's Liveness tracking
-//                    (a node whose sync state keeps changing isn't wedged, just slow; cap-sec is
-//                    how long it may go completely unchanging before we give up, max-cap-sec is
-//                    the absolute outer ceiling regardless of activity)
+//   --poll-sec / --min-floor-sec / --cap-sec / --w-settle-sec / --final-settle-sec
+//                    sync-wait tuning. There is no give-up deadline: Sync is an uncontrollable,
+//                    necessary external resource, so a settle/baseline wait is unbounded — it
+//                    waits for a real result rather than manufacturing an inconclusive timeout.
+//                    cap-sec only gates when to ALSO start checking whether the HOST itself is
+//                    offline (a different question from Sync's own health).
 //   --probe-sec      per-call cap on the settle's sync:status probe (default 5; it blocks until synced)
 //   --runs-prefix    parent dir for runs/ (default: cwd, i.e. plain ./runs)
 //   --skip-snapshot-timing  omit the pause-snapshot's per-call `ms` fields (debug aid, on by default)
+//   --would-fail-check  opt-in early-warning: during a P/W with every relevant node online, judge
+//                    a fresh observation against the real oracle; log `would-fail` (+ WOULDFAIL.log)
+//                    on LOST/DUPL. Off by default — every check here is a real extra CLI call (see
+//                    execute.ts's checkWouldFail for why that matters).
 //
 // Mirrors all stdout to a timestamped log under runs/ (invocation as its first line).
 //
@@ -63,7 +68,7 @@ import { PodmanExecutor, LocalExecutor, runProcess } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
-import { runHistory, trackLiveness, isWedged, type ExecuteOpts, type Liveness } from "./execute.js";
+import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, normalize, usesLocal, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
@@ -113,7 +118,6 @@ const { values } = parseArgs({
     "poll-sec": { type: "string" },
     "min-floor-sec": { type: "string" },
     "cap-sec": { type: "string" },
-    "max-cap-sec": { type: "string" },
     "w-settle-sec": { type: "string" },
     "final-settle-sec": { type: "string" },
     "probe-sec": { type: "string" },
@@ -121,6 +125,7 @@ const { values } = parseArgs({
     "vault-path": { type: "string" },
     "runs-prefix": { type: "string" },
     "skip-snapshot-timing": { type: "boolean" },
+    "would-fail-check": { type: "boolean" },
   },
 });
 
@@ -235,7 +240,6 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
   minFloorSec: Number(values["min-floor-sec"] ?? 3),
   capSec: Number(values["cap-sec"] ?? 120),
-  maxCapSec: Number(values["max-cap-sec"] ?? 600),
   wSettleSec: Number(values["w-settle-sec"] ?? 4),
   finalSettleSec: Number(values["final-settle-sec"] ?? 15),
   probeSec: Number(values["probe-sec"] ?? 5),
@@ -245,6 +249,8 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   obsidianVersion: await obsidianVersion(),
   localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
   localObsidianVersion: await localObsidianVersion(),
+  wouldFailCheck: !!values["would-fail-check"], // off by default — see execute.ts's checkWouldFail
+  runsDir: runsRoot,
 };
 
 // Human-readable wall-clock stamp DDTHHMMSS (local time), e.g. 25T181530 — used for both the
@@ -497,27 +503,16 @@ async function preflight(): Promise<boolean> {
     }
   }
 
-  // Wait until every node is `synced` (or something is clearly wrong) before trusting a count
-  // comparison: during the initial sync, note counts legitimately differ. A node's reported
-  // state may transiently show "error" right after `containers-up` (e.g. while it's still
-  // settling in) — that's not treated as fatal on its own; only a node whose state stays
-  // completely unchanging for a full `cap` window (isWedged), or the absolute `maxCap`
-  // ceiling, ends the wait early (same liveness tracking as execute.ts's settle loop).
-  const cap = execBase.capSec ?? 120;
-  const maxCap = execBase.maxCapSec ?? 600;
-  const absoluteStart = Date.now();
+  // Wait until every node is `synced` before trusting a count comparison: during the initial
+  // sync, note counts legitimately differ. A node's reported state may transiently show "error"
+  // right after `containers-up` (e.g. while it's still settling in) — that's tolerated, not
+  // fatal: there's no give-up deadline here, same reasoning as execute.ts's settle loop (Sync is
+  // an uncontrollable, necessary external resource). Only a genuinely unreachable node (a down
+  // or absent container) ends this early.
   let rows = await Promise.all(drivers.map(readState));
-  let liveness: Liveness = { lastStates: null, lastChangeAt: absoluteStart };
-  liveness = trackLiveness(liveness, rows.map((r) => r.state), Date.now());
-  while (
-    rows.every((r) => r.reachable) &&
-    !rows.every((r) => r.state === "synced") &&
-    !isWedged(liveness, Date.now(), cap * 1000) &&
-    Date.now() - absoluteStart < maxCap * 1000
-  ) {
+  while (rows.every((r) => r.reachable) && !rows.every((r) => r.state === "synced")) {
     await sleep(2000);
     rows = await Promise.all(drivers.map(readState));
-    liveness = trackLiveness(liveness, rows.map((r) => r.state), Date.now());
   }
   for (const r of rows) console.log(`preflight ${r.node}: status=${r.state} notes=${r.notes}`);
 
@@ -526,14 +521,10 @@ async function preflight(): Promise<boolean> {
     console.log("preflight FAILED — a node is unreachable (is `make containers-up` done?). Aborting.");
     return false;
   }
-  // A node that won't reach `synced` (wedged on a stuck state, or still `syncing`/paused past
-  // the cap) is a sick baseline — soaking on it just burns reps into -TIMEOUTs. Abort so
-  // it's recreated/healed first rather than silently degrading the run.
-  const unhealthy = rows.filter((r) => r.state !== "synced");
-  if (unhealthy.length > 0) {
-    console.log(`preflight UNHEALTHY: node(s) not synced after ${cap}s (${unhealthy.map((r) => `${r.node}:${r.state}`).join(" ")}) — recreate with 'make containers-up' (or wait for recovery); aborting.`);
-    return false;
-  }
+  // The loop above only exits once every reachable node is synced (or a node is unreachable,
+  // handled above) — this is checking OUR OWN loop held that contract, not a new black-box
+  // finding, so assert is the right tool (see docs/cli-trust.md).
+  assert(rows.every((r) => r.state === "synced"), "preflight's wait loop only exits once every reachable node is synced");
   // All synced now, so a note-count disagreement is real divergence, not lag.
   if (new Set(rows.map((r) => r.notes)).size > 1) {
     const detail = rows.map((r) => `${r.node}=${r.notes}`).join(" ");

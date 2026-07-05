@@ -9,6 +9,8 @@
 // as a severity witness.
 
 import assert from "node:assert/strict";
+import { appendFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { formatToken, NOTE_DIR, type NodeId } from "./types.js";
 import { isConflictFile, type ObsidianDriver } from "./driver.js";
 import { CliInconsistencyError } from "./inconsistency.js";
@@ -29,28 +31,29 @@ export interface ExecuteOpts {
   noteName: (letter: string) => string; // DSL note letter -> concrete vault note name (per-rep)
   pollSec?: number; // observation poll cadence (default 1)
   minFloorSec?: number; // observe at least this long (catches slow-to-start syncs after C; default 3)
-  capSec?: number; // how long a driver's reported sync state may stay completely unchanging before
-                    // it's presumed wedged (default 120) — see trackLiveness/isWedged
-  // Absolute outer ceiling on a settle/baseline wait, regardless of activity (default 600 = 10min):
-  // a node whose state keeps changing (see capSec above) is granted more time than capSec alone,
-  // but not forever — this bounds the worst case.
-  maxCapSec?: number;
-  // Settled = every node reports `synced` AND the observed state has been unchanged
-  // for this window. Convergence is judged separately by the oracle, so a stable but
-  // divergent state finishes here (as `-SYNCBAD`) instead of waiting out the cap. The
-  // window absorbs a just-lagging conflict file; keep it short since `synced` already
-  // means "Sync is idle".
+  // How long to wait, once not-yet-done, before ALSO checking whether the host itself might be
+  // offline (default 120) — see waitForSynced. Sync itself is an uncontrollable, necessary
+  // external resource: there is no principled point at which "it's been a while" means "it's
+  // never coming", so this is NOT a give-up deadline — waitForSynced/waitNodesSynced/preflight()
+  // all wait unboundedly for a real settle. Every step is still logged (settle-poll), so an
+  // unusually long rep is visible after the fact (e.g. by comparing timings across a history's
+  // reps), just never aborted mid-flight.
+  capSec?: number;
+  // Settled = every node reports `synced`, the observed state (canonical + conflicts) has been
+  // unchanged for this window, AND every node agrees on it. A stable DISAGREEMENT does not
+  // finish here — see waitForSynced's own doc comment for why. The window absorbs a
+  // just-lagging conflict file; keep it short since `synced` already means "Sync is idle".
   wSettleSec?: number; // mid-history W: quiescent-for window (default 4)
   finalSettleSec?: number; // final settle: quiescent-for window (default 15)
   // Per-call cap on the settle's `sync:status` probe (default 5). `sync:status` blocks until
   // synced, so this bounds it into a pollable "synced yet?" — a timeout means "still syncing".
   // Must stay comfortably above a synced node's instant reply, well below the settle window.
   probeSec?: number;
-  // When a settle/baseline wait is about to give up (capSec/maxCapSec exhausted), tell a Sync
-  // failure apart from a host-internet outage: if the host itself is offline, wait for
-  // connectivity to return and restart the window instead of recording a false timeout. Disabled
-  // by --skip-host-check — a sandbox with no outbound TCP would otherwise treat the cap as a
-  // permanent outage and wait forever. Default on.
+  // Once capSec has elapsed without a settle, tell a Sync failure apart from a host-internet
+  // outage: if the host itself is offline, wait for connectivity to return and restart the
+  // window instead of recording a false timeout. Disabled by --skip-host-check — a sandbox with
+  // no outbound TCP would otherwise treat this as a permanent outage and wait forever anyway
+  // (which is often still the right call, just with less useful logging). Default on.
   hostCheck?: boolean;
   // Per-call `ms` timing on the pause-snapshot (debug/observability aid — see the "pause"
   // case, useful for spotting a slow snapshot call). Default ON; --skip-snapshot-timing turns
@@ -72,6 +75,12 @@ export interface ExecuteOpts {
   // Overridable so tests don't wait the real ~15s worst case — see assertLocalSyncOn.
   localSyncGraceMs?: number;
   localSyncGraceAttempts?: number;
+  // Opt-in early-warning check (default OFF — see checkWouldFail's own doc comment for why this
+  // must stay opt-in): during a P or W with every relevant driver online, run the real oracle
+  // judgment against a fresh observation right now, logging a `would-fail` event (+ durable
+  // WOULDFAIL.log under `runsDir`) if it comes back LOST or DUPL.
+  wouldFailCheck?: boolean;
+  runsDir?: string; // where WOULDFAIL.log lives when wouldFailCheck is on (default "runs")
 }
 
 export interface LostForensic {
@@ -111,32 +120,26 @@ function signature(notes: string[], obs: NodeObservation[]): string {
   return parts.join("\n");
 }
 
+/** Whether every driver's observation for `note` agrees — same canonical content AND the same
+ *  conflict-file set. Required (alongside `everySynced` + quiet) before the settle accepts a
+ *  state as truly "done" — see waitForSynced. */
+function noteConverged(note: string, obs: NodeObservation[]): { first: NodeObservation | undefined; allEqual: boolean } {
+  const g = obs.filter((o) => o.note === note);
+  const first = g[0];
+  const allEqual = first != null && g.every((o) =>
+    (o.canonical ?? null) === (first.canonical ?? null) && sameConflictSet(o.conflicts, first.conflicts));
+  return { first, allEqual };
+}
+function allNotesConverged(notes: string[], obs: NodeObservation[]): boolean {
+  return notes.every((note) => noteConverged(note, obs).allEqual);
+}
+
 /** A node's own sync state via the BOUNDED probe, e.g. "synced" / "syncing" / "timeout" (killed
  *  before a reply came back — not positively confirmed as any specific state) / "?" (unreadable).
  *  Bounded so the settle loop polls instead of blocking ~70s on `sync:status` (which would
  *  straddle the quiescence window and fabricate a `-SYNCBAD` — see waitForSynced). */
 async function syncState(d: ObsidianDriver, probeMs: number): Promise<string> {
   return d.syncStateProbe(probeMs);
-}
-
-// --- liveness tracking: "is it still visibly doing something, or wedged?" -----------------
-//
-// The same question comes up in three places (waitForSynced, waitNodesSynced, and run.ts's
-// preflight): a node stuck reporting the SAME non-synced state forever is a real problem, but a
-// node whose reported state keeps CHANGING (even cycling through "error") is evidence it's still
-// alive — just slow, e.g. recovering from a reconnect or waiting on a busy Sync server. Treating
-// every state change as liveness (not just "syncing") means a flat capSec deadline no longer
-// mistakes that kind of churn for a wedge; maxCapSec is the separate, absolute backstop so a node
-// that flaps forever without ever landing on "synced" still eventually gives up.
-export interface Liveness { lastStates: string[] | null; lastChangeAt: number }
-export function trackLiveness(prev: Liveness, states: string[], now: number): Liveness {
-  const changed = prev.lastStates === null
-    || states.length !== prev.lastStates.length
-    || states.some((s, i) => s !== prev.lastStates![i]);
-  return { lastStates: states, lastChangeAt: changed ? now : prev.lastChangeAt };
-}
-export function isWedged(liveness: Liveness, now: number, capMs: number): boolean {
-  return now - liveness.lastChangeAt > capMs; // no state activity for a full capMs window
 }
 
 const HOST_RECHECK_MS = 5_000; // recheck host connectivity every 5s while it's down
@@ -204,16 +207,27 @@ async function assertLocalSyncOn(driver: ObsidianDriver, opts: ExecuteOpts, logg
 
 /**
  * Wait until the vault has SETTLED for `notes` across `drivers`: every node reports
- * `synced` (Sync's own "idle" signal) AND the full observed state (each node's
- * canonical content AND conflict-file set) has been unchanged for `settleSec`.
- * Crucially, settling does NOT require the nodes to AGREE — a stable disagreement
- * (e.g. a conflict file that only ever lands on one node, both nodes calling
- * themselves synced) is a real divergence for the oracle to judge as `-SYNCBAD`, not
- * something to wait out to the cap (which would mislabel it `-TIMEOUT`). The quiet
- * window means we never stop mid-propagation; `minFloorSec` guards the just-after-
- * connect case where a sync hasn't started yet. No blind dwell — this is the explicit
- * wait. Only a node that never reaches `synced` while ALSO showing no further state
- * activity (see isWedged), or content that never stops changing, actually times out.
+ * `synced` (Sync's own "idle" signal), the full observed state (each node's canonical
+ * content AND conflict-file set) has been unchanged for `settleSec`, AND every node
+ * AGREES on it. That last requirement is deliberate: a STABLE DISAGREEMENT (both
+ * nodes calling themselves synced, content quiet, but disagreeing, no conflict file)
+ * would be a genuinely catastrophic Obsidian bug if it were truly permanent — far
+ * more likely, `sync:status` said "synced" before a real round-trip actually
+ * finished. So this never finalizes on a disagreement; it keeps polling, which
+ * already re-samples real content (not just the `sync:status` word) every cycle —
+ * enough to notice a later real resolution (a merge, or a conflict file appearing)
+ * whenever it actually happens. This does NOT block genuine loss detection: a token
+ * that's truly, permanently gone from every node reads as CONVERGED (everyone
+ * agrees it's absent) — only an active node-vs-node disagreement fails to converge.
+ *
+ * There is no give-up deadline. Sync is an uncontrollable, necessary external
+ * resource — there's no principled point at which "it's been a while" means "it's
+ * never coming". Every poll is logged (`settle-poll`), so an unusually long rep is
+ * still visible after the fact (e.g. comparing timings across a history's reps),
+ * just never aborted mid-flight. `minFloorSec` guards the just-after-connect gap
+ * before a sync has started; `capSec` only gates when to ALSO start checking
+ * whether the HOST itself is offline (a different question from Sync's own
+ * health) — not a deadline of its own.
  */
 export async function waitForSynced(
   drivers: ObsidianDriver[],
@@ -227,7 +241,6 @@ export async function waitForSynced(
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
-  const maxCapMs = (opts.maxCapSec ?? 600) * 1000;
   const probeMs = (opts.probeSec ?? 5) * 1000;
   if (notes.length === 0 || drivers.length === 0) {
     return { seconds: 0, timedOut: false, unsynced: false, observations: [], hostOutage: false };
@@ -239,12 +252,11 @@ export async function waitForSynced(
   // settle before the bounded-probe loop even starts (full story: docs/cli-trust.md). Gate on
   // the probe instead.
   let baseline: Record<string, number> | null = null;
-  const absoluteStart = Date.now();
-  let start = absoluteStart;
+  const start0 = Date.now();
+  let start = start0;
   let lastSig: string | null = null;
   let lastChange = start;
   let obs: NodeObservation[] = []; // last SYNCED snapshot; the verdict reuses it
-  let liveness: Liveness = { lastStates: null, lastChangeAt: start };
   let hostOutage = false;
   for (;;) {
     // 1. Bounded sync-state probe FIRST. We must NOT read content from a still-syncing node:
@@ -255,7 +267,6 @@ export async function waitForSynced(
     const states = await Promise.all(drivers.map((d) => syncState(d, probeMs)));
     const everySynced = states.every((s) => s === "synced");
     const probeWallMs = Date.now() - tProbe;
-    liveness = trackLiveness(liveness, states, Date.now());
 
     // 2. Only once every node is synced do we read content and re-sample the signature, so the
     //    quiet window is measured over synced, genuinely re-sampled snapshots (not a stale one).
@@ -274,28 +285,23 @@ export async function waitForSynced(
     const now = Date.now();
     const quietMs = everySynced ? now - lastChange : 0;
     const elapsed = now - start;
-    const sinceActivityMs = now - liveness.lastChangeAt;
-    // Settled = every node `synced` AND the observed state (canonical + conflict sets) quiet for
-    // the window. Convergence is NOT required — a stable, synced disagreement is a real `-SYNCBAD`
-    // for the oracle, not something to wait out to the cap. floorMs covers the just-after-connect
-    // gap before a sync starts.
-    const done = everySynced && obs.length > 0 && quietMs >= settleMs && elapsed >= floorMs;
+    // Settled = every node `synced`, the observed state (canonical + conflict sets) quiet for the
+    // window, AND every node agrees on it — see this function's own doc comment for why
+    // convergence is required, not just stability. floorMs covers the just-after-connect gap
+    // before a sync starts.
+    const done = everySynced && obs.length > 0 && quietMs >= settleMs && elapsed >= floorMs && allNotesConverged(notes, obs);
 
     // Per-poll trace so the settle's time-spend is visible: repeated states with probeMs≈cap and a
     // node reading "timeout" is genuine sync latency (the probe keeps getting killed at the cap
     // because the node genuinely isn't synced yet); a large gatherMs means a content read blocked.
-    // sinceActivitySec makes the liveness tracking itself visible: it stays low while a node's
-    // reported state keeps changing (even through "error"), and only grows once it's truly wedged.
     logger.log({
       kind: "settle-poll", elapsedSec: Math.round(elapsed / 1000), states, everySynced, sigChanged,
-      quietSec: Math.round(quietMs / 1000), probeMs: probeWallMs, gatherMs: gatherWallMs,
-      sinceActivitySec: Math.round(sinceActivityMs / 1000), ...context,
+      quietSec: Math.round(quietMs / 1000), probeMs: probeWallMs, gatherMs: gatherWallMs, ...context,
     });
 
-    // Cap elapsed without quiescence. Before recording a Sync timeout, rule out a HOST
-    // outage: if the host can't reach the internet, the container can't sync for
-    // reasons that aren't Obsidian's. Wait for connectivity to return, then restart the
-    // settle window and keep waiting rather than logging a false timeout.
+    // Once we've been waiting a while, ALSO rule out a HOST outage before continuing to poll: if
+    // the host can't reach the internet, the container can't sync for reasons that aren't
+    // Obsidian's. Wait for connectivity to return, then restart the window and keep waiting.
     if (!done && elapsed > capMs && opts.hostCheck !== false) {
       if (await waitForHostReconnect(logger, context)) {
         hostOutage = true;
@@ -303,63 +309,39 @@ export async function waitForSynced(
         lastChange = start;
         lastSig = null;
         obs = [];
-        liveness = { lastStates: null, lastChangeAt: start };
         continue;
       }
     }
-    // Liveness leniency: a node whose reported state keeps changing isn't wedged, just slow —
-    // don't time out while it's still visibly active, only once maxCapMs (the absolute ceiling,
-    // measured from this call's true start, never reset by a host-reconnect) is exhausted too.
-    const wedged = isWedged(liveness, now, capMs);
-    const hitCeiling = now - absoluteStart >= maxCapMs;
-    const timedOut = !done && elapsed > capMs && (wedged || hitCeiling);
-    if (done || timedOut) {
-      // On a timeout before any synced snapshot, take one best-effort observation so the verdict
-      // and forensics aren't empty-handed (the one place we read a node that isn't synced).
-      if (obs.length === 0) obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
-      // State-machine invariants: a clean settle means every node is synced AND its signature
-      // held for the whole window; anything else can only exit here by hitting the cap.
-      assert(everySynced || timedOut, "settle finishes only when every node is synced, or the cap elapsed");
-      assert(!done || quietMs >= settleMs, "a clean settle held its signature for the full window");
+    if (done) {
       const totals = await readTotals(drivers, notes);
-      baseline ??= totals; // straight-to-timeout (never synced) → no earlier baseline; use these
+      assert(baseline !== null, "done implies at least one everySynced pass, which sets baseline");
       const seconds = Math.round(elapsed / 1000);
-      // A note with no server-side history (total < 1) never reached the server —
-      // it is NOT synced however quiescent the local vault looks. Distinct from a
-      // timeout (which is inconclusive); this is a hard "nothing got there".
-      const unsynced = !timedOut && notes.some((n) => totals[n] < 1);
-      if (timedOut) {
-        // Capture each node's own sync state — a wedged node (e.g. stuck "syncing"
-        // after a network reconnect) is the usual cause and is worth seeing later.
-        for (const d of drivers) {
-          logger.log({ kind: "status-at-timeout", node: d.node, state: await syncState(d, probeMs) });
-        }
-      }
+      // A note with no server-side history (total < 1) never reached the server — it is NOT
+      // synced however quiescent the local vault looks. A real, standalone finding.
+      const unsynced = notes.some((n) => totals[n] < 1);
+      assert(quietMs >= settleMs, "a clean settle held its signature for the full window");
       // Snapshot the settled content for the audit trail — a time series across the
       // run's W's catches a token that vanished then recovered before the final check
       // (which only ever sees the end state). When all nodes agree on a note, log ONE
       // `converged:true` row instead of one-per-node so the reader isn't left diffing
       // identical rows; only a real divergence is broken out per node.
       for (const note of notes) {
-        const g = obs.filter((o) => o.note === note);
-        const first = g[0];
-        const allEqual = first != null && g.every((o) =>
-          (o.canonical ?? null) === (first.canonical ?? null) && sameConflictSet(o.conflicts, first.conflicts));
+        const { first, allEqual } = noteConverged(note, obs);
         if (allEqual) {
-          logger.log({ kind: "content-at-wait", note, converged: true, canonical: first.canonical, conflicts: first.conflicts, ...context });
+          logger.log({ kind: "content-at-wait", note, converged: true, canonical: first!.canonical, conflicts: first!.conflicts, ...context });
         } else {
-          for (const o of g) logger.log({ kind: "content-at-wait", note, node: o.node, converged: false, canonical: o.canonical, conflicts: o.conflicts, ...context });
+          for (const o of obs.filter((x) => x.note === note)) logger.log({ kind: "content-at-wait", note, node: o.node, converged: false, canonical: o.canonical, conflicts: o.conflicts, ...context });
         }
       }
       for (const n of notes) {
-        const kind = timedOut ? "sync-timeout" : totals[n] < 1 ? "unsynced" : "synced";
+        const kind = totals[n] < 1 ? "unsynced" : "synced";
         logger.log({ kind, note: n, from: baseline[n], to: totals[n], seconds, ...context });
       }
       // Return THIS observation (the one that satisfied `done`): its signature held
       // unchanged across the whole settle window, so it's confirmed across many reads.
       // Callers must use it rather than a fresh re-read — a single `files` listing can
       // transiently drop a conflict file and fabricate a "loss".
-      return { seconds, timedOut, unsynced, observations: obs, hostOutage };
+      return { seconds, timedOut: false, unsynced, observations: obs, hostOutage };
     }
     await sleep(pollMs);
   }
@@ -414,33 +396,63 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
 /** Gate the start of a rep on a known-clean baseline: every node reporting `synced`. Uses the
  *  BOUNDED probe (syncStateProbe), same as waitForSynced's own poll — NOT the retrying
  *  syncStatus(), whose own internal retry-until-recognized loop can itself silently consume up
- *  to ~105s on a single poll attempt (see docs/cli-trust.md), independent of and underneath the
- *  capSec/maxCapSec liveness tracking below. A poll loop that's meant to be responsive (many
- *  quick samples, tracking whether state is still changing) needs each individual sample to
- *  actually be quick and boundable from the outside — an unboundable one defeats the purpose. */
-async function waitNodesSynced(drivers: ObsidianDriver[], capSec: number, maxCapSec: number, probeMs: number, logger: RunLogger): Promise<void> {
-  const capMs = capSec * 1000;
-  const maxCapMs = maxCapSec * 1000;
-  const absoluteStart = Date.now();
-  let liveness: Liveness = { lastStates: null, lastChangeAt: absoluteStart };
+ *  to ~105s on a single poll attempt (see docs/cli-trust.md). A poll loop that's meant to be
+ *  responsive needs each individual sample to actually be quick — an unboundable one defeats the
+ *  purpose. No give-up deadline, same reasoning as waitForSynced. */
+async function waitNodesSynced(drivers: ObsidianDriver[], probeMs: number, logger: RunLogger): Promise<void> {
   for (;;) {
     const states = await Promise.all(drivers.map((d) => syncState(d, probeMs)));
-    const now = Date.now();
-    liveness = trackLiveness(liveness, states, now);
     if (states.every((s) => s === "synced")) {
       const notes = await Promise.all(drivers.map(async (d) => (await d.listFiles()).value?.length ?? 0));
       logger.log({ kind: "baseline-synced", states, notes });
       return;
     }
-    // Same liveness leniency as waitForSynced: a node still visibly changing state (even
-    // cycling through "error") isn't wedged, just slow — only give up once it's been unchanging
-    // for a full capSec window, or maxCapSec elapses regardless.
-    if (isWedged(liveness, now, capMs) || now - absoluteStart >= maxCapMs) {
-      logger.log({ kind: "baseline-sync-timeout", states });
-      return;
-    }
     await sleep(1000);
   }
+}
+
+/** Opt-in early-warning check (ExecuteOpts.wouldFailCheck, default OFF). Called from both `P` and
+ *  `W` when every driver touching `notes` is online: runs the REAL oracle judgment against a
+ *  fresh observation right now, using the exact same paranoid gatherObservation() the final
+ *  settle uses (not the lighter pause-snapshot reads) — so this is genuinely "what would the
+ *  verdict be if we judged RIGHT NOW", not an approximation. Logs a `would-fail` event (+ durable
+ *  `<runsDir>/WOULDFAIL.log`, same append-one-JSON-line-per-hit shape as
+ *  inconsistency.ts's recordInconsistency) for LOST/DUPL only — SYNCBAD is deliberately never
+ *  reported here: per waitForSynced's own convergence requirement, a stable disagreement is
+ *  presumed a still-pending real sync, not a verdict an incomplete mid-history snapshot should
+ *  ever assert.
+ *
+ *  P and W are equally reliable (or unreliable) as a mid-history snapshot — neither is more
+ *  "trustworthy", they're both just an early look at a possibly-still-converging state. The
+ *  reason this is opt-in at all: every call here is a REAL extra CLI call (the same paranoid,
+ *  retrying reads the final judgment uses), and this project's whole premise is treating
+ *  Obsidian as a black box we must not accidentally influence — extra polling conceivably could
+ *  perturb Sync's own timing. Default off; a user who wants it can compare pass rates/timings
+ *  with it on vs. off. */
+async function checkWouldFail(
+  drivers: ObsidianDriver[],
+  offline: Set<number>,
+  touched: Set<string>,
+  acked: AckedEdit[],
+  opts: ExecuteOpts,
+  logger: RunLogger,
+  atSec: number,
+): Promise<void> {
+  if (!opts.wouldFailCheck || offline.size > 0 || touched.size === 0) return;
+  const notes = [...touched];
+  const obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
+  const verdict = checkRun(acked, obs);
+  const lost = verdict.notes.some((n) => n.lost.length > 0);
+  const dupl = verdict.notes.some((n) => n.duplicated.length > 0);
+  if (!lost && !dupl) return; // OK, or a SYNCBAD-shaped disagreement — neither is reported here
+  const suffix = lost ? "-LOST" : "-DUPL";
+  const rec = { atSec, suffix, verdict };
+  logger.log({ kind: "would-fail", ...rec });
+  try {
+    const runsDir = opts.runsDir ?? "runs";
+    mkdirSync(runsDir, { recursive: true });
+    appendFileSync(path.join(runsDir, "WOULDFAIL.log"), JSON.stringify(rec) + "\n");
+  } catch { /* even if we can't persist, the caller still has the logged event */ }
 }
 
 export async function runHistory(
@@ -462,7 +474,7 @@ export async function runHistory(
     isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, localObsidianVersion: opts.localObsidianVersion,
     wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
-    capSec: opts.capSec ?? 120, maxCapSec: opts.maxCapSec ?? 600, probeSec: opts.probeSec ?? 5,
+    capSec: opts.capSec ?? 120, probeSec: opts.probeSec ?? 5,
   });
 
   // Route the driver's cli-unresponsive (wait-for-recovery) events, and the isolator's own
@@ -497,7 +509,7 @@ export async function runHistory(
   // resumed once at harness startup (the real one-time paused state after `make containers-up`);
   // Sync stays on for the whole session from there.
   // Start from a known-clean baseline: don't begin editing until every node is synced.
-  await waitNodesSynced(drivers, opts.capSec ?? 120, opts.maxCapSec ?? 600, probeMs, logger);
+  await waitNodesSynced(drivers, probeMs, logger);
 
   let activeNode = 1;
   let activeNote: string | undefined;
@@ -582,6 +594,7 @@ export async function runHistory(
           }),
         );
         logger.log({ kind: "pause-snapshot", seconds: op.seconds, nodes: nodesSnapshot });
+        await checkWouldFail(drivers, offline, touched, acked, opts, logger, (Date.now() - startedAt) / 1000);
         break;
       }
       case "disconnect":
@@ -606,7 +619,6 @@ export async function runHistory(
         // client reports, not what other nodes/the network are seeing (that whole-system
         // "god's-eye" check is what the FINAL settle is for, across every node and note).
         // A W on a disconnected node can't make progress — NOP it rather than block.
-        // (waitForSynced is also hard-bounded by capSec/maxCapSec, so a W never hangs even online.)
         if (offline.has(activeNode)) {
           logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
           break;
@@ -614,6 +626,7 @@ export async function runHistory(
         if (activeNode === opts.localNode) hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
         const w = await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
         hostOutage ||= w.hostOutage;
+        await checkWouldFail(drivers, offline, touched, acked, opts, logger, (Date.now() - startedAt) / 1000);
         break;
       }
       case "append": {

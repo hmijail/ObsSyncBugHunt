@@ -111,13 +111,13 @@ real, in-use vault, the tester should keep your own notes safe.
 | `SKIP_HOST_CHECK` | `--skip-host-check` | off | skip the host-online checks: the startup preflight *and* the in-settle host-outage wait (set it where outbound TCP is blocked, else a stalled settle would wait forever) |
 | `POLL_SEC` | `--poll-sec` | 1 | how often (s) to re-read every node's state while waiting |
 | `MIN_FLOOR_SEC` | `--min-floor-sec` | 3 | observe at least this long before declaring done — catches a sync slow to *start* right after a reconnect |
-| `CAP_SEC` | `--cap-sec` | 120 | how long a node's reported sync state may stay completely unchanging before it's presumed wedged — a state still cycling (even through `error`) is granted more time, up to `MAX_CAP_SEC` |
-| `MAX_CAP_SEC` | `--max-cap-sec` | 600 | absolute outer ceiling on any single wait, regardless of activity; exceeding it is a `-TIMEOUT` (inconclusive) |
+| `CAP_SEC` | `--cap-sec` | 120 | how long to wait, once not-yet-settled, before ALSO checking whether the host itself is offline — not a give-up deadline: Sync is an uncontrollable, necessary external resource, so every settle/baseline wait is unbounded |
 | `W_SETTLE_SEC` | `--w-settle-sec` | 4 | for the `W` command: how long the `synced` state must hold |
 | `FINAL_SETTLE_SEC` | `--final-settle-sec` | 15 | end-of-history settle window; needs to cover a potential round-trip sync |
 | `PROBE_SEC` | `--probe-sec` | 5 | per-call cap on the settle's `sync:status` probe — it blocks until synced, so this bounds it into a pollable "synced yet?" (a timeout reads as *still syncing*) |
 | `RUNS_PREFIX` | `--runs-prefix` | *(cwd)* | parent dir for the whole `runs/` tree, so a soak's artifacts (logs, rep `.jsonl` files, `analysis.md`) can live somewhere other than the working directory |
 | `SKIP_SNAPSHOT_TIMING` | `--skip-snapshot-timing` | off | omit the pause-snapshot's per-call `ms` fields (a debug aid for diagnosing a slow snapshot, on by default) |
+| `WOULD_FAIL_CHECK` | `--would-fail-check` | off | opt-in early-warning: during a `P`/`W` with every relevant node online, judge a fresh observation against the real oracle; logs `would-fail` (+ `WOULDFAIL.log`) on LOST/DUPL. Off by default — every check is a real extra CLI call against the black box under test |
 
 # How it all works
 
@@ -203,14 +203,25 @@ The result of each repetition of the history is recorded in a JSONL file under t
 | `-DUPL` | a token is duplicated (nodes still converged) |
 | `-SYNCBAD` | nodes synced and settled but disagree |
 | `-NOUPLOAD` | a token was writen in a node but never reached the server |
-| `-TIMEOUT` | some node never finished syncing within the allowed time |
+| `-TIMEOUT` | (should no longer occur — see below) |
 | `-OBSFAIL` | obsidian-cli reports something but the filesystem disagrees |
 | `-UNKNOWN` | some situation couldn't be recognised |
 
-A settle only gives up when a node's reported sync state has been completely unchanging for
-`CAP_SEC`; a node still visibly cycling through states (even through `error`, e.g. right after a
-reconnect) is presumed alive and granted more time, up to `MAX_CAP_SEC` overall — so `-TIMEOUT`
-means "genuinely wedged or too slow even accounting for that," not "briefly touched `error` once."
+A settle never gives up: Sync is an uncontrollable, necessary external resource, so there's no
+principled point at which "it's been a while" means "it's never coming" — `waitForSynced`/the
+baseline gate/`preflight` all wait unboundedly for a real result rather than manufacturing an
+inconclusive timeout. `CAP_SEC` only gates when to *also* start checking whether the host itself
+is offline; every poll is still logged, so an unusually long rep remains visible after the fact
+(e.g. comparing timings across a history's reps) without ever being aborted mid-flight. `-TIMEOUT`
+is kept as a known outcome code structurally, but should now be unreachable in practice.
+
+Similarly, a settle never finalizes on a stable *disagreement* between nodes — only on genuine
+convergence (including a stable, agreed-upon absence, which is exactly what `-LOST` needs to be
+detected at all). A stable node-vs-node disagreement is presumed to be a still-pending real sync
+that `sync:status` hasn't caught up to reporting yet, not a final verdict, so the settle keeps
+polling (which already re-samples real content every cycle, not just the status word) rather than
+reporting `-SYNCBAD` prematurely. `-SYNCBAD` should therefore be rare — if it ever surfaces, it
+survived genuinely unbounded waiting, which is itself a noteworthy finding.
 
 
 OBSFAIL and UNKNOWN mean that something is seriously wrong and needs special handling, so they are additionally logged to runs/OBSFAIL.log and runs/UNKNOWN.log, with data to reproduce the error.
@@ -274,6 +285,7 @@ Makefile         podman lifecycle: build -> login -> capture -> containers-up ->
 - In fact, the very Obsidian driving could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *lossy* it was.
 - The local node (`L`) currently works directly on the host's own Obsidian instance (in practice, so far, a Mac), which limits what can be done with it: e.g., no network faults. It could be interesting to use `tart` to have a macOS VM and treat it as another container — provisioning it might be simpler than it sounds: an Obsidian developer's own forum comment says Sync credentials live in IndexedDB inside the app's appdata folder (not the OS Keychain), so copying that folder into a fresh VM may carry the login over, similar to how the container image already bakes one in.
 - A nearer-term alternative for real network isolation without a VM (on macOS specifically): a narrowly-scoped `pfctl` anchor blocking only Obsidian Sync's own traffic (not a broad default-deny), paired with a session-scoped sudoers grant set up/torn down per soak (`make pf-setup`/`make pf-teardown`, restricted to exact `pfctl` args) and an exit hook to flush it on any normal exit. Would reverse the current "local instance always connected" premise, so it needs its own design pass.
+- It'd be interesting to change the history generator so that it takes into account the failure rate of past histories to generate new ones, a la genetic algorithms. Should be pretty easy, actually.
 
 
 ## Tooling

@@ -74,12 +74,12 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(POLL_SEC),--poll-sec $(POLL_SEC)) \
   $(if $(MIN_FLOOR_SEC),--min-floor-sec $(MIN_FLOOR_SEC)) \
   $(if $(CAP_SEC),--cap-sec $(CAP_SEC)) \
-  $(if $(MAX_CAP_SEC),--max-cap-sec $(MAX_CAP_SEC)) \
   $(if $(W_SETTLE_SEC),--w-settle-sec $(W_SETTLE_SEC)) \
   $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
   $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
   $(if $(RUNS_PREFIX),--runs-prefix $(RUNS_PREFIX)) \
-  $(if $(SKIP_SNAPSHOT_TIMING),--skip-snapshot-timing)
+  $(if $(SKIP_SNAPSHOT_TIMING),--skip-snapshot-timing) \
+  $(if $(WOULD_FAIL_CHECK),--would-fail-check)
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
