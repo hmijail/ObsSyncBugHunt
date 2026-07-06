@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   UNRECOGNIZED, isNotFoundError,
   parseRead, parseFilesList, parseSyncStatus, parseTotal, parseSyncRead,
-  parseSyncVersions, parseFileVersions, parseMutation,
+  parseSyncVersions, parseFileVersions, parseMutation, parseVaultName,
 } from "./cli-parse.js";
 
 // Samples are the real obsidian-cli outputs captured 2026-06-26 (see docs/cli-trust.md).
@@ -36,6 +36,12 @@ test("parseTotal: integer | absent | UNRECOGNIZED", () => {
   assert.equal(parseTotal('Error: File "x" not found.'), "absent");
   assert.equal(parseTotal(""), UNRECOGNIZED);
   assert.equal(parseTotal("twelve"), UNRECOGNIZED);
+});
+
+test("parseVaultName: a plain name is recognized; empty/Error: is not", () => {
+  assert.equal(parseVaultName("Throwaway"), "Throwaway");
+  assert.equal(parseVaultName(""), UNRECOGNIZED);
+  assert.equal(parseVaultName("Error: no active vault"), UNRECOGNIZED);
 });
 
 test("parseSyncRead: content after ---, no-version, absent, junk", () => {

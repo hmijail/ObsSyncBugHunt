@@ -217,6 +217,27 @@ test("snapshotFiles: a normal listing returns entries in one attempt", async () 
   assert.equal(exec.execCalls, 1);
 });
 
+test("vaultNameProbe: a killed reply → 'timeout' in exactly one attempt", async () => {
+  const exec = new CountingExecutor({ killed: true });
+  const d = new ObsidianDriver(exec);
+  assert.deepEqual(await d.vaultNameProbe(50), { status: "timeout" });
+  assert.equal(exec.execCalls, 1);
+});
+
+test("vaultNameProbe: an unrecognized (empty) reply → 'unrecognized' in exactly one attempt", async () => {
+  const exec = new CountingExecutor({ stdout: "" });
+  const d = new ObsidianDriver(exec);
+  assert.deepEqual(await d.vaultNameProbe(50), { status: "unrecognized" });
+  assert.equal(exec.execCalls, 1);
+});
+
+test("vaultNameProbe: a plain vault name is recognized in one attempt", async () => {
+  const exec = new CountingExecutor({ stdout: "Throwaway" });
+  const d = new ObsidianDriver(exec);
+  assert.deepEqual(await d.vaultNameProbe(50), { status: "ok", name: "Throwaway" });
+  assert.equal(exec.execCalls, 1);
+});
+
 test("snapshotFs: a killed shell reply → 'timeout' in exactly one attempt (no ~10min unresponsive retry)", async () => {
   const exec = new CountingExecutor({}, { killed: true });
   const d = new ObsidianDriver(exec, "/vault");

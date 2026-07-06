@@ -17,7 +17,7 @@ import type { ExecResult, FileVersion, OpResult, SyncVersion } from "./types.js"
 import {
   CliUnrecognizedOutput, UNRECOGNIZED, type Unrecognized,
   parseRead, parseFilesList, parseSyncStatus, parseTotal, parseSyncRead,
-  parseSyncVersions, parseFileVersions, parseMutation, parseSyncHistory, isNotFoundError,
+  parseSyncVersions, parseFileVersions, parseMutation, parseSyncHistory, parseVaultName, isNotFoundError,
 } from "./cli-parse.js";
 import { CliInconsistencyError } from "./inconsistency.js";
 
@@ -370,6 +370,19 @@ export class ObsidianDriver {
     if (raw.killed) return { status: "timeout" };
     if (raw.code !== 0) return { status: "missing" };
     return { status: "ok", entries: raw.stdout.split("\n").map((l) => l.trim()).filter((l) => l.endsWith(".md")) };
+  }
+
+  /** Single bounded attempt to read the active vault's own name (`vault info=name`). Never
+   *  retries; used only for the local instance's "is this still the same vault" guard (see
+   *  assertLocalVaultUnchanged in execute.ts) — a vault name is an open string, so (unlike
+   *  syncStateProbe's status words) this returns a discriminated result instead of a sentinel
+   *  string, to avoid any collision with a real vault literally named "timeout". */
+  async vaultNameProbe(timeoutMs: number): Promise<{ status: "ok"; name: string } | { status: "unrecognized" | "timeout" }> {
+    const raw = await this.executor.exec(["vault", "info=name"], { timeoutMs });
+    if (raw.killed) return { status: "timeout" };
+    const r = parseVaultName(raw.stdout);
+    if (r === UNRECOGNIZED) return { status: "unrecognized" };
+    return { status: "ok", name: r };
   }
 
   /** Raw server-side sync version listing for a note. !ok = positively absent. */

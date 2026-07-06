@@ -72,6 +72,10 @@ export interface ExecuteOpts {
   // D/C defense-in-depth assert below — undefined means no local instance is configured.
   localNode?: number;
   localObsidianVersion?: string;
+  // Captured once at startup (`vault info=name`, before any rep runs) — the baseline
+  // assertLocalVaultUnchanged compares against on every op that touches the local node.
+  // Undefined means it couldn't be captured, so the check below never fires (see run.ts).
+  localVaultName?: string;
   // Overridable so tests don't wait the real ~15s worst case — see assertLocalSyncOn.
   localSyncGraceMs?: number;
   localSyncGraceAttempts?: number;
@@ -203,6 +207,27 @@ async function assertLocalSyncOn(driver: ObsidianDriver, opts: ExecuteOpts, logg
     throw new Error(`the local node's Sync is not on (observed "${state}") — the harness requires it to stay always-connected. Check Sync on ${driver.node} and re-run.`);
   }
   return hostOutage;
+}
+
+/** `obsidian-cli` acts on whatever vault is currently active in the GUI, not one the harness
+ *  pins by name — if a human (or Obsidian itself) switches vaults mid-soak, every subsequent
+ *  local-node read/write silently targets the wrong data. Checked at the same points as
+ *  `assertLocalSyncOn`: once per rep, and before every op that actually touches the local node.
+ *  Only a POSITIVELY-read, DIFFERENT name is a problem — a probe timeout/unrecognized reply is
+ *  tolerated, same "never manufacture a failure from an inconclusive bounded probe" philosophy
+ *  as everywhere else in this file. Throws a plain Error (not CliInconsistencyError): a wrong
+ *  vault invalidates every subsequent rep, not just this one, so it must escape runRep's
+ *  per-rep catch and abort the whole soak, matching assertLocalSyncOn's own reasoning. */
+async function assertLocalVaultUnchanged(driver: ObsidianDriver, opts: ExecuteOpts): Promise<void> {
+  if (opts.localVaultName === undefined) return; // nothing captured at startup — can't check
+  const probeMs = (opts.probeSec ?? 5) * 1000;
+  const r = await driver.vaultNameProbe(probeMs);
+  if (r.status !== "ok" || r.name === opts.localVaultName) return;
+  throw new Error(
+    `the local node's active vault changed from "${opts.localVaultName}" to "${r.name}" — the ` +
+    `harness requires the same vault to stay active for the whole soak. Switch back to ` +
+    `"${opts.localVaultName}" in Obsidian and re-run.`,
+  );
 }
 
 /**
@@ -398,15 +423,22 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
  *  syncStatus(), whose own internal retry-until-recognized loop can itself silently consume up
  *  to ~105s on a single poll attempt (see docs/cli-trust.md). A poll loop that's meant to be
  *  responsive needs each individual sample to actually be quick — an unboundable one defeats the
- *  purpose. No give-up deadline, same reasoning as waitForSynced. */
+ *  purpose. No give-up deadline, same reasoning as waitForSynced. Every poll is logged
+ *  (`baseline-poll`), same as waitForSynced's `settle-poll` — a stuck node's exact state is
+ *  visible in the trace instead of a silent multi-hour gap (found live: a node's own status word
+ *  can get stuck for hours, e.g. while its host app is suspended by the OS). */
 async function waitNodesSynced(drivers: ObsidianDriver[], probeMs: number, logger: RunLogger): Promise<void> {
+  const start = Date.now();
   for (;;) {
+    const tProbe = Date.now();
     const states = await Promise.all(drivers.map((d) => syncState(d, probeMs)));
+    const probeWallMs = Date.now() - tProbe;
     if (states.every((s) => s === "synced")) {
       const notes = await Promise.all(drivers.map(async (d) => (await d.listFiles()).value?.length ?? 0));
       logger.log({ kind: "baseline-synced", states, notes });
       return;
     }
+    logger.log({ kind: "baseline-poll", elapsedSec: Math.round((Date.now() - start) / 1000), states, probeMs: probeWallMs });
     await sleep(1000);
   }
 }
@@ -472,6 +504,7 @@ export async function runHistory(
     // not the full topology it ran against).
     nodes: drivers.map((d) => d.node),
     isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, localObsidianVersion: opts.localObsidianVersion,
+    localVaultName: opts.localVaultName,
     wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
     capSec: opts.capSec ?? 120, probeSec: opts.probeSec ?? 5,
@@ -502,6 +535,7 @@ export async function runHistory(
   // broken local vault fails fast instead of first burning the whole baseline wait.
   if (opts.localNode !== undefined) {
     hostOutage = await assertLocalSyncOn(driverOf(opts.localNode), opts, logger);
+    await assertLocalVaultUnchanged(driverOf(opts.localNode), opts);
   }
 
   // No `sync on` here: the network isolator (the default fault primitive) never calls `sync
@@ -623,14 +657,20 @@ export async function runHistory(
           logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
           break;
         }
-        if (activeNode === opts.localNode) hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
+        if (activeNode === opts.localNode) {
+          hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
+          await assertLocalVaultUnchanged(driverOf(activeNode), opts);
+        }
         const w = await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
         hostOutage ||= w.hostOutage;
         await checkWouldFail(drivers, offline, touched, acked, opts, logger, (Date.now() - startedAt) / 1000);
         break;
       }
       case "append": {
-        if (activeNode === opts.localNode) hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
+        if (activeNode === opts.localNode) {
+          hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
+          await assertLocalVaultUnchanged(driverOf(activeNode), opts);
+        }
         const noteLetter = op.note!;
         activeNote = opts.noteName(noteLetter); // logical letter -> concrete vault note (also the W target)
         touched.add(activeNote);

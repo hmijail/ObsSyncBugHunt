@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classify, tokensIn, letterOf, buildStateCells, stateKey, renderCategoryTable, renderGroup, line, type Results, type StateEntry } from "./analyze.js";
+import { classify, tokensIn, letterOf, buildStateCells, stateKey, renderCategoryTable, renderGroup, line, isUninteresting, type Results, type StateEntry } from "./analyze.js";
 
 const converged = (note: string, canonical: string, conflicts: { file: string; content: string }[] = []) => ({
   note, lost: [] as string[], onlyInConflict: [] as string[], converged: true, conflictFiles: conflicts.length,
@@ -127,7 +127,7 @@ test("renderCategoryTable: column set is the union of all entries' cells; missin
 test("renderGroup: only non-empty categories appear, in ranked order", () => {
   const g = {
     reps: 2, pass: 1, fail: 1, lost: 1, serverDropped: 0, neverRegistered: 1,
-    duplReps: 0, diffReps: 0, unsyncedReps: 0, conflictReps: 0, timeouts: 0, conv: [8, 9],
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [8, 9],
     obsfail: 0, unknown: 0,
     categories: new Map([
       ["PASS", new Map<string, StateEntry>([["k1", { cells: { a: "x" }, count: 1, reps: ["r1"] }]])],
@@ -135,21 +135,61 @@ test("renderGroup: only non-empty categories appear, in ranked order", () => {
     ]),
   };
   const md = renderGroup("N1AaWN2Aa", g);
-  const lostIdx = md.indexOf("### LOST");
-  const passIdx = md.indexOf("### PASS");
+  const lostIdx = md.indexOf("## LOST");
+  const passIdx = md.indexOf("## PASS");
   assert.ok(lostIdx > 0 && passIdx > 0 && lostIdx < passIdx, "LOST (ranked above PASS) renders first");
-  assert.ok(!md.includes("### DUPL"), "an empty category is skipped entirely");
-  assert.ok(md.startsWith("## N1AaWN2Aa"), "history string heads the section");
+  assert.ok(!md.includes("## DUPL"), "an empty category is skipped entirely");
+  assert.ok(md.startsWith("# N1AaWN2Aa"), "history string heads the section");
 });
 
-test("line: only non-zero fields are shown", () => {
+test("line: only non-zero fields are shown, and convergenceSec reports min/avg/max/span", () => {
   const g = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
-    duplReps: 0, diffReps: 0, unsyncedReps: 0, conflictReps: 0, timeouts: 0, conv: [5, 8, 11],
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
     obsfail: 0, unknown: 0, categories: new Map(),
   };
   const l = line(g);
   assert.ok(l.includes("reps=3 pass=3"));
   assert.ok(!l.includes("fail="), "a zero field is omitted");
-  assert.ok(l.includes("min=5 med=8 max=11"));
+  assert.ok(l.includes("min=5 avg=8 max=11 span=6"));
+});
+
+test("isUninteresting: all-PASS reps landing in the same state -> true", () => {
+  const g = {
+    reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
+    obsfail: 0, unknown: 0,
+    categories: new Map([
+      ["PASS", new Map<string, StateEntry>([["k1", { cells: { a: "x" }, count: 3, reps: ["r1", "r2", "r3"] }]])],
+    ]),
+  };
+  assert.equal(isUninteresting(g), true);
+});
+
+test("isUninteresting: all-PASS but reps land in DIFFERENT states -> false (there's variety to show)", () => {
+  const g = {
+    reps: 2, pass: 2, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8],
+    obsfail: 0, unknown: 0,
+    categories: new Map([
+      ["PASS", new Map<string, StateEntry>([
+        ["k1", { cells: { a: "x" }, count: 1, reps: ["r1"] }],
+        ["k2", { cells: { a: "y" }, count: 1, reps: ["r2"] }],
+      ])],
+    ]),
+  };
+  assert.equal(isUninteresting(g), false);
+});
+
+test("isUninteresting: any real failure -> false, even with a single PASS state otherwise", () => {
+  const g = {
+    reps: 2, pass: 1, fail: 1, lost: 1, serverDropped: 0, neverRegistered: 1,
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8],
+    obsfail: 0, unknown: 0,
+    categories: new Map([
+      ["PASS", new Map<string, StateEntry>([["k1", { cells: { a: "x" }, count: 1, reps: ["r1"] }]])],
+      ["LOST", new Map<string, StateEntry>([["k2", { cells: { a: "y" }, count: 1, reps: ["r2"] }]])],
+    ]),
+  };
+  assert.equal(isUninteresting(g), false);
 });

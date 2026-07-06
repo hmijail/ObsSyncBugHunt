@@ -73,6 +73,14 @@ export function parseTotal(stdout: string): number | "absent" | Unrecognized {
   return UNRECOGNIZED;
 }
 
+// --- vault info=name -----------------------------------------------------------
+// A single non-empty line naming the active vault. Empty or an Error: line is unrecognized.
+export function parseVaultName(stdout: string): string | Unrecognized {
+  const t = stdout.trim();
+  if (t === "" || t.startsWith("Error:")) return UNRECOGNIZED;
+  return t;
+}
+
 // --- sync:history file= (raw listing) ----------------------------------------
 // The non-empty server-side listing text, or positively absent. Empty / other `Error:`
 // (e.g. `Error: Sync is in error state.` while disconnected) is unrecognized → retried.

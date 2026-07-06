@@ -210,6 +210,16 @@ async function localVaultPath(): Promise<string | undefined> {
   return r.stdout.trim() || undefined;
 }
 
+// The local instance's active vault NAME, captured once here (before any rep runs) as the
+// baseline execute.ts's assertLocalVaultUnchanged compares against on every subsequent op that
+// touches the local node — obsidian-cli acts on whatever vault is currently active in the GUI,
+// so this is the one place that establishes what "currently active" was supposed to mean.
+async function localVaultName(): Promise<string | undefined> {
+  if (!localRequested) return undefined;
+  const r = await runProcess(localBin!, ["vault", "info=name"]);
+  return r.stdout.trim() || undefined;
+}
+
 // Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
 // cwd (e.g. a bigger disk). Default (no flag) keeps today's behavior: plain "runs".
 const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs") : "runs";
@@ -249,6 +259,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   obsidianVersion: await obsidianVersion(),
   localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
   localObsidianVersion: await localObsidianVersion(),
+  localVaultName: await localVaultName(),
   wouldFailCheck: !!values["would-fail-check"], // off by default — see execute.ts's checkWouldFail
   runsDir: runsRoot,
 };
@@ -478,6 +489,14 @@ async function readState(d: ObsidianDriver): Promise<PreflightRow> {
 }
 
 async function preflight(): Promise<boolean> {
+  // Every driver call here (syncResume, readState's syncStatus/listFiles) can emit its own
+  // cli-call-timeout-retry/cli-output-recognized-after-retry events (driver.ts's emit()) — with
+  // no onEvent wired up yet (that only happens per-rep, inside runHistory), those would silently
+  // fall back to a console.warn that never reaches the .log file. Wire it to console.log (which
+  // IS captured, see the override above) so preflight's own retries are just as durable as a
+  // rep's. runHistory overwrites this per rep anyway, so there's nothing to restore afterward.
+  for (const d of drivers) d.onEvent = (e) => console.log(`· ${JSON.stringify(e)}`);
+
   // The harness always runs with Sync ON (network is the only isolation layer), and a
   // fresh `make containers-up` brings nodes up with Sync PAUSED. Resume first — else a
   // perfectly normal just-started node reads as "unhealthy" — then wait for it to
@@ -509,8 +528,19 @@ async function preflight(): Promise<boolean> {
   // fatal: there's no give-up deadline here, same reasoning as execute.ts's settle loop (Sync is
   // an uncontrollable, necessary external resource). Only a genuinely unreachable node (a down
   // or absent container) ends this early.
+  //
+  // Progress print, throttled to ~30s: this loop runs before any per-rep log file exists, so
+  // without it a long wait here shows up as total silence — found live, an 8+ minute preflight
+  // stall produced a completely blank .log until the very end. One line every 30s is enough to
+  // show the process is alive and what it's currently seeing, without scrolling the console for
+  // hours on an unusually long wait.
+  let lastPrint = 0;
   let rows = await Promise.all(drivers.map(readState));
   while (rows.every((r) => r.reachable) && !rows.every((r) => r.state === "synced")) {
+    if (Date.now() - lastPrint > 30_000) {
+      console.log(`preflight: waiting — ${rows.map((r) => `${r.node}=${r.state}`).join(", ")}`);
+      lastPrint = Date.now();
+    }
     await sleep(2000);
     rows = await Promise.all(drivers.map(readState));
   }

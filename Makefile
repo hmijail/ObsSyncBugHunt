@@ -181,7 +181,7 @@ containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC publi
 
 solo-check:
 	@echo "solo-check: inspecting containers on $(NET)…$(if $(PODMAN_GUARD),, (no 'timeout' found — install coreutils for a hang guard))"
-	@# Isolation guard: every node shares the same cloned Sync login, so a stray
+	@# Isolation guard: every node Syncs to the same vault, so a stray
 	@# container on the test network would confound the run. Abort if anything running
 	@# isn't one of the intended CONTAINER_NODES. The podman call is time-bounded ($(PODMAN_GUARD))
 	@# so a wedged podman API fails fast with a hint instead of hanging silently.

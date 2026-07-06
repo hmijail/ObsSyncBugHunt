@@ -1,12 +1,18 @@
 // Offline analyzer for soak runs. Layout is runs/<history-string>/<rep>/, where a
 // failing rep dir carries a `-LOST`/`-UNKNOWN` suffix. Aggregates per history string:
 // reps, losses (split server-dropped vs never-registered — the latter is worse),
-// conflicts, the caught inconsistency outcomes (`-OBSFAIL`/`-UNKNOWN`, read from the dir
-// suffix since they have no verdict), the sync-duration distribution, and — written to
+// the caught inconsistency outcomes (`-OBSFAIL`/`-UNKNOWN`, read from the dir suffix
+// since they have no verdict), the sync-duration distribution, and — written to
 // <dir>/analysis.md — a markdown table of each rep's whole "global state" (see
 // buildStateCells), grouped first by outcome (PASS/LOST/DUPL/...). Groups are per history
 // string only, NEVER merged across different histories — note letters/tokens from
-// unrelated DSL structures aren't comparable. Pure file reader — run anytime.
+// unrelated DSL structures aren't comparable. A history that's all-PASS and landed in the
+// exact same state every rep is "uninteresting" — nothing to dig into — so it's pulled out
+// of the per-history sections entirely and just named under a trailing `# uninteresting`
+// list instead. History sections render at `#`; their category tables at `##`. Directories
+// are processed in alphabetical order, so ties in the interesting-first ranking (and the
+// uninteresting list itself) come out deterministic, not filesystem-order-dependent. Pure
+// file reader — run anytime.
 //
 //   npm run analyze            (reads ./runs, writes ./runs/analysis.md)
 //   npm run analyze -- <dir>
@@ -103,21 +109,22 @@ interface Group {
   reps: number; pass: number; fail: number;
   lost: number; serverDropped: number; neverRegistered: number;
   duplReps: number; diffReps: number; unsyncedReps: number;
-  conflictReps: number; timeouts: number; conv: number[];
+  timeouts: number; conv: number[];
   // Caught inconsistency outcomes (no results.json — counted from the rep dir suffix).
   obsfail: number; unknown: number;
   categories: Map<string, Map<string, StateEntry>>; // classify() -> stateKey() -> entry
 }
 const newGroup = (): Group => ({
   reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0,
-  unsyncedReps: 0, conflictReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, categories: new Map(),
+  unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, categories: new Map(),
 });
 
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 const stats = (xs: number[]) => {
   if (!xs.length) return "n/a";
-  const s = [...xs].sort((a, b) => a - b);
-  return `min=${s[0]} med=${s[Math.floor(s.length / 2)]} max=${s[s.length - 1]} avg=${Math.round(s.reduce((a, b) => a + b, 0) / s.length)}`;
+  const min = Math.min(...xs), max = Math.max(...xs);
+  const avg = Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
+  return `min=${min} avg=${avg} max=${max} span=${max - min}`;
 };
 
 function tally(g: Group, r: Results, rep: string) {
@@ -125,7 +132,6 @@ function tally(g: Group, r: Results, rep: string) {
   g.conv.push(r.timings?.convergenceSec ?? 0);
   if (r.timings?.syncTimedOut) g.timeouts++;
   if (r.timings?.unsynced) g.unsyncedReps++;
-  if (r.verdict.notes.some((n) => n.conflictFiles > 0 || n.onlyInConflict.length > 0)) g.conflictReps++;
   const lost = r.verdict.notes.reduce((s, n) => s + n.lost.length, 0);
   g.lost += lost;
   for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
@@ -171,7 +177,6 @@ export const line = (g: Group) => {
   if (g.diffReps) parts.push(`diff=${g.diffReps}`);
   if (g.unsyncedReps) parts.push(`unsynced=${g.unsyncedReps}`);
   if (g.timeouts) parts.push(`timeouts=${g.timeouts}`);
-  if (g.conflictReps) parts.push(`conflicts=${g.conflictReps}`);
   return parts.join(" ") + `\nconvergenceSec: ${stats(g.conv)}`;
 };
 
@@ -192,16 +197,26 @@ export function renderCategoryTable(category: string, byState: Map<string, State
   });
   const headerRow = `| ${headers.join(" | ")} |`;
   const sepRow = `|${headers.map(() => "---").join("|")}|`;
-  return [`### ${category}`, "", headerRow, sepRow, ...rows, ""].join("\n");
+  return [`## ${category}`, "", headerRow, sepRow, ...rows, ""].join("\n");
 }
 
 export function renderGroup(str: string, g: Group): string {
-  const sections = [`## ${str}`, line(g), ""];
+  const sections = [`# ${str}`, line(g), ""];
   for (const category of CATEGORY_ORDER) {
     const byState = g.categories.get(category);
     if (byState && byState.size > 0) sections.push(renderCategoryTable(category, byState));
   }
   return sections.join("\n");
+}
+
+// A history is "uninteresting" when every rep passed AND every one of them landed in the exact
+// same state (nothing to compare, nothing to dig into) — a full per-history breakdown for that
+// is just noise. `byState` missing/empty counts too (older results.json with no `observations`
+// data at all — equally nothing to show variety in).
+export function isUninteresting(g: Group): boolean {
+  if (g.fail || g.obsfail || g.unknown) return false;
+  const byState = g.categories.get("PASS");
+  return !byState || byState.size <= 1;
 }
 
 // Surface the most interesting histories first: real findings (oracle fail + the client
@@ -221,7 +236,9 @@ export function main(base: string): void {
   const groups = new Map<string, Group>();
   let skipped = 0;
 
-  for (const str of readdirSync(base)) {
+  // Sorted so processing order (and any downstream tie-break) is deterministic regardless of
+  // filesystem/readdir ordering, not just cosmetic.
+  for (const str of readdirSync(base).sort()) {
     const strDir = path.join(base, str);
     if (!isDir(strDir)) continue;
     if (!groups.has(str)) groups.set(str, newGroup());
@@ -242,12 +259,15 @@ export function main(base: string): void {
     }
   }
 
-  const orderedGroups = [...groups.entries()]
-    .filter(([, g]) => g.reps > 0)
+  const active = [...groups.entries()].filter(([, g]) => g.reps > 0);
+  const interesting = active.filter(([, g]) => !isUninteresting(g))
     .sort((a, b) => (rank(b[1]) - rank(a[1])) || (b[1].lost - a[1].lost) || (b[1].unknown - a[1].unknown));
+  const uninteresting = active.filter(([, g]) => isUninteresting(g)).map(([str]) => str).sort();
 
   const totalReps = [...groups.values()].reduce((s, g) => s + g.reps, 0);
-  const md = orderedGroups.map(([str, g]) => renderGroup(str, g)).join("\n");
+  const sections = interesting.map(([str, g]) => renderGroup(str, g));
+  if (uninteresting.length > 0) sections.push(["# uninteresting", "", ...uninteresting, ""].join("\n"));
+  const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");
   writeFileSync(outPath, md + "\n");
 

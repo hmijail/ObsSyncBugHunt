@@ -162,7 +162,7 @@ class SharedVaultExecutor implements Executor {
   // local instance whose Sync is off (or was) when the rep starts, which runHistory's upfront
   // check must see directly, before ever reaching the baseline gate.
   private syncStatusCalls = 0;
-  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: (string | "killed") | (string | "killed")[] = "synced", private readonly startSynced = true) {}
+  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: (string | "killed") | (string | "killed")[] = "synced", private readonly startSynced = true, private readonly vaultName: string | "killed" = "TestVault") {}
   async exec(args: string[]): Promise<ExecResult> {
     const r = (stdout: string, killed = false): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed });
     const params = Object.fromEntries(args.slice(1).map((a) => {
@@ -193,6 +193,7 @@ class SharedVaultExecutor implements Executor {
         return r(`Appended to: ${params.file}`);
       }
       case "open": return r(`Opened: ${params.file}`);
+      case "vault": return params.info === "name" ? (this.vaultName === "killed" ? r("", true) : r(this.vaultName)) : r("");
       default: return r("");
     }
   }
@@ -327,6 +328,49 @@ test("assertLocalSyncOn: an off-state that persists through every grace attempt 
     }),
     /local node's Sync is not on.*"error"/,
   );
+});
+
+// --- the local instance's active-vault guard: abort (not just tag the rep) if it ever drifts ---
+test("assertLocalVaultUnchanged: the captured name still matching the driver's own report never throws", async () => {
+  const vault = new Map<string, string>();
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "Throwaway"));
+  const noLog = { log() {} } as unknown as RunLogger;
+  await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
+    wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+  }); // must resolve, not throw
+});
+
+test("assertLocalVaultUnchanged: a changed vault name aborts the whole run, with both names in the message", async () => {
+  const vault = new Map<string, string>();
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "SomeOtherVault"));
+  const noLog = { log() {} } as unknown as RunLogger;
+  await assert.rejects(
+    () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
+    }),
+    /active vault changed from "Throwaway" to "SomeOtherVault"/,
+  );
+});
+
+test("assertLocalVaultUnchanged: no captured baseline (localVaultName unset) means the check never fires", async () => {
+  const vault = new Map<string, string>();
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "WhateverIsActive"));
+  const noLog = { log() {} } as unknown as RunLogger;
+  await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false,
+    wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+  }); // no localVaultName in opts → never checked, never throws regardless of the driver's report
+});
+
+test("assertLocalVaultUnchanged: an inconclusive probe (killed) is tolerated, not treated as a mismatch", async () => {
+  const vault = new Map<string, string>();
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "killed"));
+  const noLog = { log() {} } as unknown as RunLogger;
+  await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
+    wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+  }); // a killed vault-name probe must never itself manufacture a failure
 });
 
 // --- opt-in would-fail snapshot judgment (P and W) --------------------------------------
