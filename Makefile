@@ -60,6 +60,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
   $(if $(LOCAL_BIN),--local-bin $(LOCAL_BIN)) \
   $(if $(LOCAL_NODE_ID),--local-node-id $(LOCAL_NODE_ID)) \
+  $(if $(LOCAL_VAULT_PIN),--local-vault-pin) \
   $(if $(SCENARIO),--scenario $(SCENARIO)) \
   $(if $(HISTORY),--history $(HISTORY)) \
   $(if $(STEPS),--steps $(STEPS)) \

@@ -49,6 +49,19 @@ export class ObsidianDriver {
   /** Per-attempt timeout inside runRecognized(); overridable for tests. */
   recognizeCallTimeoutMs = RECOGNIZE_CALL_TIMEOUT_MS;
 
+  /** Local-only opt-in (see run.ts's --local-vault-pin): when set, every CONTENT command below
+   *  explicitly targets this vault by name, regardless of whatever's actually focused in the
+   *  GUI — confirmed live that `vault=<name>` only reaches a vault that's already open as its
+   *  own separate Obsidian window (it does not open/switch to one by name); with the pinned
+   *  vault kept open as its own window, a human is free to work in ANY OTHER window without
+   *  disrupting these calls. Deliberately NEVER applied to sync:* commands (they don't accept
+   *  vault= at all) or to the vault-identity probe itself (vaultNameProbe) — that one's whole
+   *  job is reporting the TRUE active vault, and pinning it would make it tautological. */
+  pinnedVault?: string;
+  private vaultParams(): string[] {
+    return this.pinnedVault ? [`vault=${this.pinnedVault}`] : [];
+  }
+
   // `vaultPath` (the vault's on-disk root, e.g. /root/vaults/TestVault) enables the
   // filesystem second-source. Unset (local/dev) → FS cross-checks are skipped.
   constructor(private readonly executor: Executor, private readonly vaultPath?: string) {}
@@ -62,8 +75,9 @@ export class ObsidianDriver {
     else console.warn(`· ${JSON.stringify(event)}`);
   }
 
-  // Each node runs exactly one vault, so we never pass vault=. File commands would accept
-  // it, but sync:* commands ignore it — so it's pure noise.
+  // Each node runs exactly one vault, so by default we never pass vault= — the one exception is
+  // the opt-in `pinnedVault` above, added explicitly at each content method below. sync:*
+  // commands don't accept vault= at all (structural, not just ignored).
   //
   // Runs the command with a hard timeout; on an untimely (killed) result, waits and retries
   // until the CLI responds. Returns only a TIMELY ExecResult (never a killed one).
@@ -194,6 +208,7 @@ export class ObsidianDriver {
     // (with the .md extension). read/append/open/delete take `file=` with the folder path.
     const p = name.includes("/") ? [`path=${name}.md`] : [`name=${name}`];
     if (content) p.push(`content=${content}`);
+    p.push(...this.vaultParams());
     const raw = await this.runMutationOnce("create", p);
     this.expect(raw, parseMutation);
     return { ok: true, value: raw.stdout.trim(), raw };
@@ -201,27 +216,27 @@ export class ObsidianDriver {
 
   /** Appends `line` plus a trailing newline. */
   async appendLine(name: string, line: string): Promise<OpResult> {
-    const raw = await this.runMutationOnce("append", [`file=${name}`, `content=${line}`]);
+    const raw = await this.runMutationOnce("append", [`file=${name}`, `content=${line}`, ...this.vaultParams()]);
     this.expect(raw, parseMutation);
     return { ok: true, value: raw.stdout.trim(), raw };
   }
 
   /** Prepends `line` to the top of the note. */
   async prependLine(name: string, line: string): Promise<OpResult> {
-    const raw = await this.runMutationOnce("prepend", [`file=${name}`, `content=${line}`]);
+    const raw = await this.runMutationOnce("prepend", [`file=${name}`, `content=${line}`, ...this.vaultParams()]);
     this.expect(raw, parseMutation);
     return { ok: true, value: raw.stdout.trim(), raw };
   }
 
   /** Read a note: ok+value = present content; !ok = positively absent. Retries while unparseable. */
   async read(name: string): Promise<OpResult> {
-    const { value: r, raw } = await this.runRecognized("read", [`file=${name}`], parseRead);
+    const { value: r, raw } = await this.runRecognized("read", [`file=${name}`, ...this.vaultParams()], parseRead);
     return r.present ? { ok: true, value: r.content, raw } : { ok: false, raw };
   }
 
   /** Read by exact vault-relative path (needed for "(Conflicted copy …)" files). */
   async readByPath(path: string): Promise<OpResult> {
-    const { value: r, raw } = await this.runRecognized("read", [`path=${path}`], parseRead);
+    const { value: r, raw } = await this.runRecognized("read", [`path=${path}`, ...this.vaultParams()], parseRead);
     return r.present ? { ok: true, value: r.content, raw } : { ok: false, raw };
   }
 
@@ -233,7 +248,7 @@ export class ObsidianDriver {
   /** Open a note in the GUI (visible via VNC). Safe before first edit: a missing note is a
    *  positively-recognized no-op, not an error we abort on. */
   async open(name: string): Promise<OpResult> {
-    const raw = await this.run("open", [`file=${name}`]);
+    const raw = await this.run("open", [`file=${name}`, ...this.vaultParams()]);
     if (parseMutation(raw.stdout) === UNRECOGNIZED && !isNotFoundError(raw.stdout)) {
       throw new CliUnrecognizedOutput(raw, "parseMutation");
     }
@@ -243,6 +258,7 @@ export class ObsidianDriver {
   async deleteNote(name: string, permanent = false): Promise<OpResult> {
     const p = [`file=${name}`];
     if (permanent) p.push("permanent");
+    p.push(...this.vaultParams());
     const raw = await this.run("delete", p);
     // Deleting an already-gone note is a harmless no-op (not-found is acceptable here).
     if (parseMutation(raw.stdout) === UNRECOGNIZED && !isNotFoundError(raw.stdout)) {
@@ -256,7 +272,7 @@ export class ObsidianDriver {
   /** Vault file names, one per line (validated; throws on garbage). An empty list is
    *  returned as [] but is NOT a positive "empty folder" — confirm independently. */
   async listFiles(folder?: string): Promise<OpResult<string[]>> {
-    const { value, raw } = await this.runRecognized("files", folder ? [`folder=${folder}`] : [], parseFilesList);
+    const { value, raw } = await this.runRecognized("files", [...(folder ? [`folder=${folder}`] : []), ...this.vaultParams()], parseFilesList);
     return { ok: true, value, raw };
   }
 
@@ -343,7 +359,7 @@ export class ObsidianDriver {
   /** Single bounded attempt to read a note. Never retries; a timeout or unrecognized reply
    *  is reported as such, not chased. */
   async snapshotRead(name: string, timeoutMs: number): Promise<{ status: "present" | "absent" | "unrecognized" | "timeout"; content?: string }> {
-    const raw = await this.executor.exec(["read", `file=${name}`], { timeoutMs });
+    const raw = await this.executor.exec(["read", `file=${name}`, ...this.vaultParams()], { timeoutMs });
     if (raw.killed) return { status: "timeout" };
     const r = parseRead(raw.stdout);
     if (r === UNRECOGNIZED) return { status: "unrecognized", content: raw.stdout };
@@ -353,7 +369,7 @@ export class ObsidianDriver {
   /** Single bounded attempt at the vault-relative file listing (CLI's own view — includes
    *  "(Conflicted copy …)" names). Never retries. */
   async snapshotFiles(folder: string, timeoutMs: number): Promise<{ status: "ok" | "unrecognized" | "timeout"; entries?: string[] }> {
-    const raw = await this.executor.exec(["files", `folder=${folder}`], { timeoutMs });
+    const raw = await this.executor.exec(["files", `folder=${folder}`, ...this.vaultParams()], { timeoutMs });
     if (raw.killed) return { status: "timeout" };
     const r = parseFilesList(raw.stdout);
     if (r === UNRECOGNIZED) return { status: "unrecognized" };

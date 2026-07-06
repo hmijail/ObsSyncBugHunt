@@ -126,6 +126,7 @@ const { values } = parseArgs({
     "runs-prefix": { type: "string" },
     "skip-snapshot-timing": { type: "boolean" },
     "would-fail-check": { type: "boolean" },
+    "local-vault-pin": { type: "boolean" },
   },
 });
 
@@ -141,6 +142,10 @@ const isolatorKind = values.isolator ?? "network";
 const localBin = values["local-bin"];
 if (localRequested && !localBin) {
   console.error(`--nodes/NODES includes "l" but --local-bin/LOCAL_BIN wasn't provided — pass --local-bin <path> or drop "l" from --nodes.`);
+  process.exit(2);
+}
+if (values["local-vault-pin"] && !localRequested) {
+  console.error(`--local-vault-pin was given but "l" isn't in --nodes/NODES — add it or drop --local-vault-pin.`);
   process.exit(2);
 }
 const scenario = values.scenario ?? "random";
@@ -243,6 +248,19 @@ if (localRequested) {
   // reorders driver construction. Make that assumption loud instead.
   assert(drivers[drivers.length - 1].node === localNodeId, "local driver must be pushed last so localNode: drivers.length resolves to it");
 }
+// Captured once, reused both as the Round-11 drift-detection baseline (execBase.localVaultName
+// below) and, if --local-vault-pin is on, as the actual pin target — see ObsidianDriver.pinnedVault.
+const capturedLocalVaultName = await localVaultName();
+if (values["local-vault-pin"]) {
+  if (!capturedLocalVaultName) {
+    console.error(`--local-vault-pin was given but the local instance's active vault name couldn't be captured — pinning to an unknown name would be worse than not pinning at all. Check --local-bin and re-run.`);
+    process.exit(2);
+  }
+  // Pin only reaches a vault that's already open as its OWN Obsidian window (confirmed live) —
+  // it does not open/switch to one by name. Keep that vault open as a window for the whole
+  // soak; any OTHER window is then free to use without disrupting these calls.
+  drivers[drivers.length - 1].pinnedVault = capturedLocalVaultName;
+}
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
 
@@ -259,7 +277,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   obsidianVersion: await obsidianVersion(),
   localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
   localObsidianVersion: await localObsidianVersion(),
-  localVaultName: await localVaultName(),
+  localVaultName: capturedLocalVaultName,
   wouldFailCheck: !!values["would-fail-check"], // off by default — see execute.ts's checkWouldFail
   runsDir: runsRoot,
 };

@@ -164,10 +164,12 @@ class CountingExecutor implements Executor {
   shellCalls = 0;
   lastExecTimeoutMs?: number;
   lastShellTimeoutMs?: number;
+  lastExecArgv?: string[];
   constructor(private readonly execResult: Partial<ExecResult> = {}, private readonly shellResult: Partial<ExecResult> = {}) {}
   async exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
     this.execCalls++;
     this.lastExecTimeoutMs = opts?.timeoutMs;
+    this.lastExecArgv = args;
     return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false, ...this.execResult };
   }
   async shell(argv: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
@@ -252,4 +254,58 @@ test("snapshotFs: no vaultPath configured → 'unavailable', no call at all", as
   const d = new ObsidianDriver(exec); // no vaultPath
   assert.deepEqual(await d.snapshotFs("bughunt", 50), { status: "unavailable" });
   assert.equal(exec.shellCalls, 0);
+});
+
+// --- pinnedVault: opt-in vault= on content commands only ------------------------------------
+test("pinnedVault: read carries a trailing vault= param when set, absent when unset", async () => {
+  const withPin = new CountingExecutor({ stdout: "(n1-1-a)" });
+  const d1 = new ObsidianDriver(withPin);
+  d1.pinnedVault = "Throwaway";
+  const r1 = await d1.read("bughunt/x");
+  assert.ok(r1.raw.argv.includes("vault=Throwaway"), `expected vault= in argv: ${r1.raw.argv}`);
+
+  const noPin = new CountingExecutor({ stdout: "(n1-1-a)" });
+  const d2 = new ObsidianDriver(noPin);
+  const r2 = await d2.read("bughunt/x");
+  assert.ok(!r2.raw.argv.some((a) => a.startsWith("vault=")), `expected no vault= in argv: ${r2.raw.argv}`);
+});
+
+test("pinnedVault: appendLine (a mutation) carries vault= when set", async () => {
+  const exec = new CountingExecutor({ stdout: "Appended to: bughunt/x" });
+  const d = new ObsidianDriver(exec);
+  d.pinnedVault = "Throwaway";
+  const r = await d.appendLine("bughunt/x", "(n1-1-a)");
+  assert.ok(r.raw.argv.includes("vault=Throwaway"));
+});
+
+test("pinnedVault: createNote carries vault= when set, for both the name= and path= shapes", async () => {
+  const exec = new CountingExecutor({ stdout: "Created: bughunt/x" });
+  const d = new ObsidianDriver(exec);
+  d.pinnedVault = "Throwaway";
+  const r = await d.createNote("bughunt/x", "(n1-1-a)");
+  assert.ok(r.raw.argv.includes("vault=Throwaway"));
+});
+
+test("pinnedVault: listFiles carries vault= when set, with or without a folder", async () => {
+  const exec = new CountingExecutor({ stdout: "" });
+  const d = new ObsidianDriver(exec);
+  d.pinnedVault = "Throwaway";
+  const r = await d.listFiles("bughunt");
+  assert.ok(r.raw.argv.includes("vault=Throwaway"));
+});
+
+test("pinnedVault: snapshotRead carries vault= when set", async () => {
+  const exec = new CountingExecutor({ stdout: "(n1-1-a)" });
+  const d = new ObsidianDriver(exec);
+  d.pinnedVault = "Throwaway";
+  await d.snapshotRead("bughunt/x", 50);
+  assert.ok(exec.lastExecArgv?.includes("vault=Throwaway"), `expected vault= in argv: ${exec.lastExecArgv}`);
+});
+
+test("pinnedVault: sync:* commands never carry vault=, even when pinnedVault is set", async () => {
+  const exec = new CountingExecutor({ stdout: "status: synced" });
+  const d = new ObsidianDriver(exec);
+  d.pinnedVault = "Throwaway";
+  await d.syncStatus();
+  assert.ok(!exec.lastExecArgv?.some((a) => a.startsWith("vault=")), `expected no vault= in argv: ${exec.lastExecArgv}`);
 });
