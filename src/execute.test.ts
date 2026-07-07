@@ -162,7 +162,8 @@ class SharedVaultExecutor implements Executor {
   // local instance whose Sync is off (or was) when the rep starts, which runHistory's upfront
   // check must see directly, before ever reaching the baseline gate.
   private syncStatusCalls = 0;
-  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: (string | "killed") | (string | "killed")[] = "synced", private readonly startSynced = true, private readonly vaultName: string | "killed" = "TestVault") {}
+  private vaultNameCalls = 0;
+  constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: (string | "killed") | (string | "killed")[] = "synced", private readonly startSynced = true, private readonly vaultName: (string | "killed") | (string | "killed")[] = "TestVault") {}
   async exec(args: string[]): Promise<ExecResult> {
     const r = (stdout: string, killed = false): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed });
     const params = Object.fromEntries(args.slice(1).map((a) => {
@@ -193,7 +194,12 @@ class SharedVaultExecutor implements Executor {
         return r(`Appended to: ${params.file}`);
       }
       case "open": return r(`Opened: ${params.file}`);
-      case "vault": return params.info === "name" ? (this.vaultName === "killed" ? r("", true) : r(this.vaultName)) : r("");
+      case "vault": {
+        if (params.info !== "name") return r("");
+        const seq = Array.isArray(this.vaultName) ? this.vaultName : [this.vaultName];
+        const word = seq[Math.min(this.vaultNameCalls++, seq.length - 1)];
+        return word === "killed" ? r("", true) : r(word);
+      }
       default: return r("");
     }
   }
@@ -330,7 +336,7 @@ test("assertLocalSyncOn: an off-state that persists through every grace attempt 
   );
 });
 
-// --- the local instance's active-vault guard: abort (not just tag the rep) if it ever drifts ---
+// --- the local instance's active-vault guard: wait for it to come back, never abort ---
 test("assertLocalVaultUnchanged: the captured name still matching the driver's own report never throws", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "Throwaway"));
@@ -341,16 +347,22 @@ test("assertLocalVaultUnchanged: the captured name still matching the driver's o
   }); // must resolve, not throw
 });
 
-test("assertLocalVaultUnchanged: a changed vault name aborts the whole run, with both names in the message", async () => {
+test("assertLocalVaultUnchanged: a changed vault name is waited out, not aborted on, and flags vaultDrift", async () => {
   const vault = new Map<string, string>();
-  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "SomeOtherVault"));
-  const noLog = { log() {} } as unknown as RunLogger;
-  await assert.rejects(
-    () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
-      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
-    }),
-    /active vault changed from "Throwaway" to "SomeOtherVault"/,
-  );
+  // Wrong at the rep's upfront check, still wrong on the first recheck, matches on the second —
+  // proves this actually POLLS (not just re-reads once) before giving up on aborting altogether.
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, ["SomeOtherVault", "SomeOtherVault", "Throwaway"]));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const result = await runHistory([local], new NoopIsolator(), logger, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
+    vaultRecheckMs: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+  }); // must resolve, not throw — the whole point of this round's change
+  assert.equal(result.timings.vaultDrift, true);
+  assert.equal(events.filter((e) => e.kind === "local-vault-changed").length, 1);
+  assert.ok(events.some((e) => e.kind === "local-vault-recheck" && e.back === false), "at least one recheck still saw the wrong vault");
+  assert.ok(events.some((e) => e.kind === "local-vault-recheck" && e.back === true), "a later recheck confirmed it came back");
+  assert.equal(events.filter((e) => e.kind === "local-vault-restored").length, 1);
 });
 
 test("assertLocalVaultUnchanged: no captured baseline (localVaultName unset) means the check never fires", async () => {

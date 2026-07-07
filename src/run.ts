@@ -311,6 +311,7 @@ let obsfail = 0; // client misreported its vault (-OBSFAIL)
 let unknown = 0; // couldn't judge — unparseable/unresponsive CLI, or ladder catch-all (-UNKNOWN)
 let conflicts = 0; // reps where Obsidian Sync's own (Conflicted copy ...) mechanism fired
 let hostOutages = 0; // reps where a host-connectivity blip forced a recovery wait (timings unreliable)
+let vaultDrifts = 0; // reps where the local node's active vault drifted and was waited back (timings unreliable)
 const failures: string[] = [];
 const startedAt = Date.now();
 // The group dir currently accruing reps, so a Ctrl-C mid-soak can still tag it with -BAD<pct>
@@ -320,7 +321,8 @@ let activeGroup: { strDir: string; groupName: string } | null = null;
 const nonOk = () => fail + obsfail + unknown;
 const tally = () =>
   `\n=== TALLY: PASS=${pass} FAIL=${fail} OBSFAIL=${obsfail} UNKNOWN=${unknown} reps=${pass + nonOk()}` +
-  `  (reps with conflict files: ${conflicts}) (reps with a host-outage detour: ${hostOutages}) ===` +
+  `  (reps with conflict files: ${conflicts}) (reps with a host-outage detour: ${hostOutages})` +
+  ` (reps with a local-vault-drift detour: ${vaultDrifts}) ===` +
   (failures.length ? "\nfailing reps:\n" + failures.map((f) => "  " + f).join("\n") : "");
 
 // Permanent bottom status bar, TTY only. We reserve the last terminal row with a VT100
@@ -423,6 +425,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   const { verdict, timings, forensics } = outcome;
 
   if (timings.hostOutage) hostOutages++;
+  if (timings.vaultDrift) vaultDrifts++;
 
   const lost = verdict.notes.flatMap((n) => n.lost);
   const duplicated = verdict.notes.flatMap((n) => n.duplicated);
@@ -438,7 +441,8 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     pass++;
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
     const hostTag = timings.hostOutage ? " (host-outage — timings unreliable)" : "";
-    console.log(`  rep ${id}: PASS${tag}${hostTag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
+    const vaultTag = timings.vaultDrift ? " (local-vault-drift — timings unreliable)" : "";
+    console.log(`  rep ${id}: PASS${tag}${hostTag}${vaultTag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
   } else {
     // Ranked, most-severe-first: never-uploaded > inconclusive timeout > real loss >
     // duplication > divergence. -UNKNOWN is a catch-all that should never fire here (a true

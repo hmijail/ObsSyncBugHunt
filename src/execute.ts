@@ -76,6 +76,8 @@ export interface ExecuteOpts {
   // assertLocalVaultUnchanged compares against on every op that touches the local node.
   // Undefined means it couldn't be captured, so the check below never fires (see run.ts).
   localVaultName?: string;
+  // Overridable so tests don't wait the real 5s worst case — see assertLocalVaultUnchanged.
+  vaultRecheckMs?: number;
   // Overridable so tests don't wait the real ~15s worst case — see assertLocalSyncOn.
   localSyncGraceMs?: number;
   localSyncGraceAttempts?: number;
@@ -98,7 +100,7 @@ export interface RunResult {
   verdict: RunVerdict;
   acked: AckedEdit[];
   observations: NodeObservation[];
-  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean; hostOutage: boolean };
+  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean; hostOutage: boolean; vaultDrift: boolean };
   forensics: LostForensic[];
 }
 
@@ -209,25 +211,38 @@ async function assertLocalSyncOn(driver: ObsidianDriver, opts: ExecuteOpts, logg
   return hostOutage;
 }
 
+const VAULT_RECHECK_MS = 5_000; // recheck every 5s while the active vault doesn't match
+
 /** `obsidian-cli` acts on whatever vault is currently active in the GUI, not one the harness
  *  pins by name — if a human (or Obsidian itself) switches vaults mid-soak, every subsequent
  *  local-node read/write silently targets the wrong data. Checked at the same points as
  *  `assertLocalSyncOn`: once per rep, and before every op that actually touches the local node.
  *  Only a POSITIVELY-read, DIFFERENT name is a problem — a probe timeout/unrecognized reply is
  *  tolerated, same "never manufacture a failure from an inconclusive bounded probe" philosophy
- *  as everywhere else in this file. Throws a plain Error (not CliInconsistencyError): a wrong
- *  vault invalidates every subsequent rep, not just this one, so it must escape runRep's
- *  per-rep catch and abort the whole soak, matching assertLocalSyncOn's own reasoning. */
-async function assertLocalVaultUnchanged(driver: ObsidianDriver, opts: ExecuteOpts): Promise<void> {
-  if (opts.localVaultName === undefined) return; // nothing captured at startup — can't check
+ *  as everywhere else in this file.
+ *
+ *  A mismatch does NOT abort: which vault is active is a human/GUI-controlled condition, not a
+ *  Sync problem — same reasoning as `waitForHostReconnect`. Wait it out instead, unbounded,
+ *  rechecking every `vaultRecheckMs` (default 5s) until the expected vault is confirmed active
+ *  again, logging each phase (`local-vault-changed`, `local-vault-recheck` per attempt,
+ *  `local-vault-restored`). Returns whether it ever had to wait, so the caller can flag this
+ *  rep's timings as unreliable even though it goes on to finish normally. */
+async function assertLocalVaultUnchanged(driver: ObsidianDriver, opts: ExecuteOpts, logger: RunLogger): Promise<boolean> {
+  if (opts.localVaultName === undefined) return false; // nothing captured at startup — can't check
   const probeMs = (opts.probeSec ?? 5) * 1000;
-  const r = await driver.vaultNameProbe(probeMs);
-  if (r.status !== "ok" || r.name === opts.localVaultName) return;
-  throw new Error(
-    `the local node's active vault changed from "${opts.localVaultName}" to "${r.name}" — the ` +
-    `harness requires the same vault to stay active for the whole soak. Switch back to ` +
-    `"${opts.localVaultName}" in Obsidian and re-run.`,
-  );
+  const recheckMs = opts.vaultRecheckMs ?? VAULT_RECHECK_MS;
+  let r = await driver.vaultNameProbe(probeMs);
+  if (r.status !== "ok" || r.name === opts.localVaultName) return false;
+  logger.log({ kind: "local-vault-changed", node: driver.node, expected: opts.localVaultName, observed: r.name });
+  for (;;) {
+    await sleep(recheckMs);
+    r = await driver.vaultNameProbe(probeMs);
+    const back = r.status === "ok" && r.name === opts.localVaultName;
+    logger.log({ kind: "local-vault-recheck", node: driver.node, observed: r.status === "ok" ? r.name : r.status, back });
+    if (back) break;
+  }
+  logger.log({ kind: "local-vault-restored", node: driver.node });
+  return true;
 }
 
 /**
@@ -521,6 +536,10 @@ export async function runHistory(
   // real recovery wait and shouldn't be trusted for latency analysis, even though the rep itself
   // may still finish and judge cleanly.
   let hostOutage = false;
+  // Same idea, but for a local-vault mismatch that was waited out rather than aborted on — a
+  // distinct condition from hostOutage (a human switched vaults, not a connectivity blip), so
+  // tracked separately.
+  let vaultDrift = false;
   // Per-call cap for any bounded sync-state probe this rep makes outside the settle loop itself
   // (the upfront local-Sync check below, waitNodesSynced's baseline poll, pause snapshots) — same
   // knob and rationale as the settle's own probe: never block on a not-yet-synced node.
@@ -535,7 +554,7 @@ export async function runHistory(
   // broken local vault fails fast instead of first burning the whole baseline wait.
   if (opts.localNode !== undefined) {
     hostOutage = await assertLocalSyncOn(driverOf(opts.localNode), opts, logger);
-    await assertLocalVaultUnchanged(driverOf(opts.localNode), opts);
+    vaultDrift = await assertLocalVaultUnchanged(driverOf(opts.localNode), opts, logger);
   }
 
   // No `sync on` here: the network isolator (the default fault primitive) never calls `sync
@@ -659,7 +678,7 @@ export async function runHistory(
         }
         if (activeNode === opts.localNode) {
           hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
-          await assertLocalVaultUnchanged(driverOf(activeNode), opts);
+          vaultDrift ||= await assertLocalVaultUnchanged(driverOf(activeNode), opts, logger);
         }
         const w = await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
         hostOutage ||= w.hostOutage;
@@ -669,7 +688,7 @@ export async function runHistory(
       case "append": {
         if (activeNode === opts.localNode) {
           hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
-          await assertLocalVaultUnchanged(driverOf(activeNode), opts);
+          vaultDrift ||= await assertLocalVaultUnchanged(driverOf(activeNode), opts, logger);
         }
         const noteLetter = op.note!;
         activeNote = opts.noteName(noteLetter); // logical letter -> concrete vault note (also the W target)
@@ -763,6 +782,7 @@ export async function runHistory(
     syncTimedOut: stab.timedOut,
     unsynced: stab.unsynced,
     hostOutage,
+    vaultDrift,
   };
   logger.log({ kind: "timings", ...timings });
   logger.log({ kind: "results", history: str, timings, acked, observations, verdict, forensics, noteLetters: Object.fromEntries(noteLetters) });
