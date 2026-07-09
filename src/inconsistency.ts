@@ -72,6 +72,10 @@ export interface InconsistencyRecord {
   command?: string;
   site?: string;
   stdout?: string;
+  code?: number | null; // the underlying exec's exit code — a nonzero code with a
+                 // CliUnrecognizedOutput usually means the process itself failed (e.g. podman
+                 // couldn't reach a down/absent container), not just a CLI-output-format surprise
+  stderr?: string;
   detail?: Record<string, unknown>;
   at: string;
 }
@@ -90,10 +94,21 @@ export function describeInconsistency(err: CliInconsistencyError | CliUnrecogniz
     rec.recognizer = err.recognizer;
     rec.command = quoteArgv(err.raw.argv);
     rec.stdout = err.raw.stdout;
+    rec.code = err.raw.code;
+    if (err.raw.stderr.trim()) rec.stderr = err.raw.stderr.trim();
   } else {
     rec.detail = err.detail;
   }
   return rec;
+}
+
+/** The compact, copy-paste-friendly diagnostic used both when an inconsistency escapes the rep
+ *  loop (run.ts's uncaughtException handler) and when it's caught per-rep (runRep) — same shape,
+ *  different prefix at each call site. */
+export function formatInconsistency(d: InconsistencyRecord): string {
+  return `${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}` +
+    `${d.command ? `\n  cmd: ${d.command}` : ""}${d.stdout !== undefined ? `\n  out: ${JSON.stringify(d.stdout)}` : ""}` +
+    `${d.code !== undefined && d.code !== 0 ? `\n  code: ${d.code}` : ""}${d.stderr ? `\n  err: ${JSON.stringify(d.stderr)}` : ""}`;
 }
 
 /** Append the record to its durable per-category index (`<runsDir>/OBSFAIL.log` /

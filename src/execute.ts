@@ -55,10 +55,11 @@ export interface ExecuteOpts {
   // no outbound TCP would otherwise treat this as a permanent outage and wait forever anyway
   // (which is often still the right call, just with less useful logging). Default on.
   hostCheck?: boolean;
-  // Per-call `ms` timing on the pause-snapshot (debug/observability aid — see the "pause"
-  // case, useful for spotting a slow snapshot call). Default ON; --skip-snapshot-timing turns
-  // it off without touching the snapshot logic itself.
-  snapshotTiming?: boolean;
+  // Whether the "pause" case's whole snapshot mechanism runs at all (see the "pause" case) — a
+  // real bounded CLI call per driver per touched note, purely diagnostic. Default ON;
+  // --skip-snapshot turns it fully off, in case it's suspected of perturbing timings/results
+  // (same methodological caution as checkWouldFail's own opt-in design).
+  snapshot?: boolean;
   // Recorded into the `history` event only — neither changes execution here. A rep's
   // outcome can depend on which of these governed it (confirmed: the isolator choice alone
   // flips whether a concurrent-create collision produces a conflict file), so both need to
@@ -68,8 +69,10 @@ export interface ExecuteOpts {
   // The local instance (DSL `L`), when configured: its 1-based position within `drivers` (it's
   // just another element of that array, always last — see run.ts) and its own self-reported
   // Obsidian version (likely different from the containers' pinned build, which is the whole
-  // point of testing against it). `localNode` drives both `case "local"`'s resolution and the
-  // D/C defense-in-depth assert below — undefined means no local instance is configured.
+  // point of testing against it). Purely a construction-time detail — used once, inside
+  // runHistory, to get a direct `localDriver` reference; NOT the DSL's own addressing scheme
+  // (N<d> always resolves by container NAME, see driverOf — it can never reach this driver).
+  // Undefined means no local instance is configured.
   localNode?: number;
   localObsidianVersion?: string;
   // Captured once at startup (`vault info=name`, before any rep runs) — the baseline
@@ -92,8 +95,14 @@ export interface ExecuteOpts {
 export interface LostForensic {
   note: string;
   token: string;
+  writer: NodeId; // the node whose edit was lost (from AckedEdit)
   serverRecoverable: boolean; // present in server history despite being gone from the vault
   serverVersions: number[];
+  // Did the writer's own device leave behind ANY conflict file for this note? Per the confirmed
+  // model (see lostForensics's doc comment), a lost token can never itself appear inside a
+  // conflict file — false here means the writer's client never even attempted to preserve its
+  // diverging content for this note, i.e. it silently discarded its own edit.
+  conflictFileFound: boolean;
 }
 
 export interface RunResult {
@@ -413,8 +422,20 @@ export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): P
   }
 }
 
-/** Severity witness: which "lost" tokens are still recoverable from server history. */
-async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promise<LostForensic[]> {
+/** Severity witness: which "lost" tokens are still recoverable from server history, who wrote
+ *  them, and whether the writer left behind the conflict file it should have.
+ *
+ *  Model (per Obsidian's own docs, and independently verified against 140 real conflict files
+ *  captured by this harness, 2026-07-09, 140/140 matching, 0 exceptions): the device holding a
+ *  locally-differing, not-yet-synced edit is the one that "detects" the conflict when an incoming
+ *  remote update supersedes it — it keeps the remote content as the new canonical note and stashes
+ *  its OWN prior content into `(Conflicted copy <device> <ts>)`. Since a device's own stashed
+ *  content only grows via its own sequential local appends, the LAST token inside a conflict file
+ *  is always attributable to the device named in its title (see docs/DESIGN.md). A lost token can
+ *  therefore never appear inside ANY conflict file (that would make it "onlyInConflict", not
+ *  "lost" — see oracle.ts's checkNote) — so `conflictFileFound` checks whether the writer's device
+ *  produced A conflict file for this note at all, not whether it contains this specific token. */
+async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict, acked: AckedEdit[]): Promise<LostForensic[]> {
   const out: LostForensic[] = [];
   for (const nv of verdict.notes) {
     if (nv.lost.length === 0) continue;
@@ -425,9 +446,16 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict): Promi
       const r = await driver.syncRead(nv.note, v);
       contents.push(r.ok ? (r.value ?? "") : "");
     }
+    const conflictDevices = new Set(nv.conflictMeta.map((cm) => cm.device));
     for (const token of nv.lost) {
       const versions = contents.map((c, i) => (c.includes(token) ? i : -1)).filter((i) => i >= 0);
-      out.push({ note: nv.note, token, serverRecoverable: versions.length > 0, serverVersions: versions });
+      const entry = acked.find((a) => a.note === nv.note && a.token === token);
+      assert(entry !== undefined, `lost token ${token} for note ${nv.note} has no matching AckedEdit — oracle.ts's checkNote only ever lists tokens that came from acked in the first place`);
+      out.push({
+        note: nv.note, token, writer: entry.node,
+        serverRecoverable: versions.length > 0, serverVersions: versions,
+        conflictFileFound: conflictDevices.has(entry.node),
+      });
     }
   }
   return out;
@@ -530,7 +558,25 @@ export async function runHistory(
   for (const d of drivers) d.onEvent = (e) => logger.log(e);
   isolator.onEvent = (e) => logger.log(e);
 
-  const driverOf = (num: number) => drivers[num - 1];
+  // `opts.localNode` is purely a construction-time detail (which array slot run.ts put the local
+  // driver in — always last) — used ONCE here to get a direct reference, not as the DSL's own
+  // addressing scheme (see driverOf below).
+  const localDriver = opts.localNode !== undefined ? drivers[opts.localNode - 1] : undefined;
+
+  // N<d> always means the container literally named `n<d>` — never positional, never the local
+  // instance, regardless of how many containers are configured or where `l` sits in --nodes (a
+  // container driver's `.node` is literally its container name — see exec.ts's PodmanExecutor).
+  // "local" is a structurally separate selector, resolved directly via localDriver — it can never
+  // collide with a numbered lookup, since the local driver's name is never "n<number>".
+  const driverOf = (sel: number | "local"): ObsidianDriver => {
+    if (sel === "local") {
+      assert(localDriver !== undefined, "'local' selected but no local driver configured — should be unreachable, run.ts validates L requires a configured local instance before this ever runs");
+      return localDriver;
+    }
+    const d = drivers.find((d) => d.node === `n${sel}`);
+    assert(d !== undefined, `N${sel} has no matching container — configured: ${drivers.filter((d) => d !== localDriver).map((d) => d.node).join(", ") || "(none)"}`);
+    return d;
+  };
   // True once any host-connectivity detour actually fired during this rep (settle-loop cap
   // exhaustion, or the local-Sync guard) — a signal that this rep's timings are inflated by a
   // real recovery wait and shouldn't be trusted for latency analysis, even though the rep itself
@@ -552,9 +598,9 @@ export async function runHistory(
   // than silently timing out reps one after another until some future history happens to touch
   // it. Checked BEFORE waitNodesSynced (the generic, non-throwing baseline gate below) so a
   // broken local vault fails fast instead of first burning the whole baseline wait.
-  if (opts.localNode !== undefined) {
-    hostOutage = await assertLocalSyncOn(driverOf(opts.localNode), opts, logger);
-    vaultDrift = await assertLocalVaultUnchanged(driverOf(opts.localNode), opts, logger);
+  if (localDriver !== undefined) {
+    hostOutage = await assertLocalSyncOn(localDriver, opts, logger);
+    vaultDrift = await assertLocalVaultUnchanged(localDriver, opts, logger);
   }
 
   // No `sync on` here: the network isolator (the default fault primitive) never calls `sync
@@ -564,7 +610,7 @@ export async function runHistory(
   // Start from a known-clean baseline: don't begin editing until every node is synced.
   await waitNodesSynced(drivers, probeMs, logger);
 
-  let activeNode = 1;
+  let activeNode: number | "local" = 1;
   let activeNote: string | undefined;
   const offline = new Set<number>(); // node numbers currently network-disconnected
   const touched = new Set<string>(); // concrete note names seen this run
@@ -582,10 +628,7 @@ export async function runHistory(
         activeNode = op.node!;
         break;
       case "local":
-        // opts.localNode is the local driver's own position within `drivers` (run.ts appends it
-        // last) — from here on it's indistinguishable from any other numbered node to the
-        // rest of this function, except D/C refuse it (see the asserts below).
-        activeNode = opts.localNode!;
+        activeNode = "local";
         break;
       case "pause": {
         // Logged at START: a pause has no result to report beyond "I did the thing" (just the
@@ -599,61 +642,65 @@ export async function runHistory(
         // is a single bounded attempt via the driver's snapshot* methods — never the paranoid,
         // retrying read()/files()/listDirFs() the oracle uses. A wedged or unrecognized reply
         // is recorded as-is, never chased, so a snapshot can never itself stall the harness.
-        //
-        // `NOTE_DIR` accumulates every rep of a soak, so a bare folder listing is mostly
-        // OTHER reps' notes. Scope both listings down to files that belong to THIS rep: an
-        // entry is relevant iff it's exactly one of our touched notes, or a "(Conflicted
-        // copy ...)" of one. `fs` entries are bare filenames (a raw `ls` inside the folder);
-        // `files` entries carry the NOTE_DIR/ prefix (the CLI's own vault-relative paths).
-        const touchedList = [...touched];
-        const noteBase = (fullname: string) => fullname.slice(NOTE_DIR.length + 1); // strip "bughunt/"
-        const isRelevant = (entry: string, base: string) => entry === `${base}.md` || entry.startsWith(`${base} (Conflicted copy`);
-        // A synced node's sync:status replies quickly; an unsynced one blocks for the WHOLE
-        // budget regardless (it never returns early with a "syncing" word — see
-        // syncStateProbe), so a short cap here just makes that wasted wait cheap. Separate from
-        // the settle's own probeMs (unchanged, different concern).
-        const SNAPSHOT_SYNC_PROBE_MS = 1000;
-        // Debug/observability aid: time each call individually (useful for spotting a slow
-        // snapshot call), without affecting their concurrency. Default on; --skip-snapshot-timing
-        // (opts.snapshotTiming === false) drops the `ms` fields with no other code change.
-        const mkTimed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms?: number }> => {
-          const t0 = Date.now();
-          const value = await fn();
-          return { value, ms: opts.snapshotTiming === false ? undefined : Date.now() - t0 };
-        };
-        const nodesSnapshot = await Promise.all(
-          drivers.map(async (d) => {
-            const [syncT, fsT, filesT, notesT] = await Promise.all([
-              mkTimed(() => syncState(d, SNAPSHOT_SYNC_PROBE_MS)),
-              mkTimed(() => d.snapshotFs(NOTE_DIR, probeMs)),
-              mkTimed(() => d.snapshotFiles(NOTE_DIR, probeMs)),
-              Promise.all(touchedList.map(async (fullname) => {
-                const { value: r, ms } = await mkTimed(() => d.snapshotRead(fullname, probeMs));
-                return [noteLetters.get(fullname) ?? fullname, ms !== undefined ? { ...r, ms } : r] as const;
-              })),
-            ]);
-            const fsRelevant = (fsT.value.entries ?? []).filter((e) => touchedList.some((f) => isRelevant(e, noteBase(f))));
-            const filesRelevant = (filesT.value.entries ?? []).filter((e) => touchedList.some((f) => isRelevant(e, f)));
-            // Conflict-file NAMES only (from the one `files` call — cheap, bounded, no
-            // per-file follow-up reads); their content is what the settle-time oracle judges.
-            const conflicts = filesRelevant.filter(isConflictFile);
-            return {
-              node: d.node,
-              sync: syncT.ms !== undefined ? { state: syncT.value, ms: syncT.ms } : syncT.value,
-              fs: { status: fsT.value.status, entries: fsRelevant, ...(fsT.ms !== undefined ? { ms: fsT.ms } : {}) },
-              files: { status: filesT.value.status, conflicts, ...(filesT.ms !== undefined ? { ms: filesT.ms } : {}) },
-              notes: Object.fromEntries(notesT),
-            };
-          }),
-        );
-        logger.log({ kind: "pause-snapshot", seconds: op.seconds, nodes: nodesSnapshot });
+        // Entirely opt-out via --skip-snapshot (opts.snapshot === false): none of these CLI
+        // calls happen at all, and no `pause-snapshot` event is logged for this P — in case the
+        // extra calls are suspected of perturbing timings/results (same caution as
+        // checkWouldFail's own opt-in design, just the opposite default).
+        if (opts.snapshot !== false) {
+          // `NOTE_DIR` accumulates every rep of a soak, so a bare folder listing is mostly
+          // OTHER reps' notes. Scope both listings down to files that belong to THIS rep: an
+          // entry is relevant iff it's exactly one of our touched notes, or a "(Conflicted
+          // copy ...)" of one. `fs` entries are bare filenames (a raw `ls` inside the folder);
+          // `files` entries carry the NOTE_DIR/ prefix (the CLI's own vault-relative paths).
+          const touchedList = [...touched];
+          const noteBase = (fullname: string) => fullname.slice(NOTE_DIR.length + 1); // strip "bughunt/"
+          const isRelevant = (entry: string, base: string) => entry === `${base}.md` || entry.startsWith(`${base} (Conflicted copy`);
+          // A synced node's sync:status replies quickly; an unsynced one blocks for the WHOLE
+          // budget regardless (it never returns early with a "syncing" word — see
+          // syncStateProbe), so a short cap here just makes that wasted wait cheap. Separate from
+          // the settle's own probeMs (unchanged, different concern).
+          const SNAPSHOT_SYNC_PROBE_MS = 1000;
+          // Time each call individually (debug aid, spotting a slow snapshot call), without
+          // affecting their concurrency.
+          const mkTimed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms: number }> => {
+            const t0 = Date.now();
+            const value = await fn();
+            return { value, ms: Date.now() - t0 };
+          };
+          const nodesSnapshot = await Promise.all(
+            drivers.map(async (d) => {
+              const [syncT, fsT, filesT, notesT] = await Promise.all([
+                mkTimed(() => syncState(d, SNAPSHOT_SYNC_PROBE_MS)),
+                mkTimed(() => d.snapshotFs(NOTE_DIR, probeMs)),
+                mkTimed(() => d.snapshotFiles(NOTE_DIR, probeMs)),
+                Promise.all(touchedList.map(async (fullname) => {
+                  const { value: r, ms } = await mkTimed(() => d.snapshotRead(fullname, probeMs));
+                  return [noteLetters.get(fullname) ?? fullname, { ...r, ms }] as const;
+                })),
+              ]);
+              const fsRelevant = (fsT.value.entries ?? []).filter((e) => touchedList.some((f) => isRelevant(e, noteBase(f))));
+              const filesRelevant = (filesT.value.entries ?? []).filter((e) => touchedList.some((f) => isRelevant(e, f)));
+              // Conflict-file NAMES only (from the one `files` call — cheap, bounded, no
+              // per-file follow-up reads); their content is what the settle-time oracle judges.
+              const conflicts = filesRelevant.filter(isConflictFile);
+              return {
+                node: d.node,
+                sync: { state: syncT.value, ms: syncT.ms },
+                fs: { status: fsT.value.status, entries: fsRelevant, ms: fsT.ms },
+                files: { status: filesT.value.status, conflicts, ms: filesT.ms },
+                notes: Object.fromEntries(notesT),
+              };
+            }),
+          );
+          logger.log({ kind: "pause-snapshot", seconds: op.seconds, nodes: nodesSnapshot });
+        }
         await checkWouldFail(drivers, offline, touched, acked, opts, logger, (Date.now() - startedAt) / 1000);
         break;
       }
       case "disconnect":
         // Defense-in-depth: dsl.ts's assertLocalAlwaysConnected already makes this unreachable
         // via any real history, but never trust a single layer for "never disconnect the local instance".
-        assert(activeNode !== opts.localNode, "the local node must never be disconnected");
+        assert(activeNode !== "local", "the local node must never be disconnected");
         // Logged at START: no result of its own beyond "I did the thing" — the actual outcome
         // (each reachability attempt, and how long it took) is network-probe's job, at ITS finish.
         logger.log({ kind: "disconnecting", node: driverOf(activeNode).node });
@@ -661,7 +708,7 @@ export async function runHistory(
         offline.add(activeNode);
         break;
       case "connect":
-        assert(activeNode !== opts.localNode, "the local node must never be disconnected");
+        assert(activeNode !== "local", "the local node must never be disconnected");
         logger.log({ kind: "connecting", node: driverOf(activeNode).node });
         await isolator.connect(driverOf(activeNode).node);
         offline.delete(activeNode);
@@ -672,11 +719,11 @@ export async function runHistory(
         // client reports, not what other nodes/the network are seeing (that whole-system
         // "god's-eye" check is what the FINAL settle is for, across every node and note).
         // A W on a disconnected node can't make progress — NOP it rather than block.
-        if (offline.has(activeNode)) {
+        if (activeNode !== "local" && offline.has(activeNode)) {
           logger.log({ kind: "wait-skip", node: driverOf(activeNode).node, note: activeNote, reason: "offline" });
           break;
         }
-        if (activeNode === opts.localNode) {
+        if (activeNode === "local") {
           hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
           vaultDrift ||= await assertLocalVaultUnchanged(driverOf(activeNode), opts, logger);
         }
@@ -686,7 +733,7 @@ export async function runHistory(
         break;
       }
       case "append": {
-        if (activeNode === opts.localNode) {
+        if (activeNode === "local") {
           hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
           vaultDrift ||= await assertLocalVaultUnchanged(driverOf(activeNode), opts, logger);
         }
@@ -771,9 +818,12 @@ export async function runHistory(
     }
   }
 
-  const forensics = await lostForensics(drivers[0], verdict);
+  const forensics = await lostForensics(drivers[0], verdict, acked);
   for (const f of forensics) {
-    logger.log({ kind: "lost-forensic", note: f.note, token: f.token, serverRecoverable: f.serverRecoverable, serverVersions: f.serverVersions });
+    logger.log({
+      kind: "lost-forensic", note: f.note, token: f.token, writer: f.writer,
+      serverRecoverable: f.serverRecoverable, serverVersions: f.serverVersions, conflictFileFound: f.conflictFileFound,
+    });
   }
 
   const timings = {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classify, tokensIn, letterOf, buildStateCells, stateKey, renderCategoryTable, renderGroup, line, isUninteresting, type Results, type StateEntry } from "./analyze.js";
+import { classify, tokensIn, letterOf, buildStateCells, stateKey, renderCategoryTable, renderGroup, line, isUninteresting, renderUninteresting, type Results, type StateEntry } from "./analyze.js";
 
 const converged = (note: string, canonical: string, conflicts: { file: string; content: string }[] = []) => ({
   note, lost: [] as string[], onlyInConflict: [] as string[], converged: true, conflictFiles: conflicts.length,
@@ -142,7 +142,7 @@ test("renderGroup: only non-empty categories appear, in ranked order", () => {
   assert.ok(md.startsWith("# N1AaWN2Aa"), "history string heads the section");
 });
 
-test("line: only non-zero fields are shown, and convergenceSec reports min/avg/max/span", () => {
+test("line: only non-zero fields are shown, and convergenceSec reports min/median/max/span", () => {
   const g = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
@@ -151,7 +151,18 @@ test("line: only non-zero fields are shown, and convergenceSec reports min/avg/m
   const l = line(g);
   assert.ok(l.includes("reps=3 pass=3"));
   assert.ok(!l.includes("fail="), "a zero field is omitted");
-  assert.ok(l.includes("min=5 avg=8 max=11 span=6"));
+  assert.ok(l.includes("min=5 median=8 max=11 span=6"));
+});
+
+test("line: median (not average) is robust to a single huge transient outlier", () => {
+  const g = {
+    reps: 4, pass: 4, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [1, 2, 3, 100],
+    obsfail: 0, unknown: 0, categories: new Map(),
+  };
+  const l = line(g);
+  // avg would be 26.5 (dragged way up by the 100); the median stays near the typical values.
+  assert.ok(l.includes("min=1 median=3 max=100 span=99"), l);
 });
 
 test("isUninteresting: all-PASS reps landing in the same state -> true", () => {
@@ -192,4 +203,22 @@ test("isUninteresting: any real failure -> false, even with a single PASS state 
     ]),
   };
   assert.equal(isUninteresting(g), false);
+});
+
+test("renderUninteresting: a table with min/median/max/span per history, heading starts with a capital U", () => {
+  const g1 = {
+    reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
+    obsfail: 0, unknown: 0, categories: new Map(),
+  };
+  const g2 = {
+    reps: 1, pass: 1, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [] as number[],
+    obsfail: 0, unknown: 0, categories: new Map(),
+  };
+  const md = renderUninteresting([["histA", g1], ["histB", g2]]);
+  assert.ok(md.startsWith("# Uninteresting"), md);
+  assert.ok(md.includes("| history | min | median | max | span |"));
+  assert.ok(md.includes("| histA | 5 | 8 | 11 | 6 |"));
+  assert.ok(md.includes("| histB | n/a | n/a | n/a | n/a |"), "an empty conv array (no timing data) renders as n/a, not a crash");
 });

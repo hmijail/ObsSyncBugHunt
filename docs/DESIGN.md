@@ -93,3 +93,29 @@ participant — `assertLocalSyncOn` (`execute.ts`) checks its Sync state before 
 performs; a host-internet blip gets a chance to recover first (see the settle loop's own
 host-outage handling), but a genuinely off Sync state aborts the whole run (not just the rep),
 since it invalidates every subsequent rep until a human notices and fixes it.
+
+## Conflict-file attribution: the title's device always matches the last token inside
+
+Per Obsidian's own docs: the device holding a locally-differing, not-yet-synced edit is the one
+that "detects" the conflict when an incoming remote update supersedes it — it adopts the remote
+content as the new canonical note and stashes its OWN prior content into
+`(Conflicted copy <device> <ts>)`. Since a device's own stashed content only grows via its own
+sequential local appends (`A<x>` always calls `appendLine`, never `prependLine` — confirmed by
+reading `execute.ts`'s op interpreter, the only call site), the LAST token inside a conflict file
+is always attributable to the device named in its title.
+
+Verified against real data, not just the docs, 2026-07-09: checked all 140 conflict files then
+present in the local node's `bughunt/` folder (obsidian-cli `files`/`read`, scripted) — 140/140
+matched (the device parsed from each filename equaled the writer of the last token in its
+content), 0 exceptions.
+
+This makes a lost token's expected culprit directly derivable, no guessing needed: `AckedEdit`
+(`oracle.ts`) already records who wrote every token, so for a `lost` token the writer is known
+for free. `execute.ts`'s `lostForensics` uses this to compute `conflictFileFound` per lost
+token — whether the writer's own device left behind ANY conflict file for that note. Note it
+checks for *a* conflict file from that device, not one *containing* the specific lost token: by
+oracle.ts's own definition (`checkNote`), a token present in a conflict file is `onlyInConflict`,
+not `lost` — a truly lost token can never appear inside any conflict file, so the presence check
+has to be on the device, not the content. `conflictFileFound: false` is the clean, expected shape
+of a real bug: the writer's client never even attempted to preserve its diverging edit before
+silently discarding it.

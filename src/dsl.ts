@@ -6,7 +6,8 @@ import assert from "node:assert/strict";
 // cursor that persists until changed (N). Each append names its own note, so a history
 // reads as what the USER does — the user never "syncs", they only Wait and hope it happens.
 //
-//   N<d>   set active node           (N1, N2)
+//   N<d>   set active node           (N1, N2 — always the container literally named n1/n2,
+//          regardless of --nodes order; see execute.ts's driverOf)
 //   L      set active node to the local instance (a real Obsidian instance running directly on
 //          this host, if configured) — exempt from D/C: it must always stay connected, see
 //          assertLocalAlwaysConnected below
@@ -214,4 +215,22 @@ export function normalize(h: History): History {
  *  execute.ts/repro.ts. */
 export function usesLocal(h: History): boolean {
   return h.some((op) => op.cmd === "local");
+}
+
+/** Every node/local selector a NORMALIZED history's ops actually exercise while running an
+ *  action (D/C/A/W) — including the IMPLICIT starting cursor (node 1) if an action happens
+ *  before the first explicit N/L selector (e.g. "Aa" needs node 1 even though it never writes
+ *  N1). This is what a --history run actually needs configured/participating — run.ts uses it
+ *  to derive --nodes/NODES automatically instead of requiring it. */
+export function requiredNodes(h: History): { containers: number[]; local: boolean } {
+  let active: number | "local" = 1;
+  const containers = new Set<number>();
+  let local = false;
+  for (const op of h) {
+    if (op.cmd === "node") { active = op.node!; continue; }
+    if (op.cmd === "local") { active = "local"; continue; }
+    if (op.cmd === "pause") continue; // touches no node
+    if (active === "local") local = true; else containers.add(active);
+  }
+  return { containers: [...containers].sort((a, b) => a - b), local };
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parse, serialize, normalize, usesLocal, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesLocal, requiredNodes, type History } from "./dsl.js";
 
 test("parses the worked example N1DAaC", () => {
   const h = parse("N1DAaC");
@@ -107,4 +107,27 @@ test("normalize: D/C on a numbered node is unaffected by the local-instance safe
 test("usesLocal: true iff the history ever selects the local instance", () => {
   assert.equal(usesLocal(parse("N1AaN2Ab")), false);
   assert.equal(usesLocal(parse("N1AaLAaN2Ab")), true);
+});
+
+test("requiredNodes: explicit-selector-first history — deduped, sorted containers, no local", () => {
+  assert.deepEqual(requiredNodes(parse("N2AaN1AbN2Ac")), { containers: [1, 2], local: false });
+  assert.deepEqual(requiredNodes(parse("N1AaLAaN1Ab")), { containers: [1], local: true });
+});
+
+test("requiredNodes: an action before any explicit selector implicitly requires node 1", () => {
+  assert.deepEqual(requiredNodes(parse("Aa")), { containers: [1], local: false });
+  assert.deepEqual(requiredNodes(parse("DAaC")), { containers: [1], local: false });
+});
+
+test("requiredNodes: a local-only history requires no containers", () => {
+  assert.deepEqual(requiredNodes(parse("LAaPAa")), { containers: [], local: true });
+});
+
+test("requiredNodes: an empty or pause-only history requires nothing", () => {
+  assert.deepEqual(requiredNodes(parse("")), { containers: [], local: false });
+  assert.deepEqual(requiredNodes(parse("P30")), { containers: [], local: false });
+});
+
+test("requiredNodes: D/C alone (no append) still marks its node required", () => {
+  assert.deepEqual(requiredNodes(parse("N2DC")), { containers: [2], local: false });
 });

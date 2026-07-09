@@ -8,11 +8,14 @@
 // string only, NEVER merged across different histories — note letters/tokens from
 // unrelated DSL structures aren't comparable. A history that's all-PASS and landed in the
 // exact same state every rep is "uninteresting" — nothing to dig into — so it's pulled out
-// of the per-history sections entirely and just named under a trailing `# uninteresting`
-// list instead. History sections render at `#`; their category tables at `##`. Directories
-// are processed in alphabetical order, so ties in the interesting-first ranking (and the
-// uninteresting list itself) come out deterministic, not filesystem-order-dependent. Pure
-// file reader — run anytime.
+// of the per-history sections entirely and listed, one row per history with its own
+// convergence-time stats, in a trailing `# Uninteresting` table instead. History sections
+// render at `#`; their category tables at `##`. Both the interesting sections and the
+// uninteresting table are ordered newest-first (history dirnames are `DDTHHMMSS-<dsl>`
+// prefixed, so plain descending string comparison is chronological). Every timing stat uses
+// the MEDIAN, not the average — a single rare-but-huge transient outlier (e.g. one 8-hour
+// stall) would drag an average up and hide what's actually typical. Pure file reader — run
+// anytime.
 //
 //   npm run analyze            (reads ./runs, writes ./runs/analysis.md)
 //   npm run analyze -- <dir>
@@ -120,11 +123,23 @@ const newGroup = (): Group => ({
 });
 
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
-const stats = (xs: number[]) => {
-  if (!xs.length) return "n/a";
+
+// median, not avg — a single rare-but-huge transient outlier (e.g. one 8-hour stall) would drag
+// an average up and hide what's actually typical.
+interface Stats { min: number; median: number; max: number; span: number }
+function median(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
+}
+function computeStats(xs: number[]): Stats | null {
+  if (!xs.length) return null;
   const min = Math.min(...xs), max = Math.max(...xs);
-  const avg = Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
-  return `min=${min} avg=${avg} max=${max} span=${max - min}`;
+  return { min, median: median(xs), max, span: max - min };
+}
+const stats = (xs: number[]): string => {
+  const s = computeStats(xs);
+  return s ? `min=${s.min} median=${s.median} max=${s.max} span=${s.span}` : "n/a";
 };
 
 function tally(g: Group, r: Results, rep: string) {
@@ -209,6 +224,21 @@ export function renderGroup(str: string, g: Group): string {
   return sections.join("\n");
 }
 
+/** One row per uninteresting history, its own convergence-time stats as columns rather than one
+ *  history's own (now-absent) section — the whole point of pulling these out is a quick scan, not
+ *  having to open each one individually. */
+export function renderUninteresting(rows: [string, Group][]): string {
+  const header = "| history | min | median | max | span |";
+  const sep = "|---|---|---|---|---|";
+  const body = rows.map(([str, g]) => {
+    const s = computeStats(g.conv);
+    return s
+      ? `| ${str} | ${s.min} | ${s.median} | ${s.max} | ${s.span} |`
+      : `| ${str} | n/a | n/a | n/a | n/a |`;
+  });
+  return ["# Uninteresting", "", header, sep, ...body, ""].join("\n");
+}
+
 // A history is "uninteresting" when every rep passed AND every one of them landed in the exact
 // same state (nothing to compare, nothing to dig into) — a full per-history breakdown for that
 // is just noise. `byState` missing/empty counts too (older results.json with no `observations`
@@ -218,13 +248,6 @@ export function isUninteresting(g: Group): boolean {
   const byState = g.categories.get("PASS");
   return !byState || byState.size <= 1;
 }
-
-// Surface the most interesting histories first: real findings (oracle fail + the client
-// misreported its vault) outrank everything, then losses, then the can't-judge unknowns.
-// NOTE: no cross-history OVERALL aggregate — note letters restart from `a` for every
-// independently-generated history, so merging states (or even convergence-time stats) across
-// unrelated histories would be exactly the "collapsing across different histories" mistake.
-const rank = (g: Group) => g.fail + g.obsfail;
 
 /** Walk `base` (runs/<history>/<rep>/), tally every rep, and write `<base>/analysis.md`. The
  *  only I/O in this module — everything above is pure and unit-tested directly. */
@@ -259,14 +282,18 @@ export function main(base: string): void {
     }
   }
 
-  const active = [...groups.entries()].filter(([, g]) => g.reps > 0);
-  const interesting = active.filter(([, g]) => !isUninteresting(g))
-    .sort((a, b) => (rank(b[1]) - rank(a[1])) || (b[1].lost - a[1].lost) || (b[1].unknown - a[1].unknown));
-  const uninteresting = active.filter(([, g]) => isUninteresting(g)).map(([str]) => str).sort();
+  // Newest-first, everywhere: history dirnames are DDTHHMMSS-<dsl> prefixed, so descending
+  // string comparison is chronological. NOTE: no cross-history OVERALL aggregate — note
+  // letters restart from `a` for every independently-generated history, so merging states (or
+  // even convergence-time stats) across unrelated histories would be exactly the "collapsing
+  // across different histories" mistake — this sort only reorders whole groups, never merges them.
+  const active = [...groups.entries()].filter(([, g]) => g.reps > 0).sort(([a], [b]) => b.localeCompare(a));
+  const interesting = active.filter(([, g]) => !isUninteresting(g));
+  const uninteresting = active.filter(([, g]) => isUninteresting(g));
 
   const totalReps = [...groups.values()].reduce((s, g) => s + g.reps, 0);
   const sections = interesting.map(([str, g]) => renderGroup(str, g));
-  if (uninteresting.length > 0) sections.push(["# uninteresting", "", ...uninteresting, ""].join("\n"));
+  if (uninteresting.length > 0) sections.push(renderUninteresting(uninteresting));
   const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");
   writeFileSync(outPath, md + "\n");

@@ -11,10 +11,13 @@
 IMAGE      := obsidian-node
 LOGIN      := obsidian-login
 NET        := obsidian-net
-# The literal "l" here is the on/off switch for the local instance (DSL's `L`) — LOCAL_BIN below
-# only supplies its binary path. Drop it (NODES="n1 n2") to exclude it; podman-container targets
-# below use CONTAINER_NODES (NODES minus "l") so they never try to manage it as a container.
-NODES      := n1 n2 l
+# Only consulted for a HISTORY-less run (generate/campaign/soak without HISTORY) — with HISTORY
+# set, run.ts derives participants (which containers, and whether the local instance) straight
+# from the DSL string itself, so this default never matters there. The literal "l" is the on/off
+# switch for the local instance (DSL's `L`) — LOCAL_BIN below only supplies its binary path; add it
+# (NODES="n1 n2 l") to include it in historyless generation. podman-container targets below use
+# CONTAINER_NODES (NODES minus "l") so they never try to manage it as a container.
+NODES      := n1 n2
 # NODES is space-separated internally (NODES_CSV below comma-joins it for the CLI flag) — but
 # `make soak NODES=n1,l` (comma-separated, matching how the CLI itself takes --nodes) is a
 # completely natural thing to type, and silently produced a single mangled word ("n1,l") that
@@ -79,7 +82,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
   $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
   $(if $(RUNS_PREFIX),--runs-prefix $(RUNS_PREFIX)) \
-  $(if $(SKIP_SNAPSHOT_TIMING),--skip-snapshot-timing) \
+  $(if $(SKIP_SNAPSHOT),--skip-snapshot) \
   $(if $(WOULD_FAIL_CHECK),--would-fail-check)
 
 .DEFAULT_GOAL := help

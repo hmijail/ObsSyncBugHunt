@@ -254,6 +254,80 @@ test("a local-instance-backed third driver: W still scopes to 1, the final settl
   assert.ok(final.every((e) => (e.states as unknown[]).length === 3), "the final settle probes all 3 drivers, including the local instance");
 });
 
+// --- driverOf resolves N<d> by container NAME, not array position -------------------------
+test("driverOf resolves N<d> by container name, not array position (the NODES=l,n2 crash scenario)", async () => {
+  const vault = new Map<string, string>();
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  // drivers = [n2, local] — only ONE container, at array position 1; local at position 2.
+  // Before this fix, N2 would have positionally resolved to drivers[1] = local (the real bug
+  // that crashed a live soak). It must now resolve to the container actually named "n2".
+  await runHistory([n2, local], new NoopIsolator(), logger, parse("N2AaLAa"), {
+    noteName: (l) => `bughunt/${l}`, localNode: 2, hostCheck: false,
+    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+  });
+  const appended = events.filter((e) => e.kind === "appended");
+  assert.equal(appended.length, 2);
+  assert.equal(appended[0].node, "n2", "N2 must append via the container named n2, not local");
+  assert.equal(appended[1].node, "MyLocal", "L must append via the local driver");
+});
+
+test("N<d> with no matching configured container throws a clear error naming what's missing", async () => {
+  const vault = new Map<string, string>();
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const noLog = { log() {} } as unknown as RunLogger;
+  await assert.rejects(
+    () => runHistory([n2], new NoopIsolator(), noLog, parse("N1Aa"), {
+      noteName: (l) => `bughunt/${l}`, hostCheck: false,
+    }),
+    /N1 has no matching container/,
+  );
+});
+
+test("driverOf is order-independent: N1/N2 resolve correctly even when drivers are constructed out of order", async () => {
+  const vault = new Map<string, string>();
+  // Deliberately swapped: n2 passed before n1.
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  await runHistory([n2, n1], new NoopIsolator(), logger, parse("N1AaN2Aa"), {
+    noteName: (l) => `bughunt/${l}`, hostCheck: false,
+    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+  });
+  const appended = events.filter((e) => e.kind === "appended");
+  assert.equal(appended.length, 2);
+  assert.equal(appended[0].node, "n1", "N1 must resolve to container n1 regardless of array order");
+  assert.equal(appended[1].node, "n2", "N2 must resolve to container n2 regardless of array order");
+});
+
+// --- opts.snapshot: skip the whole pause-snapshot mechanism, not just its timing fields -----
+test("opts.snapshot: false skips the whole pause-snapshot mechanism — no event logged", async () => {
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  await runHistory([n1], new NoopIsolator(), logger, parse("AaP1"), {
+    noteName: (l) => `bughunt/${l}`, hostCheck: false, snapshot: false,
+    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+  });
+  assert.equal(events.filter((e) => e.kind === "pause-snapshot").length, 0);
+});
+
+test("pause-snapshot is logged by default (opts.snapshot unset)", async () => {
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const events: Record<string, unknown>[] = [];
+  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  await runHistory([n1], new NoopIsolator(), logger, parse("AaP1"), {
+    noteName: (l) => `bughunt/${l}`, hostCheck: false,
+    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+  });
+  assert.equal(events.filter((e) => e.kind === "pause-snapshot").length, 1);
+});
+
 test("the D/C defense-in-depth assert fires if a D op is forced through while the local instance is active (bypassing dsl.ts's normalize-time guarantee on purpose)", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
@@ -506,5 +580,80 @@ test("checkWouldFail: a stable node-vs-node DISAGREEMENT (SYNCBAD-shaped) is nev
     assert.equal(events.filter((e) => e.kind === "would-fail").length, 0);
   } finally {
     rmSync(tmpRunsDir, { recursive: true, force: true });
+  }
+});
+
+// --- lostForensics: writer attribution + conflictFileFound --------------------------------
+// Like VanishingExecutor (a lone driver trivially converges with itself, so the final settle
+// completes regardless of Round 9's convergence requirement), except sync:history/sync:read
+// (the SERVER-side truth lostForensics queries) always reflect the vault regardless of `gone()`,
+// while files/read (the CLIENT-facing view) go empty once gone — modeling "the server still has
+// it in history, but the local client no longer shows it as current". Optionally also serves a
+// "(Conflicted copy n1 <ts>)" file once gone, to control conflictFileFound independently.
+class LostForensicExecutor implements Executor {
+  id = "n1";
+  private vault = new Map<string, string>();
+  private start = Date.now();
+  constructor(private readonly vanishAtMs: number, private readonly conflictContent: string | null) {}
+  private elapsed() { return Date.now() - this.start; }
+  private gone() { return this.elapsed() >= this.vanishAtMs; }
+  async exec(args: string[]): Promise<ExecResult> {
+    const r = (stdout: string): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
+    const params = Object.fromEntries(args.slice(1).map((a) => {
+      const i = a.indexOf("=");
+      return i < 0 ? [a, ""] : [a.slice(0, i), a.slice(i + 1)];
+    }));
+    const notFound = (file: string) => r(`Error: File "${file}" not found.`);
+    const CONFLICT = "bughunt/a (Conflicted copy n1 202607091600).md"; // must match the actual note (letter "a")
+    switch (args[0]) {
+      case "sync:status": return r("status: synced");
+      case "sync:history": return this.vault.has(params.file) ? r("1") : notFound(params.file);
+      case "sync:read": return this.vault.has(params.file) ? r(`${params.file} (version 0, 2026-07-09 16:00:00)\n---\n${this.vault.get(params.file)}`) : notFound(params.file);
+      case "files": {
+        const names = this.gone() ? [] : [...this.vault.keys()].map((k) => `${k}.md`);
+        if (this.gone() && this.conflictContent !== null) names.push(CONFLICT);
+        return r(names.join("\n"));
+      }
+      case "read": {
+        if (params.path === CONFLICT && this.conflictContent !== null) return r(this.conflictContent);
+        if (!this.gone() && this.vault.has(params.file)) return r(this.vault.get(params.file)!);
+        return notFound(params.file ?? params.path);
+      }
+      case "create": {
+        const file = params.path ? params.path.replace(/\.md$/, "") : params.name;
+        this.vault.set(file, params.content ?? "");
+        return r(`Created: ${file}`);
+      }
+      case "append": {
+        const prev = this.vault.get(params.file) ?? "";
+        this.vault.set(params.file, prev ? `${prev}\n${params.content}` : params.content);
+        return r(`Appended to: ${params.file}`);
+      }
+      case "open": return r(`Opened: ${params.file}`);
+      default: return r("");
+    }
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+test("lostForensics: writer is attributed from AckedEdit, and conflictFileFound reflects whether the writer's device left ANY conflict file for the note (not necessarily containing the lost token itself)", async () => {
+  for (const conflictContent of ["(n1-0-x)", null]) {
+    const n1 = new ObsidianDriver(new LostForensicExecutor(15, conflictContent));
+    const events: Record<string, unknown>[] = [];
+    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    // A pause before the final settle, well past vanishAtMs, guarantees the settle observes it
+    // already gone (mirrors the checkWouldFail/VanishingExecutor tests' own timing pattern).
+    const result = await runHistory([n1], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.05 }], {
+      noteName: (l) => `bughunt/${l}`, hostCheck: false,
+      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+    });
+    assert.equal(result.verdict.notes[0].lost.length, 1, "the token really did vanish — a genuine LOST");
+    assert.equal(result.forensics.length, 1);
+    const f = result.forensics[0];
+    assert.equal(f.writer, "n1", "attributed from acked, not guessed");
+    assert.equal(f.serverRecoverable, true, "the server-side history still has it — this isn't testing that path");
+    assert.equal(f.conflictFileFound, conflictContent !== null, `conflictContent=${conflictContent}`);
   }
 });

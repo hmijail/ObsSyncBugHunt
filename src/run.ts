@@ -9,12 +9,15 @@
 // `make soak TURNS=paced` to the flags below), or run directly: `npm run start -- <flags>`.
 //
 //   --nodes          comma-separated container names, plus the literal "l" to include the local
-//                    instance — e.g. "n1,n2,l" (default n1,n2). "l" is the sole on/off switch for
+//                    instance — e.g. "n1,n2,l" (default n1,n2). ONLY consulted when --history is
+//                    NOT given: with --history, the participants (which containers, and whether
+//                    the local instance) are derived directly from the DSL string itself (see
+//                    dsl.ts's requiredNodes) — --nodes/NODES is ignored entirely in that mode, so
+//                    its value (default or explicit) never matters. Without --history (generation:
+//                    --generate / campaign / soak-without-HISTORY), --nodes/NODES is required —
+//                    there's nothing to derive a node pool from. "l" is the sole on/off switch for
 //                    the DSL's `L` node (a real, always-connected Obsidian instance running
-//                    directly on this host; never a D/C target, see dsl.ts) — --local-bin only
-//                    supplies its binary path, so "l" in --nodes without --local-bin/LOCAL_BIN set
-//                    fails fast at startup rather than crashing mid-run (and vice versa: a history
-//                    using `L` without "l" in --nodes also fails fast). Its Sync state is also
+//                    directly on this host; never a D/C target, see dsl.ts). Its Sync state is
 //                    checked before every op it performs (paused/error/stopped/offline aborts the
 //                    whole run — see execute.ts's assertLocalSyncOn, though a host-internet blip
 //                    gets a chance to recover first); its vault path is self-reported (`vault
@@ -23,8 +26,8 @@
 //   --bin            CLI path inside the container           (default /opt/obsidian/obsidian-cli)
 //   --isolator       network | sync                          (default network)
 //   --network        podman network                          (default obsidian-net)
-//   --local-bin      path to a local obsidian-cli binary (NOT the container's path — only used if
-//                    "l" is in --nodes; see above
+//   --local-bin      path to a local obsidian-cli binary (NOT the container's path)
+//                    (default: obsidian, relying on the normal install/activation flow's PATH entry)
 //   --local-node-id  the local instance's own Sync-reported device name (default: OS `hostname`,
 //                    which is a guess, not verified to match — see run.ts's own comment on this)
 //   --history        run a specific DSL string (else generate)
@@ -50,7 +53,8 @@
 //                    offline (a different question from Sync's own health).
 //   --probe-sec      per-call cap on the settle's sync:status probe (default 5; it blocks until synced)
 //   --runs-prefix    parent dir for runs/ (default: cwd, i.e. plain ./runs)
-//   --skip-snapshot-timing  omit the pause-snapshot's per-call `ms` fields (debug aid, on by default)
+//   --skip-snapshot  skip the whole pause-snapshot mechanism (no extra CLI calls at all during a
+//                    P) — in case it's suspected of perturbing timings/results. On by default.
 //   --would-fail-check  opt-in early-warning: during a P/W with every relevant node online, judge
 //                    a fresh observation against the real oracle; log `would-fail` (+ WOULDFAIL.log)
 //                    on LOST/DUPL. Off by default — every check here is a real extra CLI call (see
@@ -70,11 +74,11 @@ import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js"
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
-import { parse, serialize, normalize, usesLocal, type History } from "./dsl.js";
+import { parse, serialize, normalize, requiredNodes, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
-import { CliInconsistencyError, describeInconsistency, recordInconsistency } from "./inconsistency.js";
+import { CliInconsistencyError, describeInconsistency, recordInconsistency, formatInconsistency } from "./inconsistency.js";
 import { NOTE_DIR } from "./types.js";
 
 // Correctness-assumption violations are thrown deep in the driver/oracle; they're handled
@@ -87,7 +91,7 @@ for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
     if (err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput) {
       const d = describeInconsistency(err);
       recordInconsistency(d, runsRoot);
-      console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}${d.command ? `\n  cmd: ${d.command}` : ""}${d.stdout !== undefined ? `\n  out: ${JSON.stringify(d.stdout)}` : ""}`);
+      console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${formatInconsistency(d)}`);
     } else {
       console.error(err);
     }
@@ -124,30 +128,16 @@ const { values } = parseArgs({
     "skip-host-check": { type: "boolean" },
     "vault-path": { type: "string" },
     "runs-prefix": { type: "string" },
-    "skip-snapshot-timing": { type: "boolean" },
+    "skip-snapshot": { type: "boolean" },
     "would-fail-check": { type: "boolean" },
     "local-vault-pin": { type: "boolean" },
   },
 });
 
-// "l" in --nodes is the sole on/off switch for local-instance participation — --local-bin only
-// supplies its binary path (see the header comment above for why this reads more naturally than
-// a separate flag).
-const rawNodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
-const localRequested = rawNodes.includes("l");
-const nodesList = rawNodes.filter((n) => n !== "l"); // container names only, from here on
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const network = values.network ?? "obsidian-net";
 const isolatorKind = values.isolator ?? "network";
-const localBin = values["local-bin"];
-if (localRequested && !localBin) {
-  console.error(`--nodes/NODES includes "l" but --local-bin/LOCAL_BIN wasn't provided — pass --local-bin <path> or drop "l" from --nodes.`);
-  process.exit(2);
-}
-if (values["local-vault-pin"] && !localRequested) {
-  console.error(`--local-vault-pin was given but "l" isn't in --nodes/NODES — add it or drop --local-vault-pin.`);
-  process.exit(2);
-}
+const localBin = values["local-bin"] ?? "obsidian"; // same PATH-lookup convenience Makefile's LOCAL_BIN already defaults to
 const scenario = values.scenario ?? "random";
 const histories = Number(values.histories ?? 1);
 const repeat = Number(values.repeat ?? 10);
@@ -155,13 +145,31 @@ const durationMin = Number(values["duration-min"] ?? 0);
 const historyArg = values.history;
 const steps = Number(values.steps ?? 0); // with --history: run only its first N ops (0 = all)
 
-// Normalize a hand-typed --history up front (before any container is touched) so an `L` used
-// without "l" in --nodes fails fast with a clear message instead of crashing deep in
-// runHistory: the DSL grammar accepts `L` regardless of whether the local instance is actually
-// wired up, so nothing else catches this mismatch.
+// Normalize a hand-typed --history up front (before any container is touched) — both so an
+// invalid string fails fast, and because its participants (below) are derived from it.
 const parsedHistory = historyArg ? normalize(parse(historyArg)) : undefined;
-if (parsedHistory && !localRequested && usesLocal(parsedHistory)) {
-  console.error(`history "${historyArg}" uses L (the local node) but "l" isn't in --nodes/NODES — add it (e.g. --nodes ${[...nodesList, "l"].join(",")}) or remove L from the history.`);
+
+// With --history, the DSL string itself says exactly which containers/local instance it needs
+// (see dsl.ts's requiredNodes) — --nodes/NODES is not consulted at all in this mode, so its value
+// (default or explicit) can never cause an unrelated node to be required. Without --history
+// (generation has no fixed history to derive a pool from), --nodes/NODES must be given explicitly.
+let nodesList: string[];
+let localRequested: boolean;
+if (parsedHistory) {
+  const req = requiredNodes(parsedHistory);
+  nodesList = req.containers.map((n) => `n${n}`);
+  localRequested = req.local;
+} else {
+  if (values.nodes === undefined) {
+    console.error(`--nodes/NODES is required when no --history is given (generation has no fixed history to derive participants from) — e.g. --nodes n1,n2 or --nodes n1,n2,l.`);
+    process.exit(2);
+  }
+  const rawNodes = values.nodes.split(",").map((s) => s.trim());
+  localRequested = rawNodes.includes("l");
+  nodesList = rawNodes.filter((n) => n !== "l");
+}
+if (values["local-vault-pin"] && !localRequested) {
+  console.error(`--local-vault-pin was given but the local node isn't a participant in this run (history doesn't use L, or "l" isn't in --nodes/NODES) — add it or drop --local-vault-pin.`);
   process.exit(2);
 }
 
@@ -192,7 +200,10 @@ if (generateN > 0) {
 // The CLI's own self-report (`<bin> version`), not a build-time assumption — reflects
 // whatever's actually installed, queried once so every rep's `history` event can record
 // exactly which Obsidian build produced its result (a bug can appear/vanish across releases).
-async function obsidianVersion(): Promise<string> {
+// A --history run can legitimately need zero containers (e.g. local-only, "LAaLW") — nothing to
+// query in that case.
+async function obsidianVersion(): Promise<string | undefined> {
+  if (nodesList.length === 0) return undefined;
   const r = await runProcess("podman", ["exec", nodesList[0], bin, "version"]);
   return r.stdout.trim() || "?";
 }
@@ -272,7 +283,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   finalSettleSec: Number(values["final-settle-sec"] ?? 15),
   probeSec: Number(values["probe-sec"] ?? 5),
   hostCheck: !values["skip-host-check"], // on by default; --skip-host-check turns it off
-  snapshotTiming: !values["skip-snapshot-timing"], // on by default; --skip-snapshot-timing turns it off
+  snapshot: !values["skip-snapshot"], // on by default; --skip-snapshot turns off the whole mechanism
   isolator: isolatorKind,
   obsidianVersion: await obsidianVersion(),
   localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
@@ -414,11 +425,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     const repPath = tagRep(logger.path, d.suffix);
     failures.push(repPath);
     if (d.category === "obsfail") obsfail++; else unknown++;
-    console.log(
-      `  rep ${id}: *** ${d.suffix.slice(1)} *** ${d.reason}${d.recognizer ? ` (recognizer: ${d.recognizer})` : ""}${d.site ? ` @ ${d.site}` : ""}` +
-      `${d.command ? `\n    cmd: ${d.command}` : ""}${d.stdout !== undefined ? `\n    out: ${JSON.stringify(d.stdout)}` : ""}` +
-      ` → ${path.basename(repPath)}`,
-    );
+    console.log(`  rep ${id}: *** ${d.suffix.slice(1)} *** ${formatInconsistency(d)} → ${path.basename(repPath)}`);
     drawStatus();
     return;
   }
@@ -537,6 +544,19 @@ async function preflight(): Promise<boolean> {
           `The active local Obsidian vault does not appear to be connected to Sync (resuming Sync failed: ` +
           `${e.raw.stdout.trim() || "no output"}) — the harness requires the vault open in Obsidian to always ` +
           `be the one connected to Sync. Switch to it in Obsidian and re-run.`,
+        );
+        process.exit(2);
+      }
+      // Same classification readState() uses below: a down/absent container fails at the exec
+      // layer itself (podman exit ≠ 0), distinct from a live container answering with unparseable
+      // text. Name it clearly here too, rather than falling through to a generic, contentless
+      // crash (this is the FIRST driver call preflight makes, so a down container hits this
+      // before readState's own reachable check ever runs).
+      if (e instanceof CliUnrecognizedOutput && e.raw.code !== 0) {
+        console.error(
+          `node ${d.node} is unreachable (exec failed${e.raw.code !== undefined ? `, code=${e.raw.code}` : ""}: ` +
+          `${e.raw.stderr.trim() || e.raw.stdout.trim() || "no output"}) — is \`make containers-up\`/` +
+          `\`make reconnect\` done, and is the container actually running? Aborting.`,
         );
         process.exit(2);
       }

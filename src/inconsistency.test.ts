@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { CliInconsistencyError, categoryOf, quoteArgv, siteOf, describeInconsistency } from "./inconsistency.js";
+import { CliInconsistencyError, categoryOf, quoteArgv, siteOf, describeInconsistency, formatInconsistency } from "./inconsistency.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
 import type { ExecResult } from "./types.js";
 
-const fakeExec = (argv: string[], stdout: string): ExecResult => ({
-  argv, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false,
+const fakeExec = (argv: string[], stdout: string, code: number | null = 0, stderr = ""): ExecResult => ({
+  argv, code, stdout, stderr, startedAt: "", durationMs: 0, killed: false,
 });
 
 test("quoteArgv: bare tokens are left alone", () => {
@@ -73,4 +73,32 @@ test("describeInconsistency: a CLI/FS disagreement → -OBSFAIL carrying its str
   assert.equal(d.suffix, "-OBSFAIL");
   assert.deepEqual(d.detail, { node: "n1", cliOnlyCount: 1 });
   assert.equal(d.command, undefined); // no single CLI line for a cross-check disagreement
+});
+
+test("describeInconsistency: a down/absent container (nonzero exit + stderr) carries code + stderr", () => {
+  const raw = fakeExec(["podman", "exec", "n2", "/opt/obsidian/obsidian-cli", "sync", "on"], "", 125, "Error: no such container n2\n");
+  const d = describeInconsistency(new CliUnrecognizedOutput(raw, "expectSyncToggle"));
+  assert.equal(d.code, 125);
+  assert.equal(d.stderr, "Error: no such container n2");
+});
+
+test("describeInconsistency: a live container's empty/zero-code reply carries no code/stderr fields", () => {
+  const raw = fakeExec(["podman", "exec", "n1", "/opt/obsidian/obsidian-cli", "sync", "on"], "");
+  const d = describeInconsistency(new CliUnrecognizedOutput(raw, "expectSyncToggle"));
+  assert.equal(d.code, 0);
+  assert.equal(d.stderr, undefined);
+});
+
+test("formatInconsistency: includes code/err lines when set, omits them when code is 0/stderr empty", () => {
+  const withCode = describeInconsistency(new CliUnrecognizedOutput(
+    fakeExec(["podman", "exec", "n2", "obsidian-cli", "sync", "on"], "", 125, "Error: no such container n2"),
+    "expectSyncToggle",
+  ));
+  const withoutCode = describeInconsistency(new CliUnrecognizedOutput(
+    fakeExec(["podman", "exec", "n1", "obsidian-cli", "sync", "on"], ""), "expectSyncToggle",
+  ));
+  assert.match(formatInconsistency(withCode), /\n {2}code: 125/);
+  assert.match(formatInconsistency(withCode), /\n {2}err: "Error: no such container n2"/);
+  assert.doesNotMatch(formatInconsistency(withoutCode), /code:/);
+  assert.doesNotMatch(formatInconsistency(withoutCode), /err:/);
 });
