@@ -235,7 +235,7 @@ generate: ## Print N generated histories without running them (N=20; honours TUR
 
 # Most of RUN_FLAGS (turns/ops/notes/pause-prob/isolator/...) doesn't apply to an already-concrete
 # HISTORY, hence its own smaller flags var.
-REPRO_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
+REPRO_FLAGS = --network $(NET) \
   $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
   $(if $(LOCAL_BIN),--local-bin $(LOCAL_BIN)) \
   $(if $(LOCAL_NODE_ID),--local-node-id $(LOCAL_NODE_ID)) \

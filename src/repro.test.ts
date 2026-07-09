@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parse } from "./dsl.js";
 import { generateScript, type ReproOpts } from "./repro.js";
 
-const baseOpts: ReproOpts = { nodes: ["n1", "n2"], bin: "/opt/obsidian/obsidian-cli", network: "obsidian-net", runId: "repro-test" };
+const baseOpts: ReproOpts = { containers: [1, 2], bin: "/opt/obsidian/obsidian-cli", network: "obsidian-net", runId: "repro-test" };
 const LIB_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "repro-lib.sh");
 const reproLib = () => readFileSync(LIB_PATH, "utf8");
 
@@ -35,6 +35,18 @@ test("generateScript: disconnect/connect emit explicit calls, plus the pinned ip
   // Same pinned identity isolate.ts's own nodeAddress test asserts for n1.
   assert.match(script, /^NODE_IP\[1\]=10\.89\.0\.101$/m);
   assert.match(script, /^NODE_MACADDR\[1\]=6e:62:6e:65:74:65$/m);
+});
+
+test("generateScript: NODES is sparse, keyed by node NUMBER, not a compact 0-based array — a history skipping a node must not shift another node's slot", () => {
+  // Only N3 is needed (e.g. a history that never touches N1/N2) — the real bug this guards
+  // against: a compact array would have put n3 at index 0, so repro-lib.sh's ${NODES[$1]}
+  // (called with $1=3) would have looked up an out-of-bounds/empty slot instead of "n3".
+  const script = generateScript(parse("N3Aa"), { ...baseOpts, containers: [3] });
+  assert.match(script, /^NODES\[3\]=n3$/m);
+  assert.doesNotMatch(script, /^NODES\[1\]=/m);
+  assert.doesNotMatch(script, /^NODES\[2\]=/m);
+  assert.match(script, /^Append 3 a$/m);
+  assert.match(script, /^ALL_NODES=\(3\)$/m);
 });
 
 test("generateScript: a bare W with nothing appended yet is a no-op (matches execute.ts) and emits nothing; a W after an append does", () => {

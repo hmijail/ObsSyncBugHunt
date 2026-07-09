@@ -5,15 +5,13 @@
 // Connect/Pause/Check) live in scripts/repro-lib.sh, a small hand-maintained bash library every
 // generated script sources — this file only translates the DSL into a flat call sequence.
 //
-//   --history       DSL string to reproduce                        (required)
-//   --nodes         comma-separated container names, plus the literal "l" to include the local
-//                    instance — e.g. "n1,n2,l" (default n1,n2). "l" is the sole on/off switch for
-//                    the local instance (matches run.ts); --local-bin only supplies its binary
-//                    path — required iff "l" is in --nodes, and a history using L without "l" in
-//                    --nodes fails fast the same way run.ts does
+//   --history       DSL string to reproduce                        (required). Its own content
+//                    determines which containers/local instance the generated script needs (see
+//                    dsl.ts's requiredNodes) — there's no separate --nodes flag to keep in sync.
 //   --bin           CLI path inside the container                    (default /opt/obsidian/obsidian-cli)
 //   --network       podman network                                   (default obsidian-net)
-//   --local-bin     path to a local obsidian-cli binary — only used if "l" is in --nodes
+//   --local-bin     path to a local obsidian-cli binary (default: obsidian, relying on the normal
+//                    install/activation flow's PATH entry) — only actually used if --history uses L
 //   --local-node-id the local instance's own Sync-reported device name (default: OS `hostname`)
 //   --run-id        slug embedded in note names' trailing history part (default: the history itself)
 //   --wait-cap-sec / --wait-poll-sec  bounded W-poll tuning           (default 60 / 2)
@@ -31,13 +29,15 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { parse, serialize, normalize, usesLocal, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
+import { parse, serialize, normalize, usesLocal, requiredNodes, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
 import { nodeAddress } from "./isolate.js";
 import { formatToken, NOTE_DIR } from "./types.js";
 import { runProcess } from "./exec.js";
 
 export interface ReproOpts {
-  nodes: string[]; // container names, e.g. ["n1","n2"] (index 0 = node 1, etc.)
+  containers: number[]; // the N<d> numbers this history needs — container names are always
+                         // literally n<d> by convention (see execute.ts's driverOf), so there's
+                         // nothing else to configure per-container
   bin: string; // container CLI path
   network: string; // podman network
   localBin?: string; // local-instance CLI path; required iff the history uses L
@@ -86,7 +86,6 @@ export function generateScript(history: History, opts: ReproOpts): string {
     "",
     "VERBOSE=${VERBOSE:-0}", // plain string, not a template literal — must reach bash literally
     `BIN=${sq(opts.bin)}`,
-    `NODES=(${opts.nodes.join(" ")})`,
     `NETWORK=${sq(opts.network)}`,
     `NOTE_DIR=${sq(NOTE_DIR)}`,
   ];
@@ -102,13 +101,16 @@ export function generateScript(history: History, opts: ReproOpts): string {
     "",
   );
 
-  for (let i = 0; i < opts.nodes.length; i++) {
-    const { ip, mac } = nodeAddress(opts.nodes[i]);
-    lines.push(`NODE_IP[${i + 1}]=${ip}`, `NODE_MACADDR[${i + 1}]=${mac}`);
+  // Sparse, keyed by the actual node NUMBER (like NODE_IP/NODE_MACADDR already are) — not a
+  // compact 0-based array. A history skipping a node (e.g. only N1 and N3) must not shift N3's
+  // entry into slot 1: repro-lib.sh indexes NODES[$1] directly, no position/number translation.
+  for (const d of opts.containers) {
+    const { ip, mac } = nodeAddress(`n${d}`);
+    lines.push(`NODES[${d}]=n${d}`, `NODE_IP[${d}]=${ip}`, `NODE_MACADDR[${d}]=${mac}`);
   }
   lines.push("");
 
-  const allSelectors = opts.nodes.map((_, i) => String(i + 1));
+  const allSelectors = opts.containers.map(String);
   if (opts.localBin) allSelectors.push("L");
   lines.push(`ALL_NODES=(${allSelectors.join(" ")})`, "");
 
@@ -150,7 +152,7 @@ export function generateScript(history: History, opts: ReproOpts): string {
         const letter = op.note!;
         lines.push(`Append ${sel(activeNode)} ${letter}`, "");
         seq++;
-        const id = activeNode === "local" ? (opts.localNodeId ?? "local") : opts.nodes[activeNode - 1];
+        const id = activeNode === "local" ? (opts.localNodeId ?? "local") : `n${activeNode}`;
         const token = formatToken({ node: id, seq, note: letter });
         const list = tokensByLetter.get(letter);
         if (list) list.push(token); else tokensByLetter.set(letter, [token]);
@@ -179,7 +181,6 @@ if (isMain) {
   const { values } = parseArgs({
     options: {
       history: { type: "string" },
-      nodes: { type: "string" },
       bin: { type: "string" },
       network: { type: "string" },
       "local-bin": { type: "string" },
@@ -196,20 +197,6 @@ if (isMain) {
     process.exit(2);
   }
 
-  // "l" in --nodes is the sole on/off switch for local-instance participation, matching run.ts —
-  // --local-bin only supplies its binary path.
-  const rawNodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
-  const localRequested = rawNodes.includes("l");
-  const nodes = rawNodes.filter((n) => n !== "l");
-  const localBin = values["local-bin"];
-  if (localRequested && !localBin) {
-    console.error(`--nodes includes "l" but --local-bin/LOCAL_BIN wasn't provided — pass --local-bin <path> or drop "l" from --nodes.`);
-    process.exit(2);
-  }
-  // Only worth a subprocess call when the local instance is actually requested — mirrors run.ts's
-  // own hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
-  const localNodeId = localRequested ? (values["local-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
-
   let history: History;
   try {
     history = parse(values.history);
@@ -217,10 +204,16 @@ if (isMain) {
     console.error(e instanceof Error ? e.message : String(e));
     process.exit(2);
   }
-  if (usesLocal(normalize(history)) && !localRequested) {
-    console.error(`history "${values.history}" uses L (the local node) but "l" isn't in --nodes — add it (e.g. --nodes ${[...nodes, "l"].join(",")}) or remove L from the history.`);
-    process.exit(2);
-  }
+
+  // The history's own content determines which containers/local instance it needs — see dsl.ts's
+  // requiredNodes (matches run.ts's own --history behavior; no separate --nodes flag to keep in
+  // sync with it). localBin gets a sane default like --bin already has, rather than being hard-
+  // required — only actually used below if the history uses L.
+  const req = requiredNodes(normalize(history));
+  const localBin = values["local-bin"] ?? "obsidian";
+  // Only worth a subprocess call when the local instance is actually requested — mirrors run.ts's
+  // own hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
+  const localNodeId = req.local ? (values["local-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
 
   // Resolved here (not left to generateScript's own default) so the same value can also name
   // the default output file below. Mirrors generateScript's own default exactly (the normalized
@@ -231,10 +224,10 @@ if (isMain) {
   let script: string;
   try {
     script = generateScript(history, {
-      nodes,
+      containers: req.containers,
       bin: values.bin ?? "/opt/obsidian/obsidian-cli",
       network: values.network ?? "obsidian-net",
-      localBin: localRequested ? localBin : undefined,
+      localBin: req.local ? localBin : undefined,
       localNodeId,
       runId,
       waitCapSec: values["wait-cap-sec"] ? Number(values["wait-cap-sec"]) : undefined,
