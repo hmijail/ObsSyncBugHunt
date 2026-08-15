@@ -110,8 +110,33 @@ make net-check     # run after installing/switching/upgrading an engine
 
 It measures, on a disposable container, whether a reconnect restores connectivity within 1s on the
 node's pinned IP — i.e. whether a `D`…`C` is still a brief *link blip* rather than a full network
-reset. Every real `C` re-checks the same budget in passing and logs a `slow-reconnect` event if
-it's blown.
+reset. Every real `C` re-checks the same budget in passing, and **aborts the run** if it's blown:
+past that point the fault primitive isn't doing what the histories say, so every subsequent rep
+would be meaningless too. The rep is tagged `-ENVFAIL` and the cause lands in `runs/ENVFAIL.log`.
+On a slow machine, raise the bar: `make ... RECONNECT_BUDGET_MS=2000`.
+
+## Checking the assumptions this harness rests on
+
+The harness depends on things outside it — the container engine, the Obsidian build, obsidian-cli's
+output formats — which change on someone else's schedule. A run started against a violated
+assumption doesn't crash; it produces plausible results about the wrong experiment.
+
+```sh
+make check-assumptions     # after a break, or an Obsidian / Docker / Podman update
+```
+
+Rare and thorough rather than quick (about a minute), and deliberately not wired into `make run`.
+It checks the engine, the network's subnet, the pinned image and that the running nodes' Obsidian
+matches the version they're tagged with, how far the pin has fallen behind upstream (advisory), the
+`D`/`C` blip property, and — the one worth the wall-clock — that **every obsidian-cli command the
+harness depends on still produces output the parsers recognize**.
+
+That last one is otherwise only discovered *reactively*: `cli-parse.ts` refuses to guess at output
+it doesn't recognize, so a format change becomes a `-UNKNOWN` rep — found mid-soak, one burned rep
+at a time. Since a format change is the likeliest breakage right after an Obsidian upgrade, this
+moves the discovery to before you commit to an overnight run. Steps needing no containers run
+first, so the target is useful even before `make containers-up` (the CLI sweep then reports as
+skipped rather than failing).
 
 # How it all works
 
@@ -337,11 +362,13 @@ src/
   run-local.ts   single-node pipeline check (npm run local)
   analyze.ts     offline soak aggregator    (npm run analyze)
   clean-notes.ts delete the harness's notes (bughunt/) on all nodes (npm run clean-notes)
+  check-cli.ts   assert every obsidian-cli command still parses  (npm run check-cli)
   smoke.ts       driver probe               (npm run smoke)
 containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
 scripts/
   wait-node.sh   block until a node is genuinely ready (GUI alive, then Sync CLI answering)
   net-check.sh   verify a D/C reconnect is still a brief blip on this engine (make net-check)
+  check-assumptions.sh  the whole environment sanity pass  (make check-assumptions)
   repro-lib.sh   bash runtime sourced by every `make repro` script
 docs/
   cli-trust.md   why/how the harness never judges from CLI output it didn't positively recognize

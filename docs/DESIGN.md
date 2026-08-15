@@ -45,11 +45,25 @@ reconnect in the `network-identity` event, `macPinned: true|false`) and skipped 
 **This is an assumption about engine internals, so it is checked rather than trusted.**
 `make net-check` (`scripts/net-check.sh`) measures it deliberately on a disposable container —
 reconnect latency against a budget (default 1s) plus a hard assertion that the pinned IP survived
-— and is the thing to run after installing, switching, or upgrading a container engine. The same
-budget rides along on every real `C` at runtime: `NetworkIsolator.reconnectBudgetMs`, which emits
-a `slow-reconnect` event into the rep's own trace when exceeded, rather than aborting (a slow
-reconnect is an environment problem, and failing the rep would misreport infrastructure as an
-Obsidian finding).
+— and `make check-assumptions` folds that in with the rest of the environment checks. That
+deliberate measurement is needed because a history containing no `D` never exercises the primitive
+at all.
+
+The same budget rides along on every real `C` at runtime (`NetworkIsolator.reconnectBudgetMs`), and
+exceeding it **aborts the run**: the rep is tagged `-ENVFAIL`, the cause is appended to
+`runs/ENVFAIL.log`, and the operator gets a remediation block rather than a stack trace.
+
+Aborting is the point, and it was originally got wrong here. The tempting design is to record a
+slow reconnect and carry on, the way a host-outage detour is handled — but those are different
+kinds of thing. A host-outage detour spoils one rep's *timings*; a slow reconnect means the fault
+primitive itself is broken, so every following rep in the soak is equally meaningless. A run that
+keeps going is a run quietly manufacturing results about a different experiment than the one its
+histories describe. It is also not the harness's usual "don't misreport infrastructure as an
+Obsidian finding" case: `-ENVFAIL` is deliberately excluded from `FAIL_SUFFIXES`, so it never
+counts toward a history's `-BAD<pct>`.
+
+On a genuinely slow machine, raise the bar rather than lose the signal:
+`make ... RECONNECT_BUDGET_MS=2000`.
 
 The MAC address's first byte is `0x6e` ('n', for "nbnet") rather than the more on-the-nose `0x6f`
 ('o', for "obnet") for a real constraint, not a spelling preference: a MAC address's first byte's

@@ -52,6 +52,11 @@
 //                    cap-sec only gates when to ALSO start checking whether the HOST itself is
 //                    offline (a different question from Sync's own health).
 //   --probe-sec      per-call cap on the settle's sync:status probe (default 5; it blocks until synced)
+//   --reconnect-budget-ms  how long a `C` may take to restore connectivity before the run is
+//                    ABORTED (default 1000; --isolator network only). Over budget means the D/C
+//                    was a network reset rather than a link blip, so the histories stopped testing
+//                    what they say — see isolate.ts's reconnectBudgetMs. Raise it on a slow
+//                    machine; `make check-assumptions` measures what this machine actually does.
 //   --runs-prefix    parent dir for runs/ (default: cwd, i.e. plain ./runs)
 //   --skip-snapshot  skip the whole pause-snapshot mechanism (no extra CLI calls at all during a
 //                    P) — in case it's suspected of perturbing timings/results. On by default.
@@ -71,7 +76,7 @@ import { parseArgs } from "node:util";
 import { engineBin, engineVersion } from "./engine.js";
 import { ContainerExecutor, LocalExecutor, runProcess } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
-import { SyncToggleIsolator, NetworkIsolator, type Isolator } from "./isolate.js";
+import { SyncToggleIsolator, NetworkIsolator, EnvironmentAssumptionError, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
@@ -86,10 +91,19 @@ import { NOTE_DIR } from "./types.js";
 // per-rep in `runRep` (tagged -OBSFAIL/-UNKNOWN, soak continues). One that still escapes the
 // rep loop — e.g. preflight against an unparseable baseline — has no rep to attach to, so we
 // record it durably, print the compact diagnostic (copy-paste command + file:line), and exit.
+//
+// An EnvironmentAssumptionError always lands here: unlike the above it is never a rep outcome, so
+// `runRep` tags the rep and rethrows deliberately (the apparatus is broken, not the black box —
+// see isolate.ts). It gets an operator-facing block rather than a stack trace, because the reader
+// needs to know what to fix, not which line threw.
+//
 // Other errors keep the normal crash behavior.
 for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
   process.on(ev, (err: unknown) => {
-    if (err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput) {
+    if (err instanceof EnvironmentAssumptionError) {
+      recordEnvFailure(err, runsRoot);
+      console.error(`\n*** ENVFAIL — run aborted ***\n  ${err.assumption}\n\n  ${err.remedy}\n`);
+    } else if (err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput) {
       const d = describeInconsistency(err);
       recordInconsistency(d, runsRoot);
       console.error(`*** ${d.suffix.slice(1)} (outside a rep) *** ${formatInconsistency(d)}`);
@@ -98,6 +112,19 @@ for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
     }
     process.exit(1);
   });
+}
+
+/** Durable top-level index for aborted-run causes, mirroring `recordInconsistency`'s
+ *  runs/<LABEL>.log convention (and its best-effort, never-throws contract — the caller has
+ *  already printed the compact block, so a failure to persist must not mask it). */
+function recordEnvFailure(err: EnvironmentAssumptionError, runsDir: string): void {
+  try {
+    mkdirSync(runsDir, { recursive: true });
+    const rec = { at: new Date().toISOString(), assumption: err.assumption, ...err.detail };
+    appendFileSync(path.join(runsDir, "ENVFAIL.log"), JSON.stringify(rec) + "\n");
+  } catch {
+    /* best effort — the console block above is the primary report */
+  }
 }
 
 const { values } = parseArgs({
@@ -126,6 +153,7 @@ const { values } = parseArgs({
     "w-settle-sec": { type: "string" },
     "final-settle-sec": { type: "string" },
     "probe-sec": { type: "string" },
+    "reconnect-budget-ms": { type: "string" },
     "skip-host-check": { type: "boolean" },
     "vault-path": { type: "string" },
     "runs-prefix": { type: "string" },
@@ -275,6 +303,14 @@ if (values["local-vault-pin"]) {
 }
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new NetworkIsolator(network);
+// Set post-construction, like `pollDelayMs` — a public field beats a 6th positional constructor
+// argument. Only the network isolator has a reconnect to budget (a `sync off/on` toggle never
+// touches the network), so this is a no-op for --isolator sync.
+if (isolator instanceof NetworkIsolator && values["reconnect-budget-ms"] !== undefined) {
+  const ms = Number(values["reconnect-budget-ms"]);
+  assert(Number.isFinite(ms) && ms >= 0, `--reconnect-budget-ms must be a non-negative number, got "${values["reconnect-budget-ms"]}"`);
+  isolator.reconnectBudgetMs = ms;
+}
 
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
@@ -382,6 +418,8 @@ function uniqueRepId(strDir: string): string {
 }
 
 // Any rep file carrying one of these suffixes (just before .jsonl) is a non-OK rep.
+// `-ENVFAIL` is deliberately NOT here: it means the apparatus broke, not that Obsidian failed, so
+// counting it toward a history's -BAD<pct> would report infrastructure as an Obsidian finding.
 const FAIL_SUFFIXES = ["-NOUPLOAD", "-TIMEOUT", "-LOST", "-DUPL", "-SYNCBAD", "-OBSFAIL", "-UNKNOWN"];
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(`${s}.jsonl`));
@@ -420,6 +458,15 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
   try {
     outcome = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
   } catch (err) {
+    // A violated environment assumption is NOT a rep outcome — the apparatus stopped doing what
+    // the histories say it does, so continuing would manufacture results about a different
+    // experiment (see isolate.ts's EnvironmentAssumptionError). Tag the rep so the offending one
+    // is findable on disk, then rethrow: the top-level handler prints the operator block and exits.
+    if (err instanceof EnvironmentAssumptionError) {
+      logger.log({ kind: "envfail", assumption: err.assumption, ...err.detail });
+      failures.push(tagRep(logger.path, "-ENVFAIL"));
+      throw err;
+    }
     if (!(err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput)) throw err; // a real crash
     const d = describeInconsistency(err);
     recordInconsistency(d, runsRoot);

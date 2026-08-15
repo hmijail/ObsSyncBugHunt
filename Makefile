@@ -108,6 +108,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(W_SETTLE_SEC),--w-settle-sec $(W_SETTLE_SEC)) \
   $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
   $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
+  $(if $(RECONNECT_BUDGET_MS),--reconnect-budget-ms $(RECONNECT_BUDGET_MS)) \
   $(if $(RUNS_PREFIX),--runs-prefix $(RUNS_PREFIX)) \
   $(if $(SKIP_SNAPSHOT),--skip-snapshot) \
   $(if $(WOULD_FAIL_CHECK),--would-fail-check)
@@ -116,7 +117,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
 .PHONY: help install typecheck test check smoke local \
         build net secrets-dir clean-secrets login capture node1 containers-up solo-check reconnect run campaign soak analyze generate repro \
         clean-runs clean-notes clean-data clean-images trial containers-down ps logs health \
-        images obsidian-latest net-check
+        images obsidian-latest net-check check-assumptions
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -364,3 +365,13 @@ obsidian-latest: ## Check the newest Obsidian release upstream against the pinne
 
 net-check: net ## Verify a D/C reconnect is a brief blip (<1s, pinned IP) on this engine — run after an engine change
 	@scripts/net-check.sh $(or $(ROUNDS),3) $(or $(OUTAGE),10) $(or $(BUDGET),1.0)
+
+# The deliberate "is the apparatus still what we think it is" pass — engine, network, image,
+# Obsidian version, the D/C blip property, and whether obsidian-cli's output still parses. Rare and
+# thorough rather than quick, and deliberately NOT a dependency of run/containers-up: it exists for
+# coming back to the project, or after an Obsidian/engine update. OBSIDIAN_VERSION/IMAGE/NET/SUBNET
+# reach the script through the environment; ENGINE is already exported at the top.
+check-assumptions: net ## Check everything the harness assumes about its environment (engine, image, D/C blip, CLI formats)
+	@OBSIDIAN_VERSION=$(OBSIDIAN_VERSION) IMAGE=$(IMAGE) NET=$(NET) SUBNET=$(SUBNET) \
+	  NODES=$(CONTAINER_NODES_CSV) $(if $(ROUNDS),ROUNDS=$(ROUNDS)) \
+	  scripts/check-assumptions.sh
