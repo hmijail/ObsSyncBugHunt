@@ -1,13 +1,26 @@
 # Obsidian node image: real Obsidian (Electron) under Xvfb, plus x11vnc for the
-# one-time Sync login. We drive it from the host via `podman exec`, so there is
-# no sshd. Obsidian is the portable .tar.gz build at /opt/obsidian, launched via
-# the /usr/local/bin/obsidian wrapper; the CLI is /opt/obsidian/obsidian-cli.
+# one-time Sync login. We drive it from the host via `<engine> exec` (podman or
+# docker — see src/engine.ts), so there is no sshd. Obsidian is the portable
+# .tar.gz build at /opt/obsidian, launched via the /usr/local/bin/obsidian
+# wrapper; the CLI is /opt/obsidian/obsidian-cli.
 
 FROM debian:bookworm-slim
 
-ARG OBSIDIAN_VERSION=1.12.7
+# Which Obsidian release to install. Deliberately WITHOUT a default: the Makefile's
+# OBSIDIAN_VERSION is the single source of truth (it also tags the image with the version), and a
+# default here would be a second one — silently baking a stale release into an image whose tag
+# claimed otherwise the moment the two drifted. Building this Dockerfile by hand therefore has to
+# name the version too:
+#     <engine> build --build-arg OBSIDIAN_VERSION=1.13.7 -t obsidian-node:1.13.7 containers
+# The check below turns a forgotten --build-arg into an immediate, self-explaining failure rather
+# than a confusing 404 from the download step.
+ARG OBSIDIAN_VERSION
+RUN test -n "${OBSIDIAN_VERSION}" || { \
+      echo "OBSIDIAN_VERSION build-arg is required — use 'make build' (it passes the pinned version)," >&2; \
+      echo "or pass --build-arg OBSIDIAN_VERSION=<x.y.z> explicitly." >&2; exit 1; }
+
 # TARGETARCH is provided automatically by the builder (arm64 on Apple-Silicon
-# Podman machines, amd64 on typical EC2). Pick the matching build.
+# Podman/Docker machines, amd64 on typical EC2). Pick the matching build.
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,7 +63,7 @@ RUN mkdir -p /root/.config/obsidian /root/vaults/TestVault/.obsidian
 # Screen Sharing) can connect. Throwaway, localhost-only.
 RUN x11vnc -storepasswd obsidian /etc/x11vnc.pass
 
-# The GUI runs on Xvfb display :99. Bake it into the image env so every `podman
+# The GUI runs on Xvfb display :99. Bake it into the image env so every `<engine>
 # exec` (and thus every obsidian-cli call) shares the GUI's display — otherwise
 # exec sessions get an empty DISPLAY, and a CLI call that launches a GUI would
 # spawn a display-less instance.

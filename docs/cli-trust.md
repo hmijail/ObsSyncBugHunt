@@ -2,7 +2,7 @@
 
 This harness is a correctness oracle, so the cardinal sin is emitting a verdict from CLI output we
 didn't actually understand. obsidian-cli is hostile to naive trust: it **always exits 0** (even on
-errors), and under load (a wedged podman, a busy app) a call can return **empty or partial** output.
+errors), and under load (a wedged container engine, a busy app) a call can return **empty or partial** output.
 On 2026-06-26 a `files folder=bughunt` came back empty while the conflict files were on disk the whole
 time — read as "no conflicts" → a fabricated "data loss". Never again.
 
@@ -11,7 +11,7 @@ time — read as "no conflicts" → a fabricated "data loss". Never again.
 asked — otherwise the rep ends inconclusive (`-UNKNOWN`), never on a guess.** "Doesn't look like an
 error" is not enough; it must affirmatively match a known answer shape.
 
-- **Timely first.** Every call has a hard timeout (`exec.ts`, SIGKILL so a wedged `podman` can't ignore
+- **Timely first.** Every call has a hard timeout (`exec.ts`, SIGKILL so a wedged engine CLI can't ignore
   it). A killed call is *untimely*: we log `cli-unresponsive` and **retry, waiting for recovery**
   (`driver.ts`'s `run`), never judging on a stalled read. A permanent outage (after the retry budget)
   ends the rep as `-UNKNOWN` (`cli-permanently-unresponsive`).
@@ -102,7 +102,7 @@ the rep dir, and moves on. Two categories:
 Each hit is logged to iterate on it immediately: a `category`-tagged JSON line appended to a durable
 top-level index named after the label — **`runs/OBSFAIL.log`** / **`runs/UNKNOWN.log`** — carrying the
 offending **CLI line in copy-paste-runnable form** (`quoteArgv(raw.argv)`, e.g.
-`podman exec n1 /opt/obsidian/obsidian-cli read 'file=…'`) and the **`src/file:line`** throw site
+`docker exec n1 /opt/obsidian/obsidian-cli read 'file=…'`) and the **`src/file:line`** throw site
 (`siteOf`, parsed from the stack); a compact console line; and a `<category>.json` dropped in the rep
 dir. The morning-after triage file name already says which kind it was. An inconsistency that escapes
 the rep loop entirely (e.g. preflight against an unparseable baseline) has no rep to attach to, so the

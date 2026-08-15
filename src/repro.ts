@@ -9,7 +9,7 @@
 //                    determines which containers/local instance the generated script needs (see
 //                    dsl.ts's requiredNodes) — there's no separate --nodes flag to keep in sync.
 //   --bin           CLI path inside the container                    (default /opt/obsidian/obsidian-cli)
-//   --network       podman network                                   (default obsidian-net)
+//   --network       container network                                (default obsidian-net)
 //   --local-bin     path to a local obsidian-cli binary (default: obsidian, relying on the normal
 //                    install/activation flow's PATH entry) — only actually used if --history uses L
 //   --local-node-id the local instance's own Sync-reported device name (default: OS `hostname`)
@@ -39,7 +39,7 @@ export interface ReproOpts {
                          // literally n<d> by convention (see execute.ts's driverOf), so there's
                          // nothing else to configure per-container
   bin: string; // container CLI path
-  network: string; // podman network
+  network: string; // container network
   localBin?: string; // local-instance CLI path; required iff the history uses L
   localNodeId?: string; // the local instance's own node id, embedded in its tokens (same role as d.node)
   runId?: string; // slug embedded in note names; default: the (normalized) history string itself

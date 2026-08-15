@@ -2,9 +2,10 @@
 //
 // For Obsidian Sync the meaningful "offline" is "can't reach the cloud while
 // still running" (a quit node can't make CLI edits). We detach the whole
-// container from its Podman network, then reattach — an authentic offline
+// container from its container network, then reattach — an authentic offline
 // window, no privileged networking required.
 
+import { connectPinsMac, engineBin } from "./engine.js";
 import { runProcess } from "./exec.js";
 import type { ObsidianDriver } from "./driver.js";
 import type { NodeId } from "./types.js";
@@ -13,14 +14,14 @@ export interface Isolator {
   disconnect(node: NodeId): Promise<void>;
   connect(node: NodeId): Promise<void>;
   /** Optional per-rep sink for internal-step events (set to RunLogger.log); else console.
-   *  Only `PodmanIsolator` currently emits anything — its internal reachability-poll retries. */
+   *  Only `NetworkIsolator` currently emits anything — its internal reachability-poll retries. */
   onEvent?: (event: Record<string, unknown>) => void;
 }
 
 /**
  * Preferred fault primitive: Obsidian's own `sync off` / `sync on`. CLI-native,
  * deterministic, keeps the app running so edits still work, and is literally the
- * "pause sync" feature a user would use. No network/podman manipulation.
+ * "pause sync" feature a user would use. No network/engine manipulation.
  */
 export class SyncToggleIsolator implements Isolator {
   constructor(private readonly drivers: Map<NodeId, ObsidianDriver>) {}
@@ -49,7 +50,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // than a fresh dynamically-assigned one — see docs/DESIGN.md for why, and for the story behind
 // the MAC address's first byte specifically.
 // Node number comes from the trailing digits of its name (n1 -> 1, n2 -> 2); X = 100 + number.
-// IP = 10.89.0.<X> (matches obsidian-net's actual 10.89.0.0/24 subnet).
+// IP = 10.89.0.<X>. The Makefile's `net` target creates obsidian-net with an explicit
+// `--subnet 10.89.0.0/24` so this holds on any engine — it used to be merely Podman's default,
+// which silently made these addresses unassignable under Docker (default 172.x).
 // MAC = 6e:62:6e:65:74:<X in hex>. The first byte (0x6e = 'n') MUST keep its I/G bit (least
 // significant bit of the first byte) at 0 — a real interface MAC must be unicast, not
 // multicast — and its U/L bit at 1 (locally-administered, since this isn't vendor-assigned).
@@ -64,7 +67,7 @@ export function nodeAddress(node: NodeId): { ip: string; mac: string } {
 }
 
 /**
- * Detach/attach a container from a Podman network — the real "device goes
+ * Detach/attach a container from its container network — the real "device goes
  * offline" fault. We don't trust the command to take effect instantly (an
  * in-flight sync can keep draining); instead we BLOCK until the container's own
  * connectivity confirms it, with a TCP reachability probe to a well-known numeric
@@ -72,10 +75,27 @@ export function nodeAddress(node: NodeId): { ip: string; mac: string } {
  * until reachable. (TCP, not ping: rootless podman blocks ICMP — no raw socket.)
  * This is a pure network-state check, independent of what Obsidian does about it.
  */
-export class PodmanIsolator implements Isolator {
+export class NetworkIsolator implements Isolator {
   onEvent?: (event: Record<string, unknown>) => void;
   /** Delay between reachability polls; overridable so tests don't wait real time. */
   pollDelayMs = 500;
+  /**
+   * How long a reconnect may take before the rep is flagged as suspect.
+   *
+   * A `D`/`C` pair is meant to be a brief LINK BLIP — the node's established connections to Sync
+   * stall and then resume, because its IP is re-pinned. If reconnection instead takes seconds,
+   * those connections have died on timeout and Obsidian is running its rejoin/error-recovery
+   * path: a different experiment from the one the history describes, so the rep's result no
+   * longer means what it says. Whether that stays true is a property of container-engine
+   * INTERNALS, which change — hence checking it continuously here rather than trusting it once.
+   *
+   * `scripts/net-check.sh` (`make net-check`) measures the same thing deliberately and precisely,
+   * on a disposable container; this is the always-on version, riding along on every real `C`.
+   * The number compared here is coarser — it includes the engine-exec cost of the probe itself,
+   * so a healthy reconnect still reports a few hundred ms — which is why the budget is a full
+   * second rather than the ~50ms a bare reconnect actually takes.
+   */
+  reconnectBudgetMs = 1_000;
 
   constructor(
     private readonly network: string,
@@ -93,7 +113,7 @@ export class PodmanIsolator implements Isolator {
 
   private async reachable(node: NodeId): Promise<boolean> {
     if (this.probeFn) return this.probeFn(node);
-    const r = await runProcess("podman", [
+    const r = await runProcess(engineBin(), [
       "exec", node, "timeout", "2", "bash", "-c", `echo > /dev/tcp/${this.host}/${this.port}`,
     ]);
     return r.code === 0;
@@ -102,15 +122,16 @@ export class PodmanIsolator implements Isolator {
   /** Poll `reachable()` (probe first, sleep last — never the other way round) until it matches
    *  `want`. EVERY attempt is logged, including the one that finally confirms — the internal step
    *  needs to be visible even when it succeeds on the very first try (the common case in practice:
-   *  the podman network toggle takes effect near-instantly, so without this, "log internal steps"
+   *  the engine's network toggle takes effect near-instantly, so without this, "log internal steps"
    *  produced zero events in every real run). */
-  private async waitReach(node: NodeId, want: boolean, label: string): Promise<void> {
+  private async waitReach(node: NodeId, want: boolean, label: string): Promise<number> {
     const start = Date.now();
     const deadline = start + this.capMs;
     for (let attempt = 1; ; attempt++) {
       const got = await this.reachable(node);
-      this.emit({ kind: "network-probe", node, label, want, reachable: got, attempt, elapsedMs: Date.now() - start });
-      if (got === want) return;
+      const elapsedMs = Date.now() - start;
+      this.emit({ kind: "network-probe", node, label, want, reachable: got, attempt, elapsedMs });
+      if (got === want) return elapsedMs;
       if (Date.now() > deadline) {
         throw new Error(`${label} ${node}: ${this.host}:${this.port} ${want ? "still unreachable" : "still reachable"} after ${this.capMs / 1000}s`);
       }
@@ -120,14 +141,30 @@ export class PodmanIsolator implements Isolator {
 
   async disconnect(node: NodeId): Promise<void> {
     // Ignore command errors (e.g. already disconnected) — reachability is the truth.
-    await runProcess("podman", ["network", "disconnect", this.network, node]);
+    await runProcess(engineBin(), ["network", "disconnect", this.network, node]);
     await this.waitReach(node, false, "disconnect");
   }
 
   async connect(node: NodeId): Promise<void> {
     const { ip, mac } = nodeAddress(node);
-    await runProcess("podman", ["network", "connect", "--ip", ip, "--mac-address", mac, this.network, node]);
-    await this.waitReach(node, true, "connect");
+    // The IP is re-pinned on every engine; the MAC only where `network connect` can do it
+    // (Podman yes, Docker no — see engine.ts's connectPinsMac). Emitted rather than assumed,
+    // so a rep's log says which of the two identities actually survived its reconnect.
+    const pinsMac = await connectPinsMac();
+    const macArgs = pinsMac ? ["--mac-address", mac] : [];
+    this.emit({ kind: "network-identity", node, ip, mac: pinsMac ? mac : null, macPinned: pinsMac });
+    await runProcess(engineBin(), ["network", "connect", "--ip", ip, ...macArgs, this.network, node]);
+    const reconnectMs = await this.waitReach(node, true, "connect");
+    // See reconnectBudgetMs: over budget means this `C` probably wasn't the brief blip the
+    // history describes, so the rep's result is suspect. Recorded as its own event (rather than
+    // thrown) because a slow reconnect is an environment problem, and aborting on one would
+    // misreport infrastructure as an Obsidian finding — the opposite of what this harness is for.
+    if (reconnectMs > this.reconnectBudgetMs) {
+      this.emit({
+        kind: "slow-reconnect", node, reconnectMs, budgetMs: this.reconnectBudgetMs,
+        note: "reconnect exceeded the blip budget — established connections may have reset rather than resumed, so this rep may not test what its history says. Run `make net-check`.",
+      });
+    }
   }
 }
 

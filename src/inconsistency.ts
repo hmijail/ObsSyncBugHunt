@@ -73,7 +73,7 @@ export interface InconsistencyRecord {
   site?: string;
   stdout?: string;
   code?: number | null; // the underlying exec's exit code — a nonzero code with a
-                 // CliUnrecognizedOutput usually means the process itself failed (e.g. podman
+                 // CliUnrecognizedOutput usually means the process itself failed (e.g. the engine
                  // couldn't reach a down/absent container), not just a CLI-output-format surprise
   stderr?: string;
   detail?: Record<string, unknown>;

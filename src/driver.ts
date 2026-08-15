@@ -4,7 +4,7 @@
 // engine is engaged exactly as it would be for a human edit.
 //
 // Trust model (see docs/cli-trust.md): the CLI always exits 0 and can return empty/garbage
-// when the app or podman is unresponsive, so we NEVER take output at face value. Each call:
+// when the app or the container engine is unresponsive, so we NEVER take output at face value. Each call:
 //   1. is bounded by a HARD timeout; if killed (untimely) we log `cli-unresponsive` and RETRY
 //      (wait for recovery) — we never judge on a stalled read.
 //   2. once timely, its output must be POSITIVELY identified by a recognizer (see cli-parse.ts);

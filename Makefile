@@ -8,14 +8,41 @@
 # read-only — never baked into an image. Both nodes seed from the same login
 # (same device identity = the deliberate clone/collision test).
 
+# ---- what we're testing ----------------------------------------------------
+#
+# The Obsidian build under test. THE single place to change for an upgrade:
+#   make obsidian-latest            # what's the newest release upstream?
+#   (edit the line below, then)  make containers-up
+# Overridable per-invocation, which is the point — bisecting a finding across releases is
+# `make containers-up OBSIDIAN_VERSION=1.12.7` and back, with no edit at all. Images are tagged
+# by version (IMAGE_TAG below), so builds of different versions coexist and switching between
+# them costs nothing. The version the CLI actually self-reports is recorded in every rep's
+# `history` event (see run.ts) — that, not this variable, is the authoritative record of a run.
+OBSIDIAN_VERSION ?= 1.13.7
+
+# Container engine. Podman and Docker are both supported; whichever is installed is detected
+# here, and CONTAINER_ENGINE=<binary> (or ENGINE=<binary>) overrides. Exported so the scripts/
+# helpers and the TypeScript harness (src/engine.ts) all drive the SAME engine as these targets
+# — a Makefile that made containers under one engine while the harness exec'd into another would
+# fail in a thoroughly confusing way.
+ENGINE ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
+export CONTAINER_ENGINE := $(ENGINE)
+export ENGINE
+
 IMAGE      := obsidian-node
+IMAGE_TAG  := $(IMAGE):$(OBSIDIAN_VERSION)
 LOGIN      := obsidian-login
 NET        := obsidian-net
+# Fixed subnet for the test network, created explicitly rather than left to the engine's default.
+# The per-node pinned IPs are 10.89.0.<100+n> (see NODE_ADDR below and isolate.ts's nodeAddress);
+# 10.89.0.0/24 happens to be podman's own default, but Docker's is 172.x, so leaving it implicit
+# made every `--ip 10.89.0.x` unassignable there.
+SUBNET     := 10.89.0.0/24
 # Only consulted for a HISTORY-less run (generate/campaign/soak without HISTORY) — with HISTORY
 # set, run.ts derives participants (which containers, and whether the local instance) straight
 # from the DSL string itself, so this default never matters there. The literal "l" is the on/off
 # switch for the local instance (DSL's `L`) — LOCAL_BIN below only supplies its binary path; add it
-# (NODES="n1 n2 l") to include it in historyless generation. podman-container targets below use
+# (NODES="n1 n2 l") to include it in historyless generation. container-lifecycle targets below use
 # CONTAINER_NODES (NODES minus "l") so they never try to manage it as a container.
 NODES      := n1 n2
 # NODES is space-separated internally (NODES_CSV below comma-joins it for the CLI flag) — but
@@ -42,15 +69,15 @@ NODE       ?= n1
 # Linux) — override to a full path if it isn't: make soak LOCAL_BIN=/other/path
 LOCAL_BIN  ?= obsidian
 
-# Bound podman calls in solo-check so a wedged podman API fails fast with a hint
+# Bound engine calls in solo-check so a wedged engine API fails fast with a hint
 # instead of hanging silently. Uses `timeout` (or `gtimeout` from coreutils on macOS)
-# when available; the guard is a no-op otherwise. Override the budget: PODMAN_TIMEOUT=20
-PODMAN_TIMEOUT ?= 10
+# when available; the guard is a no-op otherwise. Override the budget: ENGINE_TIMEOUT=20
+ENGINE_TIMEOUT ?= 10
 TIMEOUT_BIN := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
-PODMAN_GUARD := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) $(PODMAN_TIMEOUT))
+ENGINE_GUARD := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) $(ENGINE_TIMEOUT))
 
 NODES_CSV := $(shell echo $(NODES) | tr ' ' ',')
-# Real podman containers only — every container-lifecycle target (containers-up/down, reconnect,
+# Real containers only — every container-lifecycle target (containers-up/down, reconnect,
 # clean-notes, solo-check) iterates this, never $(NODES) directly, so "l" is never mistaken for
 # a container to create/rm/exec-into.
 CONTAINER_NODES     := $(filter-out l,$(NODES))
@@ -88,7 +115,8 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke local \
         build net secrets-dir clean-secrets login capture node1 containers-up solo-check reconnect run campaign soak analyze generate repro \
-        clean-runs clean-notes clean-data clean-images trial containers-down ps logs health
+        clean-runs clean-notes clean-data clean-images trial containers-down ps logs health \
+        images obsidian-latest net-check
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -115,25 +143,43 @@ local: ## Single-node pipeline check against a local throwaway vault
 
 # ---- containers ------------------------------------------------------------
 
-build: ## Build the node image
-	podman build -t $(IMAGE) containers
+build: ## Build the node image for OBSIDIAN_VERSION (tagged obsidian-node:<version>)
+	$(ENGINE) build --build-arg OBSIDIAN_VERSION=$(OBSIDIAN_VERSION) -t $(IMAGE_TAG) containers
 
+# Create the test network if absent, with an EXPLICIT subnet — the per-node pinned IPs live in it
+# (10.89.0.<100+n>), and leaving the subnet to the engine's default silently breaks them on any
+# engine whose default isn't 10.89.0.0/24 (Docker's is 172.x). `network inspect` is the portable
+# existence test: podman's `network exists` has no Docker equivalent.
+#
+# A pre-existing network with the WRONG subnet is the nasty case — every `--ip 10.89.0.x` would
+# fail with an obscure engine error — so it's detected here and reported for what it is. The
+# subnet is matched against the raw inspect JSON rather than a --format expression because the two
+# engines shape that JSON differently (Docker: .IPAM.Config[].Subnet; podman: .subnets[].subnet).
 net:
-	podman network exists $(NET) || podman network create $(NET)
+	@if $(ENGINE) network inspect $(NET) >/dev/null 2>&1; then \
+	  $(ENGINE) network inspect $(NET) 2>/dev/null | grep -q '$(SUBNET)' || { \
+	    echo "network '$(NET)' exists but does not carry subnet $(SUBNET) — the pinned node IPs"; \
+	    echo "  (10.89.0.x) cannot be assigned in it. It was probably created by an older version"; \
+	    echo "  of this Makefile, or by hand. Remove it and let this target recreate it:"; \
+	    echo "      make containers-down && $(ENGINE) network rm $(NET) && make net"; \
+	    exit 1; }; \
+	else \
+	  $(ENGINE) network create --subnet $(SUBNET) $(NET); \
+	fi
 
 secrets-dir:
 	mkdir -p $(SECRETS)
 
 clean-secrets: containers-down ## Wipe the captured login (./secrets) + login container (then: make login -> capture)
-	-podman rm -f $(LOGIN) 2>/dev/null || true
+	-$(ENGINE) rm -f $(LOGIN) 2>/dev/null || true
 	rm -rf $(SECRETS)
 	@echo "Wiped $(SECRETS) and the login container. Next: make login && make capture"
 
 login: build net secrets-dir ## Start a VNC container for the one-time Sync login
-	-podman rm -f $(LOGIN) 2>/dev/null || true
-	podman run -d --name $(LOGIN) --network $(NET) \
+	-$(ENGINE) rm -f $(LOGIN) 2>/dev/null || true
+	$(ENGINE) run -d --name $(LOGIN) --network $(NET) \
 	  -p $(VNC_PORT):5900 \
-	  -v $(SECRETS):/secrets:rw $(IMAGE)
+	  -v $(SECRETS):/secrets:rw $(IMAGE_TAG)
 	@echo
 	@echo "VNC ready at localhost:$(VNC_PORT) (password: obsidian); TestVault opens automatically."
 	@echo "  1. enable CLI: Settings > General > Advanced > Command line interface"
@@ -142,11 +188,11 @@ login: build net secrets-dir ## Start a VNC container for the one-time Sync logi
 	@echo "  4. wait for full sync, then: make capture"
 
 capture: ## Copy the login out of the container into ./secrets, then stop it
-	podman exec $(LOGIN) sh -c '\
+	$(ENGINE) exec $(LOGIN) sh -c '\
 	  mkdir -p /secrets/config /secrets/vault && \
 	  cp -a /root/.config/obsidian/. /secrets/config/ && \
 	  cp -a /root/vaults/TestVault/.obsidian/. /secrets/vault/'
-	podman rm -f $(LOGIN)
+	$(ENGINE) rm -f $(LOGIN)
 	@echo "Captured login into $(SECRETS) (git-ignored). Next: make containers-up"
 
 # Pinned per-node network identity (see src/isolate.ts's nodeAddress — same scheme, kept in
@@ -155,7 +201,7 @@ capture: ## Copy the login out of the container into ./secrets, then stop it
 # not the cleaner "obnet" — the first byte's I/G bit marks individual/group addressing, and
 # 0x6f ('o') has it SET, i.e. multicast, which the kernel refuses to assign to a real interface;
 # 0x6e ('n') is a valid unicast, locally-administered first byte). The last byte must still be
-# hex, not decimal digits. Applied at every `podman run`/`network connect` for a node so a
+# hex, not decimal digits. Applied at every `$(ENGINE) run`/`network connect` for a node so a
 # reconnect restores the SAME identity the container has had since its very first start — the
 # identity never changes at all, on the theory that Sync recognizing "the same device,
 # unchanged" reconnects faster than a fresh join.
@@ -163,37 +209,39 @@ NODE_ADDR = num=$${n\#n}; addr=$$((100+num)); ip=10.89.0.$$addr; mac=6e:62:6e:65
 
 node1: build net ## Run a single node (n1) with VNC published, for inspection/debugging
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
-	-podman rm -f n1 2>/dev/null || true
+	-$(ENGINE) rm -f n1 2>/dev/null || true
 	@n=n1; $(NODE_ADDR); \
-	  podman run -d --name n1 --hostname n1 --network $(NET) --ip $$ip --mac-address $$mac \
-	    -p $(VNC_PORT):5900 -v $(SECRETS):/secrets:ro $(IMAGE)
+	  $(ENGINE) run -d --name n1 --hostname n1 --network $(NET) --ip $$ip --mac-address $$mac \
+	    -p $(VNC_PORT):5900 -v $(SECRETS):/secrets:ro $(IMAGE_TAG)
 	@scripts/wait-node.sh n1
 	@echo "n1 ready. Inspect via VNC: vnc://localhost:$(VNC_PORT) (password: obsidian)."
 
 containers-up: build net ## Launch n1 + n2 (each seeds from ./secrets; VNC published per node)
 	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture"; exit 1; }
 	@port=$(VNC_PORT); for n in $(CONTAINER_NODES); do \
-	  podman rm -f $$n 2>/dev/null || true; \
+	  $(ENGINE) rm -f $$n 2>/dev/null || true; \
 	  $(NODE_ADDR); \
 	  echo "starting $$n (VNC localhost:$$port, $$ip)"; \
-	  podman run -d --name $$n --hostname $$n --network $(NET) --ip $$ip --mac-address $$mac \
-	    -p $$port:5900 -v $(SECRETS):/secrets:ro $(IMAGE); \
+	  $(ENGINE) run -d --name $$n --hostname $$n --network $(NET) --ip $$ip --mac-address $$mac \
+	    -p $$port:5900 -v $(SECRETS):/secrets:ro $(IMAGE_TAG); \
 	  port=$$((port+1)); \
 	done
 	@for n in $(CONTAINER_NODES); do scripts/wait-node.sh $$n; done
 	@echo "nodes ready: $(CONTAINER_NODES). VNC from localhost:$(VNC_PORT) (password: obsidian). Then: make run"
 
 solo-check:
-	@echo "solo-check: inspecting containers on $(NET)…$(if $(PODMAN_GUARD),, (no 'timeout' found — install coreutils for a hang guard))"
+	@echo "solo-check: inspecting containers on $(NET)…$(if $(ENGINE_GUARD),, (no 'timeout' found — install coreutils for a hang guard))"
 	@# Isolation guard: every node Syncs to the same vault, so a stray
 	@# container on the test network would confound the run. Abort if anything running
-	@# isn't one of the intended CONTAINER_NODES. The podman call is time-bounded ($(PODMAN_GUARD))
-	@# so a wedged podman API fails fast with a hint instead of hanging silently.
-	@names=$$($(PODMAN_GUARD) podman ps --filter network=$(NET) --format '{{.Names}}'); rc=$$?; \
+	@# isn't one of the intended CONTAINER_NODES. The $(ENGINE) call is time-bounded ($(ENGINE_GUARD))
+	@# so a wedged $(ENGINE) API fails fast with a hint instead of hanging silently.
+	@names=$$($(ENGINE_GUARD) $(ENGINE) ps --filter network=$(NET) --format '{{.Names}}'); rc=$$?; \
 	  if [ $$rc -eq 124 ]; then \
-	    echo "podman unresponsive (timed out after $(PODMAN_TIMEOUT)s) — the machine may be wedged; try: podman machine stop && podman machine start"; exit 1; fi; \
+	    echo "$(ENGINE) unresponsive (timed out after $(ENGINE_TIMEOUT)s) — its VM may be wedged."; \
+	    echo "  podman: 'podman machine stop && podman machine start'   docker: restart Docker Desktop"; exit 1; fi; \
 	  if [ $$rc -ne 0 ]; then \
-	    echo "podman ps failed (rc=$$rc) — is the podman machine running? ('podman machine start')"; exit 1; fi; \
+	    echo "$(ENGINE) ps failed (rc=$$rc) — is the engine running?"; \
+	    echo "  podman: 'podman machine start'   docker: start Docker Desktop / the docker daemon"; exit 1; fi; \
 	  for c in $$names; do \
 	    echo " $(CONTAINER_NODES) " | grep -q " $$c " || { \
 	      echo "stray container '$$c' running on $(NET) — stop it first (e.g. 'make containers-down')"; exit 1; }; \
@@ -201,14 +249,21 @@ solo-check:
 	@# Warn when reusing long-lived nodes (accumulated vault/conflict cruft can
 	@# skew a run); 'make containers-up' recreates them fresh from the captured login.
 	@for n in $(CONTAINER_NODES); do \
-	  up=$$($(PODMAN_GUARD) podman ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
+	  up=$$($(ENGINE_GUARD) $(ENGINE) ps --filter "name=^$$n$$" --format '{{.RunningFor}}' 2>/dev/null); \
 	  [ -n "$$up" ] && echo "[warn] reusing existing container $$n (up $$up) — run 'make containers-up' for a fresh start" || true; \
 	done
 
+# The MAC is re-pinned only where `network connect` can do it (podman yes, Docker no — Docker has
+# no such flag and silently assigns a random one). Probed once here, from the engine itself rather
+# than from its name, since podman also ships a `docker`-named shim. The IP is what actually keeps
+# a reconnect a link blip rather than a network reset (see scripts/net-check.sh), and it IS
+# re-pinned on both.
 reconnect: ## Reconnect all CONTAINER_NODES to the network (fixes a node left detached by an interrupted soak)
-	@for n in $(CONTAINER_NODES); do \
+	@if $(ENGINE) network connect --help 2>&1 | grep -q -- '--mac-address'; then pinmac=1; else pinmac=0; fi; \
+	for n in $(CONTAINER_NODES); do \
 	  $(NODE_ADDR); \
-	  $(PODMAN_GUARD) podman network connect --ip $$ip --mac-address $$mac $(NET) $$n 2>/dev/null && echo "reconnected $$n ($$ip)" || echo "$$n already connected (or absent)"; \
+	  if [ $$pinmac = 1 ]; then macarg="--mac-address $$mac"; else macarg=""; fi; \
+	  $(ENGINE_GUARD) $(ENGINE) network connect --ip $$ip $$macarg $(NET) $$n 2>/dev/null && echo "reconnected $$n ($$ip)" || echo "$$n already connected (or absent)"; \
 	done
 
 # run/campaign/soak depend on `reconnect`: a Ctrl-C'd soak can leave a node detached (a `D`
@@ -259,20 +314,53 @@ clean-data: clean-notes ## Fresh slate for a soak: clear the harness's notes (bu
 trial: containers-up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
 
 containers-down: ## Stop + remove n1/n2
-	-@for n in $(CONTAINER_NODES); do podman rm -f $$n 2>/dev/null || true; done
+	-@for n in $(CONTAINER_NODES); do $(ENGINE) rm -f $$n 2>/dev/null || true; done
 
 ps: ## List containers on the test network
-	podman ps --filter network=$(NET)
+	$(ENGINE) ps --filter network=$(NET)
 
 logs: ## Tail Obsidian's log on the first node
-	podman exec $(firstword $(CONTAINER_NODES)) tail -n 80 /var/log/obsidian.log
+	$(ENGINE) exec $(firstword $(CONTAINER_NODES)) tail -n 80 /var/log/obsidian.log
 
 health: ## Print a node's liveness report + save its screenshot to ./_shot.png (NODE=n1)
-	@podman exec $(NODE) /usr/local/bin/obsidian-healthcheck
-	@podman cp $(NODE):/var/log/obsidian-shot.png ./_shot.png && echo "screenshot -> ./_shot.png"
+	@$(ENGINE) exec $(NODE) /usr/local/bin/obsidian-healthcheck
+	@$(ENGINE) cp $(NODE):/var/log/obsidian-shot.png ./_shot.png && echo "screenshot -> ./_shot.png"
 
-clean-images: containers-down ## Remove the node image + podman network (keeps ./secrets; use clean-secrets for that)
-	-podman rm -f $(LOGIN) 2>/dev/null || true
-	-podman rmi $(IMAGE) 2>/dev/null || true
-	-podman network rm $(NET) 2>/dev/null || true
+clean-images: containers-down ## Remove ALL node images (every version) + the test network (keeps ./secrets)
+	-$(ENGINE) rm -f $(LOGIN) 2>/dev/null || true
+	@# Every version-tagged build, not just the currently-pinned one — `make images` lists them.
+	-@ids=$$($(ENGINE) images --format '{{.Repository}}:{{.Tag}}' | grep '^$(IMAGE):' || true); \
+	  [ -n "$$ids" ] && $(ENGINE) rmi $$ids 2>/dev/null || true
+	-$(ENGINE) network rm $(NET) 2>/dev/null || true
 	@echo "Note: ./secrets kept. Run clean-secrets to discard the captured login."
+
+# ---- Obsidian version management -------------------------------------------
+
+images: ## List the node images built so far, one per Obsidian version
+	@$(ENGINE) images --filter reference='$(IMAGE)' --format '  {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}' \
+	  | sort || true
+	@echo "  (currently pinned: OBSIDIAN_VERSION=$(OBSIDIAN_VERSION))"
+
+# Read from Obsidian's OWN update manifest — the same file the app's updater consults — rather
+# than the GitHub API, which is rate-limited to 60 requests/hour for unauthenticated callers and
+# would occasionally answer this with an error instead of a version.
+obsidian-latest: ## Check the newest Obsidian release upstream against the pinned OBSIDIAN_VERSION
+	@latest=$$(curl -fsSL https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/desktop-releases.json \
+	    | sed -n 's/.*"latestVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1); \
+	  if [ -z "$$latest" ]; then echo "could not read the upstream release manifest (offline?)"; exit 1; fi; \
+	  if [ "$$latest" = "$(OBSIDIAN_VERSION)" ]; then \
+	    echo "up to date: pinned $(OBSIDIAN_VERSION) is the latest release"; \
+	  else \
+	    echo "pinned:  $(OBSIDIAN_VERSION)"; \
+	    echo "latest:  $$latest"; \
+	    echo; \
+	    echo "To upgrade, edit OBSIDIAN_VERSION at the top of the Makefile, then:"; \
+	    echo "    make containers-up          # rebuilds + relaunches the nodes on the new build"; \
+	    echo "Or try it without committing to it:"; \
+	    echo "    make containers-up OBSIDIAN_VERSION=$$latest"; \
+	  fi
+
+# ---- engine sanity ---------------------------------------------------------
+
+net-check: net ## Verify a D/C reconnect is a brief blip (<1s, pinned IP) on this engine — run after an engine change
+	@scripts/net-check.sh $(or $(ROUNDS),3) $(or $(OUTAGE),10) $(or $(BUDGET),1.0)

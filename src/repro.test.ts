@@ -25,7 +25,9 @@ test("generateScript: without --run-id, RUN_ID defaults to the history string it
 test("generateScript: a plain append is a single, explicit function call — no inline shell", () => {
   const script = generateScript(parse("N1Aa"), baseOpts);
   assert.match(script, /^Append 1 a$/m);
-  assert.doesNotMatch(script, /podman exec/); // all podman/CLI mechanics now live in the library, not here
+  // All engine/CLI mechanics live in the library, not inlined here — and the generated script
+  // must not bake in an engine NAME either, so it stays valid on a machine with the other one.
+  assert.doesNotMatch(script, /podman|docker/);
 });
 
 test("generateScript: disconnect/connect emit explicit calls, plus the pinned ip/mac as NODE_IP/NODE_MACADDR array entries", () => {
@@ -114,7 +116,7 @@ test("scripts/repro-lib.sh: every real command is wrapped in `run` for VERBOSE e
   for (const pattern of [
     /run \$b append/, /run \$b create/, /run \$b open/, /run \$b sync:status/,
     /run \$b read file/, /run \$b files folder/, /run \$b read path/,
-    /run podman network disconnect/, /run podman network connect/,
+    /run "\$ENGINE" network disconnect/, /run "\$ENGINE" network connect/,
   ]) {
     assert.match(lib, pattern);
   }
@@ -125,8 +127,21 @@ test("scripts/repro-lib.sh: Append aborts (die) if create doesn't report success
   assert.match(reproLib(), /\[\[ "\$out" == Created:\* \]\] \|\| die/);
 });
 
-test("scripts/repro-lib.sh: Disconnect/Connect abort (die) on a nonzero podman exit code", () => {
+test("scripts/repro-lib.sh: Disconnect/Connect abort (die) on a nonzero engine exit code", () => {
   const lib = reproLib();
-  assert.match(lib, /Disconnect\(\) \{ run podman network disconnect .*\|\| die/);
-  assert.match(lib, /Connect\(\)\s+\{ run podman network connect .*\|\| die/);
+  assert.match(lib, /Disconnect\(\) \{ run "\$ENGINE" network disconnect .*\|\| die/);
+  assert.match(lib, /run "\$ENGINE" network connect .*\|\| die "connect failed/);
+});
+
+// The generated repro must work on whichever engine the machine RUNNING it has — so the library
+// resolves the engine itself, and asks it (rather than its name) whether a reconnect can re-pin
+// the MAC. Mirrors src/engine.ts; these assertions are what keeps the pair in step.
+test("scripts/repro-lib.sh: resolves the engine at run time and probes its --mac-address support", () => {
+  const lib = reproLib();
+  assert.match(lib, /ENGINE="\$\{CONTAINER_ENGINE:-\$\(command -v podman .*podman.*docker\)\}"/);
+  assert.match(lib, /\$ENGINE network connect --help .*grep -q -- '--mac-address'/);
+  assert.match(lib, /ENGINE_PINS_MAC=1/);
+  assert.match(lib, /ENGINE_PINS_MAC=0/);
+  // The IP is pinned unconditionally; only the MAC is conditional.
+  assert.match(lib, /network connect --ip "\$\{NODE_IP\[\$1\]\}" \$mac/);
 });

@@ -25,7 +25,7 @@
 //                    nothing to configure.
 //   --bin            CLI path inside the container           (default /opt/obsidian/obsidian-cli)
 //   --isolator       network | sync                          (default network)
-//   --network        podman network                          (default obsidian-net)
+//   --network        container network                       (default obsidian-net)
 //   --local-bin      path to a local obsidian-cli binary (NOT the container's path)
 //                    (default: obsidian, relying on the normal install/activation flow's PATH entry)
 //   --local-node-id  the local instance's own Sync-reported device name (default: OS `hostname`,
@@ -68,9 +68,10 @@ import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSyn
 import assert from "node:assert/strict";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { PodmanExecutor, LocalExecutor, runProcess } from "./exec.js";
+import { engineBin, engineVersion } from "./engine.js";
+import { ContainerExecutor, LocalExecutor, runProcess } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
-import { SyncToggleIsolator, PodmanIsolator, type Isolator } from "./isolate.js";
+import { SyncToggleIsolator, NetworkIsolator, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
 import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
@@ -204,11 +205,11 @@ if (generateN > 0) {
 // query in that case.
 async function obsidianVersion(): Promise<string | undefined> {
   if (nodesList.length === 0) return undefined;
-  const r = await runProcess("podman", ["exec", nodesList[0], bin, "version"]);
+  const r = await runProcess(engineBin(), ["exec", nodesList[0], bin, "version"]);
   return r.stdout.trim() || "?";
 }
 
-// Same idea for the local instance, queried directly (no podman wrapping — same construction as
+// Same idea for the local instance, queried directly (no engine wrapping — same construction as
 // LocalExecutor.exec) — worth recording separately since a real reason to test against a real
 // local Obsidian install is likely a DIFFERENT installed version than the containers' pinned build.
 async function localObsidianVersion(): Promise<string | undefined> {
@@ -243,7 +244,7 @@ const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs"
 // Vault's on-disk root in the container — enables the filesystem second-source / CLI-vs-FS
 // cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.
 const vaultPath = values["vault-path"] ?? "/root/vaults/TestVault";
-const drivers = nodesList.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin), vaultPath));
+const drivers = nodesList.map((n) => new ObsidianDriver(new ContainerExecutor(n, bin), vaultPath));
 if (localRequested) {
   // The local instance's own Sync-reported device name — oracle.ts's conflict-file `wellFormed`
   // check matches the parsed `(Conflicted copy <device> ...)` name against each driver's own
@@ -273,7 +274,7 @@ if (values["local-vault-pin"]) {
   drivers[drivers.length - 1].pinnedVault = capturedLocalVaultName;
 }
 const byId = new Map(drivers.map((d) => [d.node, d]));
-const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new PodmanIsolator(network);
+const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new NetworkIsolator(network);
 
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
@@ -286,6 +287,7 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   snapshot: !values["skip-snapshot"], // on by default; --skip-snapshot turns off the whole mechanism
   isolator: isolatorKind,
   obsidianVersion: await obsidianVersion(),
+  containerEngine: await engineVersion(),
   localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
   localObsidianVersion: await localObsidianVersion(),
   localVaultName: capturedLocalVaultName,
@@ -507,7 +509,7 @@ async function readState(d: ObsidianDriver): Promise<PreflightRow> {
     const files = await d.listFiles();
     return { node: d.node, reachable: true, state: st.value ?? "?", notes: files.value?.length ?? 0 };
   } catch (e) {
-    // A down/absent container fails at the exec layer (podman exit ≠ 0, empty stdout) →
+    // A down/absent container fails at the exec layer (engine exit ≠ 0, empty stdout) →
     // report unreachable so preflight aborts with a friendly message. A *code-0* unknown
     // output is a real format problem, not a down node — let it propagate as a flagged inconsistency.
     if (e instanceof CliUnrecognizedOutput && e.raw.code !== 0) {
@@ -548,7 +550,7 @@ async function preflight(): Promise<boolean> {
         process.exit(2);
       }
       // Same classification readState() uses below: a down/absent container fails at the exec
-      // layer itself (podman exit ≠ 0), distinct from a live container answering with unparseable
+      // layer itself (engine exit ≠ 0), distinct from a live container answering with unparseable
       // text. Name it clearly here too, rather than falling through to a generic, contentless
       // crash (this is the FIRST driver call preflight makes, so a down container hits this
       // before readState's own reachable check ever runs).

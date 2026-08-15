@@ -3,23 +3,59 @@
 Broader architectural narrative that doesn't fit `docs/cli-trust.md`'s CLI-output-trust theme —
 why things are shaped the way they are, and paths considered and rejected. Like `cli-trust.md`,
 this is a record of reasoning, not a spec: when the black box it's reasoning about changes (a new
-Obsidian version, a new podman release), the conclusions here may need resampling. What should
-stay true regardless is the general ethos this repo follows — verify everything through an
+Obsidian version, a new podman/Docker release), the conclusions here may need resampling. What
+should stay true regardless is the general ethos this repo follows — verify everything through an
 explicitly recognizable path, log every step, fail hard on the unknown.
 
-## Podman network identity: pinning the same IP/MAC across reconnects
+Where a conclusion here is load-bearing enough that its silent expiry would corrupt results
+rather than merely break something, it gets an executable check instead of a paragraph — see
+`make net-check` under "Network identity" below.
+
+## Network identity: pinning the same IP/MAC across reconnects
 
 `isolate.ts`'s `nodeAddress()` derives a fixed IP and MAC address per node (`n1` → `10.89.0.101`
-/ `6e:62:6e:65:74:65`, etc.) and re-applies it on every reconnect, rather than letting podman
-assign a fresh one each time. The theory: Sync recognizing "the same device, unchanged" on
-reconnect may behave differently (faster, or just more representative of a real device blip) than
-a genuinely new join would look like — a real laptop reconnecting to wifi keeps its identity, so
-the harness's simulated disconnect should too.
+/ `6e:62:6e:65:74:65`, etc.) and re-applies it on every reconnect, rather than letting the engine
+assign a fresh one each time.
+
+**The point is which experiment a `D`…`C` pair actually runs.** What we want to simulate is a
+device that loses connectivity for a few seconds and gets it back: its TCP connections to Sync
+stall, then resume where they left off. What we do *not* want is a full network reset — the node
+reappearing as a different address, its old connections dying on timeout, and Obsidian taking its
+error-handling/rejoin path instead. That second thing turns a 10-second outage into a
+minute-long one and exercises entirely different code. Both are legitimate experiments, but only
+one of them is what a history like `N2DN1AaWN2AaCW` claims to be testing, and a run that silently
+does the other is a run that means something different than its label.
+
+Keeping the **IP** is what secures this: TCP connections are keyed on the address 4-tuple, so an
+unchanged IP lets the stalled connections simply resume. Measured on Docker 29.7.2 (see
+`scripts/net-check.sh`): a container reconnected with `--ip` was reachable again within ~50ms of
+the `network connect` command returning, and a peer-to-peer TCP stream held open across a 10s
+outage resumed with its byte stream intact and no gap.
+
+The **MAC** turns out not to be load-bearing for that goal, which is fortunate, because Docker
+cannot re-pin it: `docker network connect` has no `--mac-address` flag, and the plausible
+`--driver-opt com.docker.network.endpoint.{mac_address,macaddress,mac-address}` spellings are all
+accepted silently (exit 0) while a fresh random MAC is assigned anyway. Podman can, and still
+does. The reason losing it costs nothing: disconnecting destroys the container's interface, which
+takes its ARP cache with it, so on reconnect the node must re-ARP for its gateway — and that ARP
+request carries the new MAC, updating the peer's neighbour entry immediately. There is no stale-
+ARP blackhole to wait out. The MAC is therefore pinned where the engine supports it (recorded per
+reconnect in the `network-identity` event, `macPinned: true|false`) and skipped where it doesn't.
+
+**This is an assumption about engine internals, so it is checked rather than trusted.**
+`make net-check` (`scripts/net-check.sh`) measures it deliberately on a disposable container —
+reconnect latency against a budget (default 1s) plus a hard assertion that the pinned IP survived
+— and is the thing to run after installing, switching, or upgrading a container engine. The same
+budget rides along on every real `C` at runtime: `NetworkIsolator.reconnectBudgetMs`, which emits
+a `slow-reconnect` event into the rep's own trace when exceeded, rather than aborting (a slow
+reconnect is an environment problem, and failing the rep would misreport infrastructure as an
+Obsidian finding).
 
 The MAC address's first byte is `0x6e` ('n', for "nbnet") rather than the more on-the-nose `0x6f`
 ('o', for "obnet") for a real constraint, not a spelling preference: a MAC address's first byte's
 least-significant bit is the I/G (individual/group) bit — 0 for a normal unicast address, 1 for
-multicast — and `0x6f` has that bit set. Podman's rootless network backend (netavark) refuses to
+multicast — and `0x6f` has that bit set. (This still matters wherever the MAC *is* pinned, i.e.
+podman and `<engine> run` on both.) Podman's rootless network backend (netavark) refuses to
 assign a multicast address to a real interface, confirmed live (`Error: netavark: create veth
 pair: Netlink error: Cannot assign requested address`) before switching to `0x6e`, which also has
 the U/L (locally-administered) bit set — correct for a made-up, non-vendor-assigned address. Only

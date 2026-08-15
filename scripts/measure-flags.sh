@@ -13,18 +13,30 @@
 # zombie attempt is given up on quickly during measurement.
 #
 # Usage: scripts/measure-flags.sh "<label>" "<obsidian flags>" [N]
+#
+# ENGINE (podman/docker) and IMAGE are picked up from the environment — `make` exports ENGINE, and
+# node images are tagged by Obsidian version, so name the one to measure:
+#   IMAGE=obsidian-node:1.13.7 scripts/measure-flags.sh "baseline" "" 10
+# (`make images` lists what's built.)
 set -u
 
+ENGINE="${ENGINE:-${CONTAINER_ENGINE:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}}"
 label="$1"; flags="$2"; N="${3:-10}"
-img=obsidian-node; net=obsidian-net; name=measure
+img="${IMAGE:-obsidian-node}"; net=obsidian-net; name=measure
+case "$img" in
+  *:*) ;;
+  *) echo "measure-flags: IMAGE='$img' has no version tag — node images are tagged by Obsidian" >&2
+     echo "  version now. Pass e.g. IMAGE=obsidian-node:1.13.7 ('make images' lists them)." >&2
+     exit 1 ;;
+esac
 secrets="$(cd "$(dirname "$0")/.." && pwd)/secrets/obsidian"
 
 # Isolation guard: every node boots from the SAME cloned Sync login (same device
 # id), so any other node running alongside the measurement confounds it — two
 # instances on one account, plus extra CPU on the machine. Refuse to run if
 # anything is already up on the test network (our own leftover excepted).
-podman rm -f "$name" >/dev/null 2>&1 || true
-running=$(podman ps --filter "network=$net" --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
+"$ENGINE" rm -f "$name" >/dev/null 2>&1 || true
+running=$("$ENGINE" ps --filter "network=$net" --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
 if [ -n "$(echo "$running" | tr -d ' ')" ]; then
   echo "measure-flags: other node(s) running on $net: $running" >&2
   echo "  stop them first (e.g. 'make containers-down') so they can't confound the measurement." >&2
@@ -33,16 +45,16 @@ fi
 
 ok=0; total=0; a1=0; results=""
 for i in $(seq 1 "$N"); do
-  podman rm -f "$name" >/dev/null 2>&1 || true
-  podman run -d --name "$name" --network "$net" \
+  "$ENGINE" rm -f "$name" >/dev/null 2>&1 || true
+  "$ENGINE" run -d --name "$name" --network "$net" \
     -e OBSIDIAN_FLAGS="$flags" -e OBSIDIAN_RENDER_BUDGET=8 \
     -v "$secrets":/secrets:ro "$img" >/dev/null
 
   att=""
   for _ in $(seq 1 90); do
-    att=$(podman exec "$name" cat /var/log/obsidian-attempts 2>/dev/null || true)
+    att=$("$ENGINE" exec "$name" cat /var/log/obsidian-attempts 2>/dev/null || true)
     if [ -n "$att" ]; then break; fi
-    if [ "$(podman inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)" != true ]; then break; fi
+    if [ "$("$ENGINE" inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)" != true ]; then break; fi
     sleep 1
   done
   if [ -z "$att" ]; then att="FAIL"; fi
@@ -53,7 +65,7 @@ for i in $(seq 1 "$N"); do
   esac
   echo "[$label] boot $i: attempts=$att"
 done
-podman rm -f "$name" >/dev/null 2>&1 || true
+"$ENGINE" rm -f "$name" >/dev/null 2>&1 || true
 
 echo "[$label] results:$results"
 if [ "$total" -gt 0 ]; then

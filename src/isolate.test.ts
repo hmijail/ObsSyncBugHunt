@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { nodeAddress, PodmanIsolator } from "./isolate.js";
+import { nodeAddress, NetworkIsolator } from "./isolate.js";
 
 test("nodeAddress: n1 -> 10.89.0.101 / 6e:62:6e:65:74:65", () => {
   assert.deepEqual(nodeAddress("n1"), { ip: "10.89.0.101", mac: "6e:62:6e:65:74:65" });
@@ -20,10 +20,10 @@ test("nodeAddress: a node number that would overflow a single address byte throw
 
 // Drive the private waitReach() directly (via the probeFn test seam), bypassing the public
 // connect()/disconnect() so no real `podman network ...` call is needed either.
-function isolatorWithProbes(results: boolean[]): { isolator: PodmanIsolator; calls: number } {
+function isolatorWithProbes(results: boolean[]): { isolator: NetworkIsolator; calls: number } {
   let calls = 0;
   const probeFn = async () => results[Math.min(calls++, results.length - 1)];
-  const isolator = new PodmanIsolator("net", "8.8.8.8", 53, 30_000, probeFn);
+  const isolator = new NetworkIsolator("net", "8.8.8.8", 53, 30_000, probeFn);
   isolator.pollDelayMs = 0; // no real waiting in the test
   return { isolator, get calls() { return calls; } };
 }
@@ -52,11 +52,39 @@ test("waitReach: probes first, sleeps last (returns on attempt 1 without ever sl
 });
 
 test("waitReach: gives up past the cap with a descriptive error, no onEvent set falls back to console", async () => {
-  const isolator = new PodmanIsolator("net", "8.8.8.8", 53, 0, async () => false); // capMs=0 -> first check already past deadline
+  const isolator = new NetworkIsolator("net", "8.8.8.8", 53, 0, async () => false); // capMs=0 -> first check already past deadline
   isolator.pollDelayMs = 0;
   await assert.rejects(
     (isolator as unknown as { waitReach: (n: string, w: boolean, l: string) => Promise<void> })
       .waitReach("n1", true, "connect"),
     /connect n1: 8\.8\.8\.8:53 still unreachable after 0s/,
   );
+});
+
+// A D/C is only the experiment it claims to be if the reconnect is a brief blip; the isolator
+// therefore flags a slow one rather than letting it pass as a normal rep. (waitReach is driven
+// through the probeFn seam, so no real engine call happens.)
+test("connect: a reconnect within budget emits no slow-reconnect event", async () => {
+  const isolator = new NetworkIsolator("net", "8.8.8.8", 53, 30_000, async () => true);
+  isolator.pollDelayMs = 0;
+  const events: Record<string, unknown>[] = [];
+  isolator.onEvent = (e) => events.push(e);
+  const elapsed = await (isolator as unknown as { waitReach: (n: string, w: boolean, l: string) => Promise<number> })
+    .waitReach("n1", true, "connect");
+  assert.ok(elapsed < isolator.reconnectBudgetMs);
+  assert.equal(events.filter((e) => e.kind === "slow-reconnect").length, 0);
+});
+
+test("waitReach returns the elapsed time, which is what the reconnect budget is judged on", async () => {
+  const isolator = new NetworkIsolator("net", "8.8.8.8", 53, 30_000, async () => true);
+  isolator.pollDelayMs = 0;
+  isolator.onEvent = () => {};
+  const elapsed = await (isolator as unknown as { waitReach: (n: string, w: boolean, l: string) => Promise<number> })
+    .waitReach("n1", true, "connect");
+  assert.equal(typeof elapsed, "number");
+  assert.ok(elapsed >= 0);
+});
+
+test("reconnectBudgetMs defaults to 1s — the 'brief blip' threshold, tunable per run", () => {
+  assert.equal(new NetworkIsolator("net").reconnectBudgetMs, 1_000);
 });

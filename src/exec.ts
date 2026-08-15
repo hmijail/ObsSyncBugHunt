@@ -1,8 +1,9 @@
 // Executors decouple "which Obsidian CLI to run" from "how to reach it".
 // The same ObsidianDriver code works locally (dev / smoke testing) and against
-// a Podman container (`podman exec <container> obsidian ...`).
+// a container (`<engine> exec <container> obsidian ...`, engine per engine.ts).
 
 import { execFile } from "node:child_process";
+import { engineBin } from "./engine.js";
 import type { ExecResult } from "./types.js";
 
 export interface Executor {
@@ -37,9 +38,9 @@ export function runProcess(
     execFile(
       file,
       args,
-      // killSignal SIGKILL: the default SIGTERM is ignored by a wedged `podman`, so the
-      // timeout wouldn't actually fire (a real 763s hang was seen). SIGKILL makes the
-      // cap real, so `killed` is a trustworthy "untimely" signal for the retry loop.
+      // killSignal SIGKILL: the default SIGTERM is ignored by a wedged container-engine CLI, so
+      // the timeout wouldn't actually fire (a real 763s hang was seen, under podman). SIGKILL
+      // makes the cap real, so `killed` is a trustworthy "untimely" signal for the retry loop.
       { maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs, killSignal: "SIGKILL" },
       (err, stdout, stderr) => {
         const e = err as (NodeJS.ErrnoException & { code?: number; killed?: boolean }) | null;
@@ -74,17 +75,17 @@ export class LocalExecutor implements Executor {
   }
 }
 
-/** Runs the Obsidian CLI inside a Podman container. */
-export class PodmanExecutor implements Executor {
+/** Runs the Obsidian CLI inside a container, through whichever engine engine.ts resolved. */
+export class ContainerExecutor implements Executor {
   constructor(
     private readonly container: string,
     private readonly obsidianBin: string,
     readonly id = container,
   ) {}
   exec(args: string[], opts?: { timeoutMs?: number }) {
-    return runProcess("podman", ["exec", this.container, this.obsidianBin, ...args], opts?.timeoutMs);
+    return runProcess(engineBin(), ["exec", this.container, this.obsidianBin, ...args], opts?.timeoutMs);
   }
   shell(argv: string[], opts?: { timeoutMs?: number }) {
-    return runProcess("podman", ["exec", this.container, ...argv], opts?.timeoutMs);
+    return runProcess(engineBin(), ["exec", this.container, ...argv], opts?.timeoutMs);
   }
 }

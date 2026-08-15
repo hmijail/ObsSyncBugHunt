@@ -6,7 +6,7 @@
 //   npm run clean-notes -- --nodes n1,n2
 
 import { parseArgs } from "node:util";
-import { PodmanExecutor } from "./exec.js";
+import { ContainerExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { sleep } from "./runner.js";
 import { NOTE_DIR } from "./types.js";
@@ -14,7 +14,7 @@ import { NOTE_DIR } from "./types.js";
 const { values } = parseArgs({ options: { nodes: { type: "string" }, bin: { type: "string" } } });
 const nodes = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim());
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
-const drivers = nodes.map((n) => new ObsidianDriver(new PodmanExecutor(n, bin)));
+const drivers = nodes.map((n) => new ObsidianDriver(new ContainerExecutor(n, bin)));
 
 for (const d of drivers) await d.syncResume();
 

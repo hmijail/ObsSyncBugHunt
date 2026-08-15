@@ -66,6 +66,11 @@ export interface ExecuteOpts {
   // travel WITH the rep's own trace, not just live in the invocation's separate run log.
   isolator?: string; // "network" | "sync" — which fault primitive drove this run's D/C
   obsidianVersion?: string; // the CLI's own self-reported version, queried once at startup
+  // The container engine's own self-report (`<engine> --version`), same reasoning as the line
+  // above: the engine is part of the stack under test, not neutral scaffolding — it decides
+  // what a `D`/`C` actually does to the node (e.g. whether a reconnect restores the pinned MAC,
+  // which Podman can and Docker can't — see engine.ts), so a finding has to carry it.
+  containerEngine?: string;
   // The local instance (DSL `L`), when configured: its 1-based position within `drivers` (it's
   // just another element of that array, always last — see run.ts) and its own self-reported
   // Obsidian version (likely different from the containers' pinned build, which is the whole
@@ -547,6 +552,7 @@ export async function runHistory(
     // not the full topology it ran against).
     nodes: drivers.map((d) => d.node),
     isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, localObsidianVersion: opts.localObsidianVersion,
+    containerEngine: opts.containerEngine,
     localVaultName: opts.localVaultName,
     wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
@@ -565,7 +571,7 @@ export async function runHistory(
 
   // N<d> always means the container literally named `n<d>` — never positional, never the local
   // instance, regardless of how many containers are configured or where `l` sits in --nodes (a
-  // container driver's `.node` is literally its container name — see exec.ts's PodmanExecutor).
+  // container driver's `.node` is literally its container name — see exec.ts's ContainerExecutor).
   // "local" is a structurally separate selector, resolved directly via localDriver — it can never
   // collide with a numbered lookup, since the local driver's name is never "n<number>".
   const driverOf = (sel: number | "local"): ObsidianDriver => {

@@ -28,7 +28,10 @@ The result is code that is expected to only be read by an LLM, which learnt noth
 More detailed blog post coming soon.
 
 ## Requirements
-* Podman (a podman-machine with 2 vCPUs, 4GB RAM is enough for 2 Obsidian containers)
+* Podman **or** Docker (2 vCPUs / 4GB RAM in the VM is enough for 2 Obsidian containers). Whichever
+  is installed is detected automatically; `make ... ENGINE=docker` (or `CONTAINER_ENGINE=...`) forces one.
+  The only functional difference is that Docker can't re-pin a container's MAC on reconnect — which
+  doesn't affect what `D`/`C` tests, and `make net-check` verifies that on your machine.
 * Obsidian Sync subscription
 * Optionally a local (non-containerized) Obsidian instance.
 
@@ -63,6 +66,52 @@ make analyze                             # aggregate runs/ into a report
 make repro HISTORY=N1DAaWN2AaC           # turn that history into a bash script (bug repro with minimal machinery)
 ```
 
+## Which Obsidian is under test, and upgrading it
+
+Obsidian ships new releases constantly, and a bug appearing or vanishing across them is *the*
+interesting signal here — so the version is pinned, explicit, and cheap to change.
+
+`OBSIDIAN_VERSION` at the top of the `Makefile` is the single source of truth. It's baked into the
+image at build time and the image is tagged with it (`obsidian-node:1.13.7`), so builds of
+different versions coexist rather than overwriting each other.
+
+```sh
+make obsidian-latest                     # is there a newer release than the pinned one?
+# then edit OBSIDIAN_VERSION in the Makefile, and:
+make containers-up                       # rebuild + relaunch the nodes on the new build
+
+make containers-up OBSIDIAN_VERSION=1.12.7   # ...or try a version without committing to it
+make images                              # which versions are built locally
+```
+
+That last form is what makes bisecting a finding across releases practical: run the history,
+switch version, run it again. The captured `./secrets` login carries across versions — no repeat
+of the VNC login dance.
+
+Nothing relies on the pin being *honest*: every rep records the version the CLI itself
+self-reports (`obsidianVersion` in its `history` event), alongside the container engine
+(`containerEngine`). The run log is the authoritative record of what produced a result, not the
+Makefile.
+
+## Container engine
+
+Podman and Docker both work, and the one you have installed is detected automatically. Override
+with `make ... ENGINE=docker` or `CONTAINER_ENGINE=/path/to/binary` (capabilities are probed from
+the binary itself, so podman installed under a `docker` name is still correctly treated as podman).
+
+They differ in exactly one thing that matters: Docker's `network connect` cannot re-pin a MAC
+address, so a reconnected node keeps its IP but gets a fresh MAC. That doesn't change what a
+`D`/`C` tests — see `docs/DESIGN.md` — but since it's an assumption about engine internals, it's
+checked rather than assumed:
+
+```sh
+make net-check     # run after installing/switching/upgrading an engine
+```
+
+It measures, on a disposable container, whether a reconnect restores connectivity within 1s on the
+node's pinned IP — i.e. whether a `D`…`C` is still a brief *link blip* rather than a full network
+reset. Every real `C` re-checks the same budget in passing and logs a `slow-reconnect` event if
+it's blown.
 
 # How it all works
 
@@ -123,7 +172,16 @@ real, in-use vault, the harness should keep your own notes safe. Not recommended
 
 ### Practical example
 
-Here's is a simple history string that already surfaces a very repeatable Obsidian Sync bug in Obsidian 1.12.7: **N2DN1AaWN2AaCW**
+Here's is a simple history string that already surfaces a very repeatable Obsidian Sync bug: **N2DN1AaWN2AaCW**
+
+Still reproducing as of Obsidian **1.13.7** (re-checked 2026-08-15, 8/8 reps lost data — it was
+first found on 1.12.7). The lost token is still on the server, so this is the clients dropping an
+acknowledged edit rather than an upload that never happened:
+
+```json
+{"kind":"lost-forensic","token":"(n1-1-a)","writer":"n1",
+ "serverRecoverable":true,"serverVersions":[1],"conflictFileFound":false}
+```
 
 - N2: selects N2 as the current node
 - D : disconnects the current node. (See below for different ways of disconnecting: disable network, disable sync)
@@ -136,7 +194,14 @@ Here's is a simple history string that already surfaces a very repeatable Obsidi
 - W : wait for sync
 
 Interestingly, this specific history results in very consistent data loss, but only in these specific conditions:
-* when disconnecting the containers' network ( `ISOLATOR=network`), but not when using the Obsidian CLI commands `sync:on` and `sync:off` (`ISOLATOR=sync`).
+* when disconnecting the containers' network ( `ISOLATOR=network`), but not when using the Obsidian CLI commands `sync:on` and `sync:off` (`ISOLATOR=sync`). Still a clean split on 1.13.7 — back to back on the same nodes, same vault, same history:
+
+  | isolator | reps | verdict | conflict files |
+  |---|---|---|---|
+  | `network` | 8 | 8 LOST | 0 |
+  | `sync`    | 5 | 5 PASS | 5 |
+
+  The `sync` case produces exactly the conflict file the `network` case is missing, which is what makes the loss a bug rather than a merge policy.
 * when it's 2 Linux containers syncing, but it seems to fail less consistenly when it's 1 Linux vs 1 Mac instance (i.e., **N2DLAaWN2AaCW**)
 
 Conversely, other bugs only happen between a Mac and a Linux instance, but not between 2 Linux instances. E.g. **N1DAaCLP9Aa**, reproducible in about 20% of repetitions (maybe dependent on CPU load?).
@@ -157,7 +222,7 @@ The main expected source of bugs is synchronization across nodes, particularly w
 
 The exact way in which nodes go offline is selected via `ISOLATOR`:
 
-- `network`: Default. Detach/attach the container from/to a Podman network. Each of the `D`/`C` commands block until a TCP probe to a numeric address confirms the network is actually dis/connected, to avoid the possibility of Sync squeezing through. Fixed IP and MAC are used to minimize the network disruption. (Ping is not used because of complexities of rootless container vs ICMP access.)
+- `network`: Default. Detach/attach the container from/to the container network. Each of the `D`/`C` commands block until a TCP probe to a numeric address confirms the network is actually dis/connected, to avoid the possibility of Sync squeezing through. A fixed IP (and MAC, where the engine supports re-pinning it) keeps the reconnect a brief *link blip* — established connections to Sync stall and resume — rather than a full network reset, where they'd die on timeout and Obsidian would take its rejoin path instead. That's a different experiment, so `make net-check` measures the assumption and every real `C` re-checks it against a 1s budget. (Ping is not used because of complexities of rootless container vs ICMP access.)
 - `sync`: Obsidian-cli `sync off` / `sync on` commands.
 
 `SCENARIO=stale` is a separate, more fixed mode: one node disconnects early and stays offline for a long (30s) window while the
@@ -261,7 +326,8 @@ src/
   driver.ts      Obsidian CLI wrapper                         (driver.test.ts)
   cli-parse.ts   positively-recognized-output-only CLI parsers (cli-parse.test.ts; see docs/cli-trust.md)
   inconsistency.ts  classify + log a correctness-assumption violation (-OBSFAIL/-UNKNOWN) (inconsistency.test.ts)
-  exec.ts        Local / Podman executors
+  exec.ts        Local / container executors
+  engine.ts      which container engine (podman/docker) to drive, and what it can do (engine.test.ts)
   isolate.ts     fault primitives (network partition / sync toggle)
   net.ts         host-internet connectivity probe (tells a Sync stall apart from a host outage)
   types.ts       shared types (NodeId, ExecResult, token format, NOTE_DIR)
@@ -273,9 +339,14 @@ src/
   clean-notes.ts delete the harness's notes (bughunt/) on all nodes (npm run clean-notes)
   smoke.ts       driver probe               (npm run smoke)
 containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
+scripts/
+  wait-node.sh   block until a node is genuinely ready (GUI alive, then Sync CLI answering)
+  net-check.sh   verify a D/C reconnect is still a brief blip on this engine (make net-check)
+  repro-lib.sh   bash runtime sourced by every `make repro` script
 docs/
   cli-trust.md   why/how the harness never judges from CLI output it didn't positively recognize
-Makefile         podman lifecycle: build -> login -> capture -> containers-up -> run
+  DESIGN.md      architectural reasoning + dead ends (incl. why IP/MAC are pinned across reconnects)
+Makefile         container lifecycle: build -> login -> capture -> containers-up -> run
 ```
 
 
@@ -310,6 +381,6 @@ Node is pinned in `.nvmrc`, enforced by `engines` + `engine-strict`; use `npm ci
 for lockfile-exact installs.
 
 
-Podman on macOS. Built the images with a view to be easy to run in AWS-EC2, but didn't try.
+Podman on macOS originally; Docker on macOS since 2026-08-15, and both are supported. Built the images with a view to be easy to run in AWS-EC2, but didn't try.
 
 Developed using Claude Code, with Claude Opus 4.8 and Claude Sonnet 5, on a Claude Pro Claude subscription and no extra Claude credits.
