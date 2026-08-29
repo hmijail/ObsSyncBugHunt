@@ -20,12 +20,23 @@
 # `history` event (see run.ts) — that, not this variable, is the authoritative record of a run.
 OBSIDIAN_VERSION ?= 1.13.7
 
-# Container engine. Podman and Docker are both supported; whichever is installed is detected
-# here, and CONTAINER_ENGINE=<binary> (or ENGINE=<binary>) overrides. Exported so the scripts/
-# helpers and the TypeScript harness (src/engine.ts) all drive the SAME engine as these targets
-# — a Makefile that made containers under one engine while the harness exec'd into another would
-# fail in a thoroughly confusing way.
-ENGINE ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
+# Container engine. Podman and Docker are both supported; whichever is installed is detected here.
+#
+# ONE setting, reachable under two spellings, because it has two kinds of consumer:
+#   ENGINE            - the make-variable spelling, for `make <target> ENGINE=podman`.
+#   CONTAINER_ENGINE  - the ENVIRONMENT spelling, read by src/engine.ts and the scripts/ helpers
+#                       when they run WITHOUT make (`npm run start -- ...`, `scripts/net-check.sh`).
+#                       Deliberately not plain "ENGINE" as an env var: that name is generic enough
+#                       that something else in a user's environment could own it and silently
+#                       hijack which engine the harness drives.
+#
+# The two must always agree. `ENGINE ?=` therefore SEEDS from CONTAINER_ENGINE before falling back
+# to detection, so setting either one — on the command line or in the environment — moves both.
+# Without that seeding, `make run CONTAINER_ENGINE=podman` silently split them: a command-line
+# variable outranks the `export ... :=` below, so make's own recipes kept using the detected engine
+# while the harness underneath used the requested one. That is exactly the split this export exists
+# to prevent, and `make check-assumptions` now asserts the two still match.
+ENGINE ?= $(or $(CONTAINER_ENGINE),$(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker))
 export CONTAINER_ENGINE := $(ENGINE)
 export ENGINE
 

@@ -45,6 +45,14 @@ echo "check-assumptions: engine=$ENGINE image=$IMAGE:$OBSIDIAN_VERSION network=$
 # 1. The engine itself. Everything below is meaningless if this isn't answering, and "which engine
 #    and which version" is precisely the thing that changes under you between sessions.
 say "container engine responds"
+# The Makefile drives its own recipes with $(ENGINE) while the harness and these scripts read
+# $CONTAINER_ENGINE. They are two spellings of one setting and MUST agree: a split means make
+# creates containers under one engine while the harness execs into another, which fails in a
+# thoroughly confusing way. Cheap to assert, so assert it rather than trusting the wiring.
+if [ -n "${CONTAINER_ENGINE:-}" ] && [ "$CONTAINER_ENGINE" != "$ENGINE" ]; then
+  bad "ENGINE=$ENGINE but CONTAINER_ENGINE=$CONTAINER_ENGINE — make and the harness would drive"
+  note "different engines. Set just one of them (they are aliases): make ... ENGINE=$CONTAINER_ENGINE"
+fi
 if ver=$("$ENGINE" --version 2>&1); then
   ok "$ver"
 else
