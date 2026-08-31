@@ -11,9 +11,25 @@ const baseOpts: ReproOpts = { containers: [1, 2], bin: "/opt/obsidian/obsidian-c
 const LIB_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "repro-lib.sh");
 const reproLib = () => readFileSync(LIB_PATH, "utf8");
 
-test("generateScript: sources the bash library exactly once, near the top", () => {
+test("generateScript: finds the bash library RELATIVE to itself, and bakes in no host path", () => {
   const script = generateScript(parse("N1Aa"), baseOpts);
-  assert.match(script, /^#!\/usr\/bin\/env bash\nset -u\n# N1Aa\nsource '.*\/scripts\/repro-lib\.sh'/);
+  assert.match(script, /^#!\/usr\/bin\/env bash\nset -u\n# N1Aa\n/);
+  // Resolved from the script's own location at run time, so a repro stays valid when it is
+  // committed, pasted into a bug report, or run on someone else's machine.
+  assert.match(script, /REPRO_LIB="\$\{REPRO_LIB:-\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)\/\.\." && pwd\)\/scripts\/repro-lib\.sh\}"/);
+  assert.match(script, /^source "\$REPRO_LIB"$/m);
+  assert.equal(script.match(/^source /gm)?.length, 1, "the library is sourced exactly once");
+  // The regression this guards: an absolute path to the GENERATING machine's checkout. Assert it
+  // by looking for this repo's own root, which is where the old code read the library from.
+  const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+  assert.ok(!script.includes(repoRoot), `generated script leaks the generating machine's path: ${repoRoot}`);
+  assert.doesNotMatch(script, /^[^#]*['"]\/(Users|home)\//m);
+});
+
+test("generateScript: an unfound library fails loudly rather than as missing commands", () => {
+  const script = generateScript(parse("N1Aa"), baseOpts);
+  assert.match(script, /\[ -r "\$REPRO_LIB" \] \|\| \{ echo "repro-lib\.sh not found/);
+  assert.match(script, /exit 1; \}/);
 });
 
 test("generateScript: without --run-id, RUN_ID defaults to the history string itself, not a timestamp", () => {

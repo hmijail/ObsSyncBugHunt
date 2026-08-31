@@ -27,7 +27,6 @@
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { parse, serialize, normalize, usesLocal, requiredNodes, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
 import { nodeIp } from "./isolate.js";
@@ -49,9 +48,21 @@ export interface ReproOpts {
 
 const RUN_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
-// scripts/repro-lib.sh, resolved from this file's own location (one level up from src/) — an
-// absolute path, since the generated script can be printed to stdout and saved anywhere.
-const LIB_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "repro-lib.sh");
+// How the generated script finds scripts/repro-lib.sh at RUN time. Resolved from the script's own
+// location, never baked in as an absolute path: a repro is a thing you paste into a bug report,
+// commit, or hand to someone else, and one carrying `/Users/<whoever>/...` is broken everywhere
+// but the machine that generated it.
+//
+// The cost is that the script must sit one level under the repo (`runs/<id>.sh` — where `make
+// repro` puts it), so `../scripts/` reaches the library. REPRO_LIB=<path> overrides that for a
+// script kept elsewhere, and an unfound library says so instead of failing later as a pile of
+// "command not found" from every function the script calls.
+const LIB_SOURCE_LINES = [
+  'REPRO_LIB="${REPRO_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/repro-lib.sh}"',
+  '[ -r "$REPRO_LIB" ] || { echo "repro-lib.sh not found at $REPRO_LIB — keep this script one level'
+    + ' under the repo (runs/), or set REPRO_LIB=<path>" >&2; exit 1; }',
+  'source "$REPRO_LIB"',
+];
 
 /** Single-quote a value for safe bash embedding (paths/tokens here never contain a `'`, but
  *  quoting costs nothing and guards against a future change). */
@@ -82,7 +93,7 @@ export function generateScript(history: History, opts: ReproOpts): string {
     "#!/usr/bin/env bash",
     "set -u",
     `# ${serialize(h)}`,
-    `source ${sq(LIB_PATH)}`,
+    ...LIB_SOURCE_LINES,
     "",
     "VERBOSE=${VERBOSE:-0}", // plain string, not a template literal — must reach bash literally
     `BIN=${sq(opts.bin)}`,
