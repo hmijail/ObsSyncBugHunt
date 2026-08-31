@@ -7,11 +7,11 @@
 // buildStateCells), grouped first by outcome (PASS/LOST/DUPL/...). Groups are per history
 // string only, NEVER merged across different histories — note letters/tokens from
 // unrelated DSL structures aren't comparable. A history that's all-PASS and landed in the
-// exact same state every rep is "uninteresting" — nothing to dig into — so it's pulled out
-// of the per-history sections entirely and listed, one row per history with its own
-// convergence-time stats, in a trailing `# Uninteresting` table instead. History sections
-// render at `#`; their category tables at `##`. Both the interesting sections and the
-// uninteresting table are ordered newest-first (history dirnames are `DDTHHMMSS-<dsl>`
+// exact same state every rep has nothing to dig into, so it's pulled out of the per-history
+// sections entirely and listed, one row per history with its rep count and its own
+// convergence-time stats, in a trailing `# No data loss` table instead. History sections
+// render at `#`; their category tables at `##`. Both the per-history sections and that
+// table are ordered newest-first (history dirnames are `DDTHHMMSS-<dsl>`
 // prefixed, so plain descending string comparison is chronological). Every timing stat uses
 // the MEDIAN, not the average — a single rare-but-huge transient outlier (e.g. one 8-hour
 // stall) would drag an average up and hide what's actually typical. Pure file reader — run
@@ -237,19 +237,32 @@ export function renderGroup(str: string, g: Group): string {
   return sections.join("\n");
 }
 
-/** One row per uninteresting history, its own convergence-time stats as columns rather than one
- *  history's own (now-absent) section — the whole point of pulling these out is a quick scan, not
- *  having to open each one individually. */
-export function renderUninteresting(rows: [string, Group][]): string {
-  const header = "| history | min | median | max | span |";
-  const sep = "|---|---|---|---|---|";
+/** One row per clean history, its own convergence-time stats as columns rather than one history's
+ *  own (now-absent) section — the whole point of pulling these out is a quick scan, not having to
+ *  open each one individually.
+ *
+ *  The subtitle is not decoration: the heading names something slightly WIDER than the section
+ *  holds. A history can lose no data and still be missing from here, because reps that all passed
+ *  while landing in DIFFERENT end states are kept in the main body, where that variety is worth
+ *  looking at. Without the subtitle the table reads as "these are the ones that were fine",
+ *  implying the rest were not. */
+export function renderNoDataLoss(rows: [string, Group][]): string {
+  const header = "| history | reps | min | median | max | span |";
+  const sep = "|---|---|---|---|---|---|";
   const body = rows.map(([str, g]) => {
     const s = computeStats(g.conv);
     return s
-      ? `| ${str} | ${s.min} | ${s.median} | ${s.max} | ${s.span} |`
-      : `| ${str} | n/a | n/a | n/a | n/a |`;
+      ? `| ${str} | ${g.reps} | ${s.min} | ${s.median} | ${s.max} | ${s.span} |`
+      : `| ${str} | ${g.reps} | n/a | n/a | n/a | n/a |`;
   });
-  return ["# Uninteresting", "", header, sep, ...body, ""].join("\n");
+  return [
+    "# No data loss",
+    "",
+    "_Every rep passed, and every rep of a given history reached the same end state. Histories"
+      + " that also lost nothing but varied between reps stay in the sections above._",
+    "",
+    header, sep, ...body, "",
+  ].join("\n");
 }
 
 // A history is "uninteresting" when every rep passed AND every one of them landed in the exact
@@ -309,7 +322,7 @@ export function main(base: string): void {
 
   const totalReps = [...groups.values()].reduce((s, g) => s + g.reps, 0);
   const sections = interesting.map(([str, g]) => renderGroup(str, g));
-  if (uninteresting.length > 0) sections.push(renderUninteresting(uninteresting));
+  if (uninteresting.length > 0) sections.push(renderNoDataLoss(uninteresting));
   const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");
   writeFileSync(outPath, md + "\n");

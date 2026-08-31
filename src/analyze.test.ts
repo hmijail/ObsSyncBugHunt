@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classify, tokensIn, letterOf, buildStateCells, stateKey, renderCategoryTable, renderGroup, line, isUninteresting, renderUninteresting, type Results, type StateEntry } from "./analyze.js";
+import { classify, tokensIn, letterOf, buildStateCells, stateKey, renderCategoryTable, renderGroup, line, isUninteresting, renderNoDataLoss, type Results, type StateEntry } from "./analyze.js";
 
 const converged = (note: string, canonical: string, conflicts: { file: string; content: string }[] = []) => ({
   note, lost: [] as string[], onlyInConflict: [] as string[], converged: true, conflictFiles: conflicts.length,
@@ -205,7 +205,7 @@ test("isUninteresting: any real failure -> false, even with a single PASS state 
   assert.equal(isUninteresting(g), false);
 });
 
-test("renderUninteresting: a table with min/median/max/span per history, heading starts with a capital U", () => {
+test("renderNoDataLoss: one row per history with its rep count and min/median/max/span", () => {
   const g1 = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
@@ -216,9 +216,12 @@ test("renderUninteresting: a table with min/median/max/span per history, heading
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [] as number[],
     obsfail: 0, unknown: 0, envfail: 0, categories: new Map(),
   };
-  const md = renderUninteresting([["histA", g1], ["histB", g2]]);
-  assert.ok(md.startsWith("# Uninteresting"), md);
-  assert.ok(md.includes("| history | min | median | max | span |"));
-  assert.ok(md.includes("| histA | 5 | 8 | 11 | 6 |"));
-  assert.ok(md.includes("| histB | n/a | n/a | n/a | n/a |"), "an empty conv array (no timing data) renders as n/a, not a crash");
+  const md = renderNoDataLoss([["histA", g1], ["histB", g2]]);
+  assert.ok(md.startsWith("# No data loss"), md);
+  assert.ok(md.includes("| history | reps | min | median | max | span |"));
+  assert.ok(md.includes("| histA | 3 | 5 | 8 | 11 | 6 |"));
+  // The rep count still shows when there is no timing data at all — the two are independent.
+  assert.ok(md.includes("| histB | 1 | n/a | n/a | n/a | n/a |"), "an empty conv array renders as n/a, not a crash");
+  // The heading names something wider than the section holds, so the subtitle must survive.
+  assert.match(md, /_Every rep passed, and every rep of a given history reached the same end state\./);
 });
