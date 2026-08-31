@@ -13,6 +13,12 @@ import type { RunLogger } from "./history.js";
 import type { Executor } from "./exec.js";
 import type { ExecResult } from "./types.js";
 
+/** A RunLogger stub that keeps its events in memory. runHistory re-reads its own trace to confirm
+ *  the rep actually ran the history it was given (see trace.ts), so every stub must be able to
+ *  answer `readEvents` — tests that don't inspect the log just let the array go unread. */
+const stubLogger = (events: Record<string, unknown>[] = []) =>
+  ({ log: (e: Record<string, unknown>) => events.push(e), readEvents: () => events }) as unknown as RunLogger;
+
 // Stub that answers `files folder=…` (CLI listing) and `ls -1 …` (FS listing) from canned
 // strings, so we can drive the CLI-vs-FS cross-check without a live node.
 class StubExecutor implements Executor {
@@ -92,7 +98,7 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
   // `synced` only at 120ms — so the early, divergent samples coincide with "syncing".
   const n1 = new ObsidianDriver(new ConvergingExecutor("n1", 0, 120));
   const n2 = new ObsidianDriver(new ConvergingExecutor("n2", 120, 120));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   const { observations, unsynced } = await waitForSynced(
     [n1, n2], [NOTE], 0.08, // 80ms quiet window
     { noteName: (l) => l, pollSec: 0.02, minFloorSec: 0, probeSec: 0.03, capSec: 5 },
@@ -130,7 +136,7 @@ class DisagreeingExecutor implements Executor {
 test("waitForSynced: a stable but DIVERGED state does not finalize as done — keeps polling until real convergence", async () => {
   const n1 = new ObsidianDriver(new DisagreeingExecutor("n1", "(n1-1-a)", "(agreed-a)", 150));
   const n2 = new ObsidianDriver(new DisagreeingExecutor("n2", "(n2-1-a)", "(agreed-a)", 150));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   const { observations, unsynced } = await waitForSynced(
     [n1, n2], [NOTE], 0.05, // 50ms quiet window — plenty of polls fit inside the 150ms divergence
     { noteName: (l) => l, pollSec: 0.02, minFloorSec: 0, probeSec: 0.03, capSec: 5, hostCheck: false },
@@ -211,7 +217,7 @@ test("W only waits on the active node's own driver, not every online driver (fin
   const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
   const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
 
   await runHistory([n1, n2], new NoopIsolator(), logger, parse("AaW"), {
     noteName: (l) => `bughunt/${l}`,
@@ -235,7 +241,7 @@ test("a local-instance-backed third driver: W still scopes to 1, the final settl
   const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
 
   await runHistory([n1, n2, local], new NoopIsolator(), logger, parse("AaWLAaW"), {
     noteName: (l) => `bughunt/${l}`,
@@ -258,7 +264,7 @@ test("driverOf resolves N<d> by container name, not array position (the NODES=l,
   const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
   // drivers = [n2, local] — only ONE container, at array position 1; local at position 2.
   // Before this fix, N2 would have positionally resolved to drivers[1] = local (the real bug
   // that crashed a live soak). It must now resolve to the container actually named "n2".
@@ -275,7 +281,7 @@ test("driverOf resolves N<d> by container name, not array position (the NODES=l,
 test("N<d> with no matching configured container throws a clear error naming what's missing", async () => {
   const vault = new Map<string, string>();
   const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   await assert.rejects(
     () => runHistory([n2], new NoopIsolator(), noLog, parse("N1Aa"), {
       noteName: (l) => `bughunt/${l}`, hostCheck: false,
@@ -290,7 +296,7 @@ test("driverOf is order-independent: N1/N2 resolve correctly even when drivers a
   const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
   const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
   await runHistory([n2, n1], new NoopIsolator(), logger, parse("N1AaN2Aa"), {
     noteName: (l) => `bughunt/${l}`, hostCheck: false,
     pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
@@ -306,7 +312,7 @@ test("opts.snapshot: false skips the whole pause-snapshot mechanism — no event
   const vault = new Map<string, string>();
   const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
   await runHistory([n1], new NoopIsolator(), logger, parse("AaP1"), {
     noteName: (l) => `bughunt/${l}`, hostCheck: false, snapshot: false,
     pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
@@ -318,7 +324,7 @@ test("pause-snapshot is logged by default (opts.snapshot unset)", async () => {
   const vault = new Map<string, string>();
   const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
   await runHistory([n1], new NoopIsolator(), logger, parse("AaP1"), {
     noteName: (l) => `bughunt/${l}`, hostCheck: false,
     pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
@@ -329,7 +335,7 @@ test("pause-snapshot is logged by default (opts.snapshot unset)", async () => {
 test("the D/C defense-in-depth assert fires if a D op is forced through while the local instance is active (bypassing dsl.ts's normalize-time guarantee on purpose)", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   // A hand-built op array, never passed through dsl.ts's normalize()/assertLocalAlwaysConnected
   // — proving the runtime assert in execute.ts is a real, independent second layer, not dead code.
   await assert.rejects(
@@ -347,7 +353,7 @@ test("assertLocalSyncOn: a local instance whose Sync is paused aborts the whole 
   // off local instance (e.g. the wrong vault frontmost): runHistory's upfront local-Sync check
   // must catch this on its very first probe, before ever reaching the baseline gate.
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "paused", false));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   // A plain Error (not CliInconsistencyError) — proving it escapes the per-rep catch in run.ts's runRep
   // rather than becoming a quiet -OBSFAIL, since the local instance's Sync being off invalidates
   // every subsequent rep until a human fixes it. hostCheck:false disables the host-outage detour,
@@ -370,7 +376,7 @@ test("assertLocalSyncOn: an inconclusive probe (syncing / timed-out / unreadable
     // actually completes; a driver that never resolves would hang forever by design, which is
     // correct in production but untestable here).
     const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, ["synced", value, "synced"], true));
-    const noLog = { log() {} } as unknown as RunLogger;
+    const noLog = stubLogger();
     await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
       noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
     }); // resolves without throwing for every one of these states
@@ -386,7 +392,7 @@ test("assertLocalSyncOn: an off-state that recovers within the grace window does
   // startSynced:false — off from the very first read (as a real broken-from-rep-start local
   // instance would be); then recovers after two reads, well within localSyncGraceAttempts below.
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, ["error", "error", "synced"], false));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   const result = await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1,
     localSyncGraceMs: 1, localSyncGraceAttempts: 2, // keep the grace window itself fast
@@ -398,7 +404,7 @@ test("assertLocalSyncOn: an off-state that recovers within the grace window does
 test("assertLocalSyncOn: an off-state that persists through every grace attempt still aborts", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "error", false));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   await assert.rejects(
     () => runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
       noteName: (l) => `bughunt/${l}`, localNode: 1,
@@ -412,7 +418,7 @@ test("assertLocalSyncOn: an off-state that persists through every grace attempt 
 test("assertLocalVaultUnchanged: the captured name still matching the driver's own report never throws", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "Throwaway"));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
     wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
@@ -425,7 +431,7 @@ test("assertLocalVaultUnchanged: a changed vault name is waited out, not aborted
   // proves this actually POLLS (not just re-reads once) before giving up on aborting altogether.
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, ["SomeOtherVault", "SomeOtherVault", "Throwaway"]));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
   const result = await runHistory([local], new NoopIsolator(), logger, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
     vaultRecheckMs: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
@@ -440,7 +446,7 @@ test("assertLocalVaultUnchanged: a changed vault name is waited out, not aborted
 test("assertLocalVaultUnchanged: no captured baseline (localVaultName unset) means the check never fires", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "WhateverIsActive"));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false,
     wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
@@ -450,7 +456,7 @@ test("assertLocalVaultUnchanged: no captured baseline (localVaultName unset) mea
 test("assertLocalVaultUnchanged: an inconclusive probe (killed) is tolerated, not treated as a mismatch", async () => {
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "killed"));
-  const noLog = { log() {} } as unknown as RunLogger;
+  const noLog = stubLogger();
   await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
     wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
@@ -505,7 +511,7 @@ test("checkWouldFail: a P snapshot reports would-fail (LOST) when enabled, and w
   try {
     const d = new ObsidianDriver(new VanishingExecutor(30));
     const events: Record<string, unknown>[] = [];
-    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    const logger = stubLogger(events);
     await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }], {
       noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
       pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
@@ -523,7 +529,7 @@ test("checkWouldFail: a W also reports would-fail (LOST) when enabled", async ()
   try {
     const d = new ObsidianDriver(new VanishingExecutor(30));
     const events: Record<string, unknown>[] = [];
-    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    const logger = stubLogger(events);
     await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }, { cmd: "wait" }], {
       noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
       pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
@@ -539,7 +545,7 @@ test("checkWouldFail: a W also reports would-fail (LOST) when enabled", async ()
 test("checkWouldFail: off by default — no would-fail event even for the exact same vanishing content", async () => {
   const d = new ObsidianDriver(new VanishingExecutor(30));
   const events: Record<string, unknown>[] = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = stubLogger(events);
   await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }], {
     noteName: (l) => `bughunt/${l}`, // wouldFailCheck not set — defaults off
     pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
@@ -566,7 +572,7 @@ test("checkWouldFail: a stable node-vs-node DISAGREEMENT (SYNCBAD-shaped) is nev
     const n1 = new ObsidianDriver(new DisagreeingExecutor("n1", "(n1-1-a)", agreed, 150, "bughunt/a"));
     const n2 = new ObsidianDriver(new DisagreeingExecutor("n2", "(n2-2-a)", agreed, 150, "bughunt/a"));
     const events: Record<string, unknown>[] = [];
-    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    const logger = stubLogger(events);
     await runHistory([n1, n2], new NoopIsolator(), logger, [
       { cmd: "node", node: 1 }, { cmd: "append", note: "a" },
       { cmd: "node", node: 2 }, { cmd: "append", note: "a" },
@@ -640,7 +646,7 @@ test("lostForensics: writer is attributed from AckedEdit, and conflictFileFound 
   for (const conflictContent of ["(n1-0-x)", null]) {
     const n1 = new ObsidianDriver(new LostForensicExecutor(15, conflictContent));
     const events: Record<string, unknown>[] = [];
-    const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+    const logger = stubLogger(events);
     // A pause before the final settle, well past vanishAtMs, guarantees the settle observes it
     // already gone (mirrors the checkWouldFail/VanishingExecutor tests' own timing pattern).
     const result = await runHistory([n1], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.05 }], {

@@ -209,7 +209,7 @@ test("renderNoDataLoss: one row per history with its rep count and min/median/ma
   const g1 = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
-    obsfail: 0, unknown: 0, envfail: 0, categories: new Map(),
+    obsfail: 0, unknown: 0, envfail: 0, minSec: 79, categories: new Map(),
   };
   const g2 = {
     reps: 1, pass: 1, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
@@ -218,10 +218,10 @@ test("renderNoDataLoss: one row per history with its rep count and min/median/ma
   };
   const md = renderNoDataLoss([["histA", g1], ["histB", g2]]);
   assert.ok(md.startsWith("# No data loss"), md);
-  assert.ok(md.includes("| history | reps | min | median | max | span |"));
-  assert.ok(md.includes("| histA | 3 | 5 | 8 | 11 | 6 |"));
+  assert.ok(md.includes("| history | reps | floor | min | median | max | span |"));
+  assert.ok(md.includes("| histA | 3 | 79s | 5 | 8 | 11 | 6 |"));
   // The rep count still shows when there is no timing data at all — the two are independent.
-  assert.ok(md.includes("| histB | 1 | n/a | n/a | n/a | n/a |"), "an empty conv array renders as n/a, not a crash");
+  assert.ok(md.includes("| histB | 1 | n/a | n/a | n/a | n/a | n/a |"), "no timings AND no floor (a pre-floor rep) still renders");
   // The heading names something wider than the section holds, so the subtitle must survive.
   assert.match(md, /_Every rep passed, and every rep of a given history reached the same end state\./);
 });

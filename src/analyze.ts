@@ -33,7 +33,7 @@ export interface NoteVerdict {
 export interface Observation { node: string; note: string; canonical: string | null; conflicts: { file: string; content: string }[] }
 export interface Results {
   verdict: { ok: boolean; notes: NoteVerdict[] };
-  timings: { convergenceSec: number; syncTimedOut?: boolean; unsynced?: boolean };
+  timings: { convergenceSec: number; minSec?: number; syncTimedOut?: boolean; unsynced?: boolean };
   forensics?: Forensic[];
   observations?: Observation[]; // absent in results.json written before this field existed
   noteLetters?: Record<string, string>; // concrete note name -> logical DSL letter; ditto
@@ -127,6 +127,10 @@ interface Group {
   // would inflate the denominator every rate here is measured against. Surfaced only so a
   // history's line says how rough the environment was while it ran.
   envfail: number;
+  // The shortest a rep of this history could honestly take (trace.ts's durationFloorSec), read
+  // off any rep — it is a property of the history, identical for every rep of it. Absent for reps
+  // recorded before the floor existed.
+  minSec?: number;
   categories: Map<string, Map<string, StateEntry>>; // classify() -> stateKey() -> entry
 }
 const newGroup = (): Group => ({
@@ -157,6 +161,7 @@ const stats = (xs: number[]): string => {
 function tally(g: Group, r: Results, rep: string) {
   g.reps++;
   g.conv.push(r.timings?.convergenceSec ?? 0);
+  g.minSec ??= r.timings?.minSec;
   if (r.timings?.syncTimedOut) g.timeouts++;
   if (r.timings?.unsynced) g.unsyncedReps++;
   const lost = r.verdict.notes.reduce((s, n) => s + n.lost.length, 0);
@@ -247,13 +252,17 @@ export function renderGroup(str: string, g: Group): string {
  *  looking at. Without the subtitle the table reads as "these are the ones that were fine",
  *  implying the rest were not. */
 export function renderNoDataLoss(rows: [string, Group][]): string {
-  const header = "| history | reps | min | median | max | span |";
-  const sep = "|---|---|---|---|---|---|";
+  // `floor` is the history's own theoretical minimum, so the timing columns can be read against
+  // something rather than in the abstract: a median sitting near the floor means Sync contributed
+  // almost nothing and the number is mostly the harness's own waits.
+  const header = "| history | reps | floor | min | median | max | span |";
+  const sep = "|---|---|---|---|---|---|---|";
   const body = rows.map(([str, g]) => {
     const s = computeStats(g.conv);
+    const fl = g.minSec === undefined ? "n/a" : `${g.minSec}s`;
     return s
-      ? `| ${str} | ${g.reps} | ${s.min} | ${s.median} | ${s.max} | ${s.span} |`
-      : `| ${str} | ${g.reps} | n/a | n/a | n/a | n/a |`;
+      ? `| ${str} | ${g.reps} | ${fl} | ${s.min} | ${s.median} | ${s.max} | ${s.span} |`
+      : `| ${str} | ${g.reps} | ${fl} | n/a | n/a | n/a | n/a |`;
   });
   return [
     "# No data loss",
