@@ -93,6 +93,35 @@ test("normalize: L collapses redundantly just like N does", () => {
   assert.equal(norm("LLAa"), "LAa");
 });
 
+// A D/C that cannot change anything is dropped, tracked per node across the whole history —
+// not just the adjacent duplicates collapseAdjacent already caught. These are no-ops for both
+// isolators, so this only makes the string say what runs; it also stops `make repro` from
+// aborting on an engine command that was never going to do anything.
+test("normalize: a C on a node that was never disconnected is dropped", () => {
+  assert.equal(norm("N1DAaWN2AaC"), "N1DAaWN2Aa"); // the C targets n2, which stayed online
+  assert.equal(norm("N1CAa"), "N1Aa");             // a C with no D anywhere
+});
+
+test("normalize: a no-op fault takes its now-pointless node selector with it", () => {
+  // N2 exists only to aim the C; once the C goes, nothing uses the selector either.
+  assert.equal(norm("N1DAaN2C"), "N1DAa");
+});
+
+test("normalize: a redundant D/C is caught even when NOT adjacent", () => {
+  assert.equal(norm("N1DAaCAaC"), "N1DAaCAa"); // second C: n1 is already back online
+  // Second D: n1 is already offline. Removing it leaves the two Aa ADJACENT, so collapseAdjacent
+  // (which runs after) then merges them — the passes compose, and the result is shorter than
+  // just-this-pass would give.
+  assert.equal(norm("N1DAaDAaC"), "N1DAaC");
+});
+
+test("normalize: faults that genuinely change state survive, interleaved across nodes", () => {
+  const real = "N1DAaN2DAaN1CAaN2C";
+  assert.equal(norm(real), real);
+  // Per-node tracking is the point: n2's C is real even though n1 was reconnected in between.
+  assert.equal(norm("N1DAaN2CAaN1C"), "N1DAaN2AaN1C"); // only n2's C is bogus
+});
+
 test("normalize: D/C while the local instance is active is rejected — it must always stay connected", () => {
   assert.throws(() => normalize(parse("LD")), /local node.*always-connected/);
   assert.throws(() => normalize(parse("LC")), /local node.*always-connected/);

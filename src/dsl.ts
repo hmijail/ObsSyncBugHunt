@@ -203,9 +203,56 @@ function collapseAdjacent(h: History): History {
   return out;
 }
 
+/** Drop `D`/`C` that cannot do anything, by tracking which nodes are actually offline as the
+ *  history runs. `collapseAdjacent` already removes ADJACENT duplicates (`DD`, `CC`), but a
+ *  redundant fault separated by other ops — or aimed at a node that was never disconnected —
+ *  survived it: `N1DAaWN2AaC` "reconnects" n2, which had been online the whole time.
+ *
+ *  Removing them changes nothing about what runs: for both isolators these are no-ops (`network
+ *  connect` on an already-attached container, `sync on` when sync is already on), and isolate.ts
+ *  deliberately judges by reachability rather than the engine's exit code. What it changes is that
+ *  the serialized string finally says what happens, which is normalize's whole job — two histories
+ *  differing only by a no-op `C` now share a name, and so share a runs/ group.
+ *
+ *  It matters downstream too. `make repro` turns each D/C into an engine command whose nonzero
+ *  exit is fatal (the repro has no preflight, so that exit code is its only check that the world
+ *  matches the history's assumptions). A no-op `C` aborted the repro of a history the harness ran
+ *  happily. With no-ops gone, every surviving D/C is meaningful, so that strictness becomes a
+ *  genuine signal instead of a false alarm.
+ *
+ *  The local node is deliberately left ALONE: it can never go offline, so every `D`/`C` aimed at
+ *  it would look like a no-op here, and silently dropping them would rob
+ *  assertLocalAlwaysConnected of the very ops it exists to reject. */
+function dropNoopFaults(h: History): History {
+  const out: History = [];
+  let active: number | "local" = 1; // implicit starting cursor, same convention as requiredNodes
+  const offline = new Set<number>();
+  for (const op of h) {
+    if (op.cmd === "node") {
+      assert(op.node !== undefined, "'node' op must carry a node field");
+      active = op.node;
+    } else if (op.cmd === "local") {
+      active = "local";
+    } else if (active !== "local" && (op.cmd === "disconnect" || op.cmd === "connect")) {
+      const isOffline = offline.has(active);
+      if (op.cmd === "disconnect") {
+        if (isOffline) continue; // already offline — this D would be a no-op
+        offline.add(active);
+      } else {
+        if (!isOffline) continue; // already online — this C would be a no-op
+        offline.delete(active);
+      }
+    }
+    out.push({ ...op });
+  }
+  return out;
+}
+
 /** Canonicalize a history so the printed/serialized form is exactly what executes. */
 export function normalize(h: History): History {
-  const result = collapseAdjacent(dropRedundantNodes(floatPauses(h)));
+  // dropNoopFaults runs BEFORE dropRedundantNodes so a selector left pointing at nothing by a
+  // removed fault (`N1DAaN2C` -> `N1DAaN2` -> `N1DAa`) is cleaned up in the same pass.
+  const result = collapseAdjacent(dropRedundantNodes(dropNoopFaults(floatPauses(h))));
   assertLocalAlwaysConnected(result);
   return result;
 }
