@@ -67,9 +67,9 @@ export interface ExecuteOpts {
   isolator?: string; // "network" | "sync" — which fault primitive drove this run's D/C
   obsidianVersion?: string; // the CLI's own self-reported version, queried once at startup
   // The container engine's own self-report (`<engine> --version`), same reasoning as the line
-  // above: the engine is part of the stack under test, not neutral scaffolding — it decides
-  // what a `D`/`C` actually does to the node (e.g. whether a reconnect restores the pinned MAC,
-  // which Podman can and Docker can't — see engine.ts), so a finding has to carry it.
+  // above: the engine is part of the stack under test, not neutral scaffolding — it decides how
+  // fast a `D`/`C` actually detaches and reattaches the node (see scripts/check-net.sh), so a
+  // finding has to carry it.
   containerEngine?: string;
   // The local instance (DSL `L`), when configured: its 1-based position within `drivers` (it's
   // just another element of that array, always last — see run.ts) and its own self-reported
@@ -114,7 +114,7 @@ export interface RunResult {
   verdict: RunVerdict;
   acked: AckedEdit[];
   observations: NodeObservation[];
-  timings: { totalSec: number; convergenceSec: number; syncTimedOut: boolean; unsynced: boolean; hostOutage: boolean; vaultDrift: boolean };
+  timings: { totalSec: number; convergenceSec: number; unsynced: boolean; hostOutage: boolean; vaultDrift: boolean };
   forensics: LostForensic[];
 }
 
@@ -157,7 +157,7 @@ function allNotesConverged(notes: string[], obs: NodeObservation[]): boolean {
 /** A node's own sync state via the BOUNDED probe, e.g. "synced" / "syncing" / "timeout" (killed
  *  before a reply came back — not positively confirmed as any specific state) / "?" (unreadable).
  *  Bounded so the settle loop polls instead of blocking ~70s on `sync:status` (which would
- *  straddle the quiescence window and fabricate a `-SYNCBAD` — see waitForSynced). */
+ *  straddle the quiescence window and fabricate a false divergence — see waitForSynced). */
 async function syncState(d: ObsidianDriver, probeMs: number): Promise<string> {
   return d.syncStateProbe(probeMs);
 }
@@ -290,14 +290,14 @@ export async function waitForSynced(
   opts: ExecuteOpts,
   logger: RunLogger,
   context: Record<string, unknown> = {},
-): Promise<{ seconds: number; timedOut: boolean; unsynced: boolean; observations: NodeObservation[]; hostOutage: boolean }> {
+): Promise<{ seconds: number; unsynced: boolean; observations: NodeObservation[]; hostOutage: boolean }> {
   const pollMs = (opts.pollSec ?? 1) * 1000;
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
   const probeMs = (opts.probeSec ?? 5) * 1000;
   if (notes.length === 0 || drivers.length === 0) {
-    return { seconds: 0, timedOut: false, unsynced: false, observations: [], hostOutage: false };
+    return { seconds: 0, unsynced: false, observations: [], hostOutage: false };
   }
 
   // Baseline server-version counts (the `from` reference) are read LAZILY, the first time
@@ -314,7 +314,7 @@ export async function waitForSynced(
   let hostOutage = false;
   for (;;) {
     // 1. Bounded sync-state probe FIRST. We must NOT read content from a still-syncing node:
-    //    the read blocks (~70s) AND returns mid-flux content, which fabricated a -SYNCBAD. The
+    //    the read blocks (~70s) AND returns mid-flux content, which fabricated a divergence. The
     //    probe is bounded (≤ probeMs), so a not-yet-synced node reads "timeout" instead of
     //    blocking (or a genuine other status word, if the CLI actually replied with one in time).
     const tProbe = Date.now();
@@ -395,7 +395,7 @@ export async function waitForSynced(
       // unchanged across the whole settle window, so it's confirmed across many reads.
       // Callers must use it rather than a fresh re-read — a single `files` listing can
       // transiently drop a conflict file and fabricate a "loss".
-      return { seconds, timedOut: false, unsynced, observations: obs, hostOutage };
+      return { seconds, unsynced, observations: obs, hostOutage };
     }
     await sleep(pollMs);
   }
@@ -497,7 +497,7 @@ async function waitNodesSynced(drivers: ObsidianDriver[], probeMs: number, logge
  *  settle uses (not the lighter pause-snapshot reads) — so this is genuinely "what would the
  *  verdict be if we judged RIGHT NOW", not an approximation. Logs a `would-fail` event (+ durable
  *  `<runsDir>/WOULDFAIL.log`, same append-one-JSON-line-per-hit shape as
- *  inconsistency.ts's recordInconsistency) for LOST/DUPL only — SYNCBAD is deliberately never
+ *  inconsistency.ts's recordInconsistency) for LOST/DUPL only — a divergence is deliberately never
  *  reported here: per waitForSynced's own convergence requirement, a stable disagreement is
  *  presumed a still-pending real sync, not a verdict an incomplete mid-history snapshot should
  *  ever assert.
@@ -524,7 +524,7 @@ async function checkWouldFail(
   const verdict = checkRun(acked, obs);
   const lost = verdict.notes.some((n) => n.lost.length > 0);
   const dupl = verdict.notes.some((n) => n.duplicated.length > 0);
-  if (!lost && !dupl) return; // OK, or a SYNCBAD-shaped disagreement — neither is reported here
+  if (!lost && !dupl) return; // OK, or a node-vs-node disagreement — neither is reported here
   const suffix = lost ? "-LOST" : "-DUPL";
   const rec = { atSec, suffix, verdict };
   logger.log({ kind: "would-fail", ...rec });
@@ -835,7 +835,6 @@ export async function runHistory(
   const timings = {
     totalSec: Math.round((Date.now() - startedAt) / 1000),
     convergenceSec: stab.seconds,
-    syncTimedOut: stab.timedOut,
     unsynced: stab.unsynced,
     hostOutage,
     vaultDrift,

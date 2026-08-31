@@ -33,7 +33,7 @@ export interface NoteVerdict {
 export interface Observation { node: string; note: string; canonical: string | null; conflicts: { file: string; content: string }[] }
 export interface Results {
   verdict: { ok: boolean; notes: NoteVerdict[] };
-  timings: { convergenceSec: number; syncTimedOut: boolean; unsynced?: boolean };
+  timings: { convergenceSec: number; syncTimedOut?: boolean; unsynced?: boolean };
   forensics?: Forensic[];
   observations?: Observation[]; // absent in results.json written before this field existed
   noteLetters?: Record<string, string>; // concrete note name -> logical DSL letter; ditto
@@ -41,6 +41,13 @@ export interface Results {
 
 // --- outcome classification (mirrors run.ts's ranked FAIL_SUFFIXES ladder, dash dropped
 // for a readable table header) ------------------------------------------------
+//
+// TIMEOUT and SYNCBAD are kept here although run.ts can no longer produce either: this reads
+// runs/ off disk, including trees recorded before the settle required convergence (when a
+// divergence really did finalize as -SYNCBAD) and before `syncTimedOut` was retired. Dropping
+// them would silently reclassify those historical reps as PASS, since PASS is this ladder's
+// fall-through. New reps simply never match: the field is absent, and the settle guarantees
+// convergence.
 export function classify(r: Results): string {
   if (r.timings?.unsynced) return "NOUPLOAD";
   if (r.timings?.syncTimedOut) return "TIMEOUT";
@@ -115,11 +122,16 @@ interface Group {
   timeouts: number; conv: number[];
   // Caught inconsistency outcomes (no results.json — counted from the rep dir suffix).
   obsfail: number; unknown: number;
+  // Reps abandoned because the APPARATUS misbehaved, then retried. Deliberately NOT added to
+  // `reps`: an -ENVFAIL never produced a verdict and never spent a repetition, so counting it
+  // would inflate the denominator every rate here is measured against. Surfaced only so a
+  // history's line says how rough the environment was while it ran.
+  envfail: number;
   categories: Map<string, Map<string, StateEntry>>; // classify() -> stateKey() -> entry
 }
 const newGroup = (): Group => ({
   reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0,
-  unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, categories: new Map(),
+  unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, envfail: 0, categories: new Map(),
 });
 
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
@@ -163,8 +175,8 @@ function tally(g: Group, r: Results, rep: string) {
     g.categories.set(category, byState);
   }
 
-  // Numeric aggregates mirror run.ts's suffix ladder so a rep counted as DUPL/DIFF here
-  // matches its on-disk `-DUPL`/`-SYNCBAD` dir.
+  // Numeric aggregates mirror run.ts's suffix ladder so a rep counted as DUPL here matches
+  // its on-disk `-DUPL` dir (a DIFF rep can only come from an old tree — see classify).
   if (r.verdict.ok && !r.timings?.unsynced && !r.timings?.syncTimedOut) { g.pass++; return; }
   g.fail++;
   if (r.timings?.unsynced || r.timings?.syncTimedOut || lost > 0) return; // already counted above
@@ -187,6 +199,7 @@ export const line = (g: Group) => {
   if (g.fail) parts.push(`fail=${g.fail}`);
   if (g.obsfail) parts.push(`obsfail=${g.obsfail}`);
   if (g.unknown) parts.push(`unknown=${g.unknown}`);
+  if (g.envfail) parts.push(`envfail=${g.envfail}(retried)`);
   if (g.lost) parts.push(`lost=${g.lost}(dropped=${g.serverDropped},unreg=${g.neverRegistered})`);
   if (g.duplReps) parts.push(`dupl=${g.duplReps}`);
   if (g.diffReps) parts.push(`diff=${g.diffReps}`);
@@ -278,6 +291,9 @@ export function main(base: string): void {
       if (last.kind === "results") { tally(g, last as unknown as Results, rep); continue; }
       if (last.kind === "obsfail") { tallyThrown(g, "obsfail"); continue; }
       if (last.kind === "unknown") { tallyThrown(g, "unknown"); continue; }
+      // Abandoned to an environment failure and retried — a real, explained ending, so not
+      // "skipped"; but not a rep either (see Group.envfail).
+      if (last.kind === "envfail") { g.envfail++; continue; }
       skipped++; // genuinely incomplete — crashed before any verdict was ever logged
     }
   }
@@ -287,7 +303,7 @@ export function main(base: string): void {
   // letters restart from `a` for every independently-generated history, so merging states (or
   // even convergence-time stats) across unrelated histories would be exactly the "collapsing
   // across different histories" mistake — this sort only reorders whole groups, never merges them.
-  const active = [...groups.entries()].filter(([, g]) => g.reps > 0).sort(([a], [b]) => b.localeCompare(a));
+  const active = [...groups.entries()].filter(([, g]) => g.reps > 0 || g.envfail > 0).sort(([a], [b]) => b.localeCompare(a));
   const interesting = active.filter(([, g]) => !isUninteresting(g));
   const uninteresting = active.filter(([, g]) => isUninteresting(g));
 

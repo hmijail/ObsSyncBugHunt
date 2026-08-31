@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateHistory, staleReconnect } from "./generator.js";
+import { generateHistory } from "./generator.js";
 import { serialize, type Cmd, type History } from "./dsl.js";
 
 function mulberry32(seed: number): () => number {
@@ -130,12 +130,4 @@ test("partitions: a single numbered node with NO local instance still never part
     const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, rng: mulberry32(s) });
     assert.ok(!h.some((o) => o.cmd === "disconnect"), `unexpected partition with only 1 participant: ${serialize(h)}`);
   }
-});
-
-test("staleReconnect: disconnect early, pause, edits, reconnect", () => {
-  const h = staleReconnect({ nodes: 2, ops: [4, 4], rng: mulberry32(3) });
-  assert.ok(h.some((o) => o.cmd === "disconnect"));
-  assert.ok(h.some((o) => o.cmd === "connect"));
-  assert.ok(h.some((o) => o.cmd === "pause"));
-  assert.equal(h[h.length - 1].cmd, "connect", "ends by reconnecting the stale node");
 });

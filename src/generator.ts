@@ -9,9 +9,8 @@
 //   concurrent — insert nothing (maximum overlap)
 // Coordination only applies while both editors are online — you can't take a turn
 // across a partition. With `partitionProb>0` it also opens random `D`…`C`
-// partitions (one or more nodes go offline, edits diverge, then they heal), so the
-// `staleReconnect` preset is just a biased corner of this space. The result is run
-// through `normalize` (see dsl.ts) so the emitted string is exactly what executes.
+// partitions (one or more nodes go offline, edits diverge, then they heal). The result
+// is run through `normalize` (see dsl.ts) so the emitted string is exactly what executes.
 
 import { DEFAULT_PAUSE_SEC, normalize, type History } from "./dsl.js";
 
@@ -111,32 +110,5 @@ export function generateHistory(params: GenParams): History {
   }
   for (const v of [...offline]) reconnect(v); // never leave a node partitioned at the end
 
-  return normalize(ops);
-}
-
-/**
- * Stale-device-reconnect preset: a node goes offline early, edits pile up (on it
- * and the others) during a long pause, then it reconnects — the "long-unused
- * device floods conflicts" shape. Single note `a`.
- */
-export function staleReconnect(params: GenParams): History {
-  const rng = params.rng ?? Math.random;
-  const nodeCount = params.nodes;
-  const edits = randInt(rng, params.ops[0], params.ops[1]);
-  const stale = randInt(rng, 1, nodeCount);
-  const other = stale === 1 ? Math.min(2, nodeCount) : 1;
-
-  const ops: History = [
-    { cmd: "node", node: other }, { cmd: "append", note: "a" }, { cmd: "pause", seconds: DEFAULT_PAUSE_SEC }, // base; pause lets it propagate naturally
-    { cmd: "node", node: stale }, { cmd: "disconnect" }, { cmd: "pause", seconds: 30 }, // deliberately long stale window
-  ];
-  let cur = stale;
-  for (let i = 0; i < edits; i++) {
-    const n = randInt(rng, 1, nodeCount);
-    if (n !== cur) { ops.push({ cmd: "node", node: n }); cur = n; }
-    ops.push({ cmd: "append", note: "a" });
-  }
-  if (cur !== stale) ops.push({ cmd: "node", node: stale });
-  ops.push({ cmd: "connect" });
   return normalize(ops);
 }

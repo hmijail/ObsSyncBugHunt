@@ -93,12 +93,11 @@ test("waitForSynced: converges while 'syncing' → returns the CONVERGED observa
   const n1 = new ObsidianDriver(new ConvergingExecutor("n1", 0, 120));
   const n2 = new ObsidianDriver(new ConvergingExecutor("n2", 120, 120));
   const noLog = { log() {} } as unknown as RunLogger;
-  const { observations, timedOut, unsynced } = await waitForSynced(
+  const { observations, unsynced } = await waitForSynced(
     [n1, n2], [NOTE], 0.08, // 80ms quiet window
     { noteName: (l) => l, pollSec: 0.02, minFloorSec: 0, probeSec: 0.03, capSec: 5 },
     noLog,
   );
-  assert.equal(timedOut, false);
   assert.equal(unsynced, false);
   // The returned snapshot must be the converged one: BOTH nodes hold the conflict file.
   const byNode = (n: string) => observations.find((o) => o.node === n)!;
@@ -132,12 +131,11 @@ test("waitForSynced: a stable but DIVERGED state does not finalize as done — k
   const n1 = new ObsidianDriver(new DisagreeingExecutor("n1", "(n1-1-a)", "(agreed-a)", 150));
   const n2 = new ObsidianDriver(new DisagreeingExecutor("n2", "(n2-1-a)", "(agreed-a)", 150));
   const noLog = { log() {} } as unknown as RunLogger;
-  const { observations, timedOut, unsynced } = await waitForSynced(
+  const { observations, unsynced } = await waitForSynced(
     [n1, n2], [NOTE], 0.05, // 50ms quiet window — plenty of polls fit inside the 150ms divergence
     { noteName: (l) => l, pollSec: 0.02, minFloorSec: 0, probeSec: 0.03, capSec: 5, hostCheck: false },
     noLog,
   );
-  assert.equal(timedOut, false); // never gives up — see the settle's own doc comment
   assert.equal(unsynced, false);
   const byNode = (n: string) => observations.find((o) => o.node === n)!;
   assert.equal(byNode("n1").canonical, "(agreed-a)", "waited past the stable disagreement for real convergence");

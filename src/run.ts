@@ -1,7 +1,7 @@
 // Test entrypoint: generates (or takes) a DSL history, runs it REPEAT times
 // against the containerized nodes, and tallies. Each history string is a
 // directory; each repeat is a sub-run named by epoch6. A non-OK rep dir is
-// suffixed -NOUPLOAD / -TIMEOUT / -LOST / -DUPL / -SYNCBAD (verdict outcomes) or
+// suffixed -NOUPLOAD / -LOST / -DUPL (verdict outcomes) or
 // -OBSFAIL / -UNKNOWN (a caught CLI inconsistency — see inconsistency.ts), and a
 // history dir gets -BAD<pct> (share of non-OK reps).
 //
@@ -32,7 +32,6 @@
 //                    which is a guess, not verified to match — see run.ts's own comment on this)
 //   --history        run a specific DSL string (else generate)
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
-//   --scenario       random | stale                          (default random)
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
 //   --turns          barrier | paced | concurrent            (default barrier)
@@ -79,7 +78,7 @@ import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, NetworkIsolator, EnvironmentAssumptionError, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
-import { generateHistory, staleReconnect, type GenParams, type Turns } from "./generator.js";
+import { generateHistory, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, normalize, requiredNodes, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
@@ -101,6 +100,15 @@ import { NOTE_DIR } from "./types.js";
 for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
   process.on(ev, (err: unknown) => {
     if (err instanceof EnvironmentAssumptionError) {
+      // Only reachable OUTSIDE a rep now (startup, or between histories): inside one, runRep
+      // catches this and retries forever rather than ending the run. Mirror the SIGINT path. The reps that already completed are real results, so tag the group
+      // dir with its -BAD<pct> and print the tally BEFORE the operator block — otherwise ending on
+      // an ENVFAIL left a run's findings less visible on disk, and its completed work invisible on
+      // screen, than simply hitting Ctrl-C would have. The ENVFAIL block stays last so it is what
+      // the operator is looking at. (Reaching these from here is safe: an EnvironmentAssumptionError
+      // can only come from a reconnect inside a rep, long after module setup has defined them.)
+      if (activeGroup) tagHistoryDir(activeGroup.strDir, activeGroup.groupName);
+      console.log(tally());
       recordEnvFailure(err, runsRoot);
       console.error(`\n*** ENVFAIL — run aborted ***\n  ${err.assumption}\n\n  ${err.remedy}\n`);
     } else if (err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput) {
@@ -117,10 +125,10 @@ for (const ev of ["uncaughtException", "unhandledRejection"] as const) {
 /** Durable top-level index for aborted-run causes, mirroring `recordInconsistency`'s
  *  runs/<LABEL>.log convention (and its best-effort, never-throws contract — the caller has
  *  already printed the compact block, so a failure to persist must not mask it). */
-function recordEnvFailure(err: EnvironmentAssumptionError, runsDir: string): void {
+function recordEnvFailure(err: EnvironmentAssumptionError, runsDir: string, rep?: string): void {
   try {
     mkdirSync(runsDir, { recursive: true });
-    const rec = { at: new Date().toISOString(), assumption: err.assumption, ...err.detail };
+    const rec = { at: new Date().toISOString(), assumption: err.assumption, rep, ...err.detail };
     appendFileSync(path.join(runsDir, "ENVFAIL.log"), JSON.stringify(rec) + "\n");
   } catch {
     /* best effort — the console block above is the primary report */
@@ -135,7 +143,6 @@ const { values } = parseArgs({
     isolator: { type: "string" },
     "local-bin": { type: "string" },
     "local-node-id": { type: "string" },
-    scenario: { type: "string" },
     histories: { type: "string" },
     repeat: { type: "string" },
     "duration-min": { type: "string" },
@@ -167,7 +174,6 @@ const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const network = values.network ?? "obsidian-net";
 const isolatorKind = values.isolator ?? "network";
 const localBin = values["local-bin"] ?? "obsidian"; // same PATH-lookup convenience Makefile's LOCAL_BIN already defaults to
-const scenario = values.scenario ?? "random";
 const histories = Number(values.histories ?? 1);
 const repeat = Number(values.repeat ?? 10);
 const durationMin = Number(values["duration-min"] ?? 0);
@@ -221,7 +227,7 @@ const genParams: GenParams = {
 const generateN = Number(values.generate ?? 0);
 if (generateN > 0) {
   for (let i = 0; i < generateN; i++) {
-    console.log(serialize(scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams)));
+    console.log(serialize(generateHistory(genParams)));
   }
   process.exit(0);
 }
@@ -355,9 +361,10 @@ console.log = (...args: unknown[]) => { const line = args.map(String).join(" ");
 console.log(`log: ${logPath}`);
 
 let pass = 0;
-let fail = 0; // real oracle failures (NOUPLOAD/TIMEOUT/LOST/DUPL/SYNCBAD)
+let fail = 0; // real oracle failures (NOUPLOAD/LOST/DUPL)
 let obsfail = 0; // client misreported its vault (-OBSFAIL)
 let unknown = 0; // couldn't judge — unparseable/unresponsive CLI, or ladder catch-all (-UNKNOWN)
+let envfail = 0; // reps abandoned because the APPARATUS misbehaved (-ENVFAIL); retried, never counted
 let conflicts = 0; // reps where Obsidian Sync's own (Conflicted copy ...) mechanism fired
 let hostOutages = 0; // reps where a host-connectivity blip forced a recovery wait (timings unreliable)
 let vaultDrifts = 0; // reps where the local node's active vault drifted and was waited back (timings unreliable)
@@ -370,6 +377,7 @@ let activeGroup: { strDir: string; groupName: string } | null = null;
 const nonOk = () => fail + obsfail + unknown;
 const tally = () =>
   `\n=== TALLY: PASS=${pass} FAIL=${fail} OBSFAIL=${obsfail} UNKNOWN=${unknown} reps=${pass + nonOk()}` +
+  (envfail ? ` (+${envfail} ENVFAIL rep(s) retried — see runs/ENVFAIL.log)` : "") +
   `  (reps with conflict files: ${conflicts}) (reps with a host-outage detour: ${hostOutages})` +
   ` (reps with a local-vault-drift detour: ${vaultDrifts}) ===` +
   (failures.length ? "\nfailing reps:\n" + failures.map((f) => "  " + f).join("\n") : "");
@@ -382,6 +390,7 @@ const tally = () =>
 const isTTY = process.stdout.isTTY === true;
 const statusLine = () =>
   `soak: ${pass + nonOk()} reps · ${pass} passed · ${fail} failed · ${obsfail} obsfail · ${unknown} unknown` +
+  (envfail ? ` · ${envfail} envfail(retried)` : "") +
   (failures.length ? ` · last ${path.basename(failures[failures.length - 1])}` : "");
 function drawStatus(): void {
   const rows = process.stdout.rows ?? 0;
@@ -420,7 +429,7 @@ function uniqueRepId(strDir: string): string {
 // Any rep file carrying one of these suffixes (just before .jsonl) is a non-OK rep.
 // `-ENVFAIL` is deliberately NOT here: it means the apparatus broke, not that Obsidian failed, so
 // counting it toward a history's -BAD<pct> would report infrastructure as an Obsidian finding.
-const FAIL_SUFFIXES = ["-NOUPLOAD", "-TIMEOUT", "-LOST", "-DUPL", "-SYNCBAD", "-OBSFAIL", "-UNKNOWN"];
+const FAIL_SUFFIXES = ["-NOUPLOAD", "-LOST", "-DUPL", "-OBSFAIL", "-UNKNOWN"];
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(`${s}.jsonl`));
 
@@ -436,14 +445,47 @@ function tagRep(repPath: string, suffix: string): string {
  *  `groupName` is the dir's base name (`<ts0>-<history>`) so the suffix lands on it. */
 function tagHistoryDir(strDir: string, groupName: string): void {
   if (!isDir(strDir)) return;
-  const reps = readdirSync(strDir).filter((f) => f.endsWith(".jsonl"));
+  // `-ENVFAIL` files are excluded ENTIRELY, not just from `bad`: they are abandoned reps that were
+  // retried, so counting them in the denominator would dilute the percentage with non-results
+  // (2 LOST out of 2 judged reps is BAD100; the same run with three environment hiccups on disk
+  // must not read as BAD25).
+  const reps = readdirSync(strDir).filter((f) => f.endsWith(".jsonl") && !f.endsWith("-ENVFAIL.jsonl"));
   if (reps.length === 0) return;
   const bad = reps.filter(isBadRep).length;
   const target = bad > 0 ? path.join(runsRoot, `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
   if (target !== strDir) { try { renameSync(strDir, target); } catch { /* keep */ } }
 }
 
-async function runRep(history: History, str: string, strDir: string): Promise<void> {
+/** An `-ENVFAIL` is treated as a TEMPORARY condition that will clear on its own — a load spike
+ *  stretching one reconnect past the budget, a momentarily wedged engine — so the rep is retried
+ *  indefinitely and nothing is ever given up on. The soak is meant to be left running for hours;
+ *  ending it because the machine was briefly busy would throw away the very thing it exists to
+ *  accumulate.
+ *
+ *  Retries back off so a persistently broken environment waits quietly instead of spinning:
+ *  5s, 10s, 15s ... capped at a minute. Reset by any rep that reaches a verdict, so the delay
+ *  tracks how long the CURRENT bad patch has lasted, not the run's history. */
+let consecutiveEnvfails = 0;
+const envfailBackoffMs = (n: number) => Math.min(n * 5_000, 60_000);
+
+/** Reconnect every node, ignoring a further budget violation. An ENVFAIL escapes runHistory
+ *  before its end-of-history reconnect loop, so nodes a `D` took offline are still offline; the
+ *  retried rep would otherwise start against a partitioned network and test nothing it claims.
+ *  Best-effort on purpose: this is cleanup, and judging it would just re-raise what we caught. */
+async function recoverNodes(): Promise<void> {
+  // runHistory points isolator.onEvent at the REP's logger. That rep's file has just been renamed
+  // to `-ENVFAIL`, so leaving the sink attached would have RunLogger re-create the original path
+  // with only these cleanup events in it — a phantom rep on disk, counted nowhere and explaining
+  // nothing. Send them to the console instead, as the pre-rep phase already does.
+  isolator.onEvent = (e) => console.log(`· ${JSON.stringify(e)}`);
+  for (const d of drivers) {
+    try { await isolator.connect(d.node); } catch { /* cleanup — a still-slow reconnect is the caller's problem */ }
+  }
+}
+
+/** Resolves true when the rep produced a result (so it counts against REPEAT), false when it was
+ *  abandoned to an -ENVFAIL and should be retried. */
+async function runRep(history: History, str: string, strDir: string): Promise<boolean> {
   const id = uniqueRepId(strDir);
   console.log(`  rep ${id}  (running: ${nonOk()}/${pass + nonOk()} failed)`);
   drawStatus();
@@ -459,13 +501,28 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     outcome = await runHistory(drivers, isolator, logger, history, { ...execBase, noteName });
   } catch (err) {
     // A violated environment assumption is NOT a rep outcome — the apparatus stopped doing what
-    // the histories say it does, so continuing would manufacture results about a different
-    // experiment (see isolate.ts's EnvironmentAssumptionError). Tag the rep so the offending one
-    // is findable on disk, then rethrow: the top-level handler prints the operator block and exits.
+    // the histories say it does, so whatever this rep would have concluded is about a different
+    // experiment (see isolate.ts's EnvironmentAssumptionError). The rep is abandoned, tagged
+    // `-ENVFAIL` on disk for forensics, and RETRIED: it counts toward nothing, so a hiccup costs
+    // time rather than a repetition. `-ENVFAIL` is not in FAIL_SUFFIXES, so it never reaches a
+    // history's -BAD<pct> either. There is no give-up: the condition is assumed temporary and the
+    // rep is retried (with backoff) until it produces a verdict.
     if (err instanceof EnvironmentAssumptionError) {
       logger.log({ kind: "envfail", assumption: err.assumption, ...err.detail });
-      failures.push(tagRep(logger.path, "-ENVFAIL"));
-      throw err;
+      const repPath = tagRep(logger.path, "-ENVFAIL");
+      recordEnvFailure(err, runsRoot, repPath);
+      envfail++;
+      consecutiveEnvfails++;
+      const backoff = envfailBackoffMs(consecutiveEnvfails);
+      console.log(`  rep ${id}: ENVFAIL (${err.assumption}) — rep abandoned, retrying in ${backoff / 1000}s` +
+        (consecutiveEnvfails > 1 ? ` (${consecutiveEnvfails} in a row)` : ""));
+      drawStatus();
+      // Today's only assumption fires after the reconnect already succeeded, but a future one
+      // might not, so put the network back before retrying: otherwise the retry would run its
+      // history against a still-partitioned set of nodes and test nothing it claims to.
+      await recoverNodes();
+      await new Promise((r) => setTimeout(r, backoff));
+      return false;
     }
     if (!(err instanceof CliInconsistencyError || err instanceof CliUnrecognizedOutput)) throw err; // a real crash
     const d = describeInconsistency(err);
@@ -476,8 +533,10 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     if (d.category === "obsfail") obsfail++; else unknown++;
     console.log(`  rep ${id}: *** ${d.suffix.slice(1)} *** ${formatInconsistency(d)} → ${path.basename(repPath)}`);
     drawStatus();
-    return;
+    consecutiveEnvfails = 0; // a rep that produced a verdict proves the apparatus is working
+    return true;
   }
+  consecutiveEnvfails = 0;
   const { verdict, timings, forensics } = outcome;
 
   if (timings.hostOutage) hostOutages++;
@@ -485,30 +544,30 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
 
   const lost = verdict.notes.flatMap((n) => n.lost);
   const duplicated = verdict.notes.flatMap((n) => n.duplicated);
-  const diverged = verdict.notes.some((n) => !n.converged);
   const conflictFiles = Math.max(0, ...verdict.notes.map((n) => n.conflictFiles));
   const onlyInConflict = verdict.notes.reduce((s, n) => s + n.onlyInConflict.length, 0);
   if (conflictFiles > 0 || onlyInConflict > 0) conflicts++;
 
   // A clean PASS requires the token oracle happy AND a conclusive settle: a note
   // that never reached the server (unsynced) or a settle that never quiesced before
-  // the cap (syncTimedOut) is not a pass — the latter is inconclusive, not trusted.
-  if (verdict.ok && !timings.unsynced && !timings.syncTimedOut) {
+  if (verdict.ok && !timings.unsynced) {
     pass++;
     const tag = conflictFiles || onlyInConflict ? ` conflict(files=${conflictFiles})` : "";
     const hostTag = timings.hostOutage ? " (host-outage — timings unreliable)" : "";
     const vaultTag = timings.vaultDrift ? " (local-vault-drift — timings unreliable)" : "";
     console.log(`  rep ${id}: PASS${tag}${hostTag}${vaultTag} conv=${timings.convergenceSec}s total=${timings.totalSec}s`);
   } else {
-    // Ranked, most-severe-first: never-uploaded > inconclusive timeout > real loss >
-    // duplication > divergence. -UNKNOWN is a catch-all that should never fire here (a true
-    // "couldn't judge"); it's counted as `unknown`, the rest as real oracle failures.
+    // -UNKNOWN is counted as `unknown`, the rest as real oracle failures.
+    // Ranked, most-severe-first: never-uploaded > real loss > duplication. A node-vs-node
+    // DIVERGENCE has no rung of its own on purpose: waitForSynced only finishes once every node
+    // agrees, and the verdict judges that very observation, so a non-converged verdict here is a
+    // contradiction rather than an outcome — it belongs in -UNKNOWN, which is loud and logged to
+    // runs/UNKNOWN.log with reproduction data. (It had one, -SYNCBAD, until the settle started
+    // requiring convergence; analyze.ts still classifies it, for runs recorded back then.)
     const suffix =
       timings.unsynced ? "-NOUPLOAD"
-      : timings.syncTimedOut ? "-TIMEOUT"
       : lost.length ? "-LOST"
       : duplicated.length ? "-DUPL"
-      : diverged ? "-SYNCBAD"
       : "-UNKNOWN";
     assert(FAIL_SUFFIXES.includes(suffix), `verdict suffix ${suffix} is a known outcome`);
     if (suffix === "-UNKNOWN") unknown++; else fail++;
@@ -519,6 +578,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<vo
     console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) total=${timings.totalSec}s → ${path.basename(repPath)}`);
   }
   drawStatus(); // refresh the bar with the updated tally
+  return true;
 }
 
 async function runHistoryReps(history: History): Promise<void> {
@@ -529,7 +589,9 @@ async function runHistoryReps(history: History): Promise<void> {
   const strDir = path.join(runsRoot, groupName);
   activeGroup = { strDir, groupName };
   console.log(`\n=== history ${str}  (×${repeat}) ===`);
-  for (let r = 0; r < repeat; r++) await runRep(history, str, strDir);
+  // `r` advances only on a rep that produced a result — an -ENVFAIL is retried, not spent, so
+  // REPEAT=10 always means ten judged reps however many hiccups the environment had.
+  for (let r = 0; r < repeat; ) { if (await runRep(history, str, strDir)) r++; }
   tagHistoryDir(strDir, groupName);
 }
 
@@ -605,7 +667,7 @@ async function preflight(): Promise<boolean> {
         console.error(
           `node ${d.node} is unreachable (exec failed${e.raw.code !== undefined ? `, code=${e.raw.code}` : ""}: ` +
           `${e.raw.stderr.trim() || e.raw.stdout.trim() || "no output"}) — is \`make containers-up\`/` +
-          `\`make reconnect\` done, and is the container actually running? Aborting.`,
+          `\`make reconnect-nodes\` done, and is the container actually running? Aborting.`,
         );
         process.exit(2);
       }
@@ -675,11 +737,12 @@ if (historyArg) {
   activeGroup = { strDir, groupName };
   const soaking = histories <= 0 || durationMin > 0;
   console.log(`\n=== history ${str}  ${soaking ? "(soaking — stop to end)" : `(×${repeat})`} ===`);
-  for (let r = 0; soaking ? keepGoing(r) : r < repeat; r++) await runRep(hist, str, strDir);
+  // Same as runHistoryReps: an -ENVFAIL rep is retried rather than counted.
+  for (let r = 0; soaking ? keepGoing(r) : r < repeat; ) { if (await runRep(hist, str, strDir)) r++; }
   tagHistoryDir(strDir, groupName);
 } else {
   for (let h = 0; keepGoing(h); h++) {
-    const history = scenario === "stale" ? staleReconnect(genParams) : generateHistory(genParams);
+    const history = generateHistory(genParams);
     await runHistoryReps(history);
   }
 }
