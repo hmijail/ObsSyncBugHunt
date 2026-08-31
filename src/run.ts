@@ -381,6 +381,11 @@ const startedAt = Date.now();
 // The group dir currently accruing reps, so a Ctrl-C mid-soak can still tag it with -BAD<pct>
 // (tagHistoryDir is normally only called after a reps loop finishes on its own).
 let activeGroup: { strDir: string; groupName: string } | null = null;
+// The rep currently executing, so Ctrl-C can mark its half-written file as abandoned. Without
+// this it stays UNTAGGED on disk, and an untagged .jsonl is the naming convention's way of
+// spelling PASS — so an interrupted rep silently counted as a clean one in its history's
+// -BAD<pct>, diluting the very percentage the interruption was meant not to affect.
+let activeRep: string | null = null;
 
 const nonOk = () => fail + obsfail + unknown;
 const tally = () =>
@@ -422,6 +427,9 @@ process.on("exit", statusBarOff);
 
 process.on("SIGINT", () => {
   statusBarOff();
+  // Mark the interrupted rep BEFORE tagging the dir, so it is excluded from the -BAD<pct> ratio.
+  // It reached no verdict, so it is neither a pass nor a failure — it is not a result at all.
+  if (activeRep) { tagRep(activeRep, "-ABORTED"); activeRep = null; }
   if (activeGroup) tagHistoryDir(activeGroup.strDir, activeGroup.groupName);
   console.log(tally());
   process.exit(nonOk() === 0 ? 0 : 1);
@@ -438,6 +446,10 @@ function uniqueRepId(strDir: string): string {
 // `-ENVFAIL` is deliberately NOT here: it means the apparatus broke, not that Obsidian failed, so
 // counting it toward a history's -BAD<pct> would report infrastructure as an Obsidian finding.
 const FAIL_SUFFIXES = ["-NOUPLOAD", "-LOST", "-DUPL", "-OBSFAIL", "-UNKNOWN"];
+// Reps that ended without reaching a verdict: the apparatus misbehaved (-ENVFAIL, retried) or the
+// operator stopped the run mid-rep (-ABORTED). Neither is a pass and neither is a failure, so they
+// are kept on disk for forensics and left out of every ratio.
+const ABANDONED_SUFFIXES = ["-ENVFAIL", "-ABORTED"];
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 const isBadRep = (name: string) => FAIL_SUFFIXES.some((s) => name.endsWith(`${s}.jsonl`));
 
@@ -453,11 +465,12 @@ function tagRep(repPath: string, suffix: string): string {
  *  `groupName` is the dir's base name (`<ts0>-<history>`) so the suffix lands on it. */
 function tagHistoryDir(strDir: string, groupName: string): void {
   if (!isDir(strDir)) return;
-  // `-ENVFAIL` files are excluded ENTIRELY, not just from `bad`: they are abandoned reps that were
-  // retried, so counting them in the denominator would dilute the percentage with non-results
-  // (2 LOST out of 2 judged reps is BAD100; the same run with three environment hiccups on disk
-  // must not read as BAD25).
-  const reps = readdirSync(strDir).filter((f) => f.endsWith(".jsonl") && !f.endsWith("-ENVFAIL.jsonl"));
+  // ABANDONED_SUFFIXES are excluded ENTIRELY, not just from `bad`: those reps reached no verdict,
+  // so counting them in the denominator dilutes the percentage with non-results (2 LOST out of 2
+  // judged reps is BAD100; the same run with three environment hiccups on disk must not read as
+  // BAD25, and Ctrl-C during the tenth rep must not turn 5-of-9-bad into 5-of-10).
+  const reps = readdirSync(strDir)
+    .filter((f) => f.endsWith(".jsonl") && !ABANDONED_SUFFIXES.some((x) => f.endsWith(`${x}.jsonl`)));
   if (reps.length === 0) return;
   const bad = reps.filter(isBadRep).length;
   const target = bad > 0 ? path.join(runsRoot, `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
@@ -498,6 +511,7 @@ async function runRep(history: History, str: string, strDir: string): Promise<bo
   console.log(`  rep ${id}  (running: ${nonOk()}/${pass + nonOk()} failed)`);
   drawStatus();
   const logger = new RunLogger(strDir, id);
+  activeRep = logger.path; // in flight from here until runRepTracked's `finally` clears it
   const noteName = (L: string) => `${NOTE_DIR}/${id}-${L}-${str}`;
 
   // A correctness-assumption violation (unparseable CLI output, a wedged CLI, or a client
@@ -589,6 +603,16 @@ async function runRep(history: History, str: string, strDir: string): Promise<bo
   return true;
 }
 
+/** Runs one rep with `activeRep` guaranteed to be cleared however it ends. A stale value would be
+ *  worse than none: a Ctrl-C landing BETWEEN reps would mark an already-finished rep as aborted. */
+async function runRepTracked(history: History, str: string, strDir: string): Promise<boolean> {
+  try {
+    return await runRep(history, str, strDir);
+  } finally {
+    activeRep = null;
+  }
+}
+
 async function runHistoryReps(history: History): Promise<void> {
   const str = serialize(history);
   // Group dir carries the history's start ts, so each invocation is its own timestamped
@@ -599,7 +623,7 @@ async function runHistoryReps(history: History): Promise<void> {
   console.log(`\n=== history ${str}  (×${repeat}) ===`);
   // `r` advances only on a rep that produced a result — an -ENVFAIL is retried, not spent, so
   // REPEAT=10 always means ten judged reps however many hiccups the environment had.
-  for (let r = 0; r < repeat; ) { if (await runRep(history, str, strDir)) r++; }
+  for (let r = 0; r < repeat; ) { if (await runRepTracked(history, str, strDir)) r++; }
   tagHistoryDir(strDir, groupName);
 }
 
@@ -746,7 +770,7 @@ if (historyArg) {
   const soaking = histories <= 0 || durationMin > 0;
   console.log(`\n=== history ${str}  ${soaking ? "(soaking — stop to end)" : `(×${repeat})`} ===`);
   // Same as runHistoryReps: an -ENVFAIL rep is retried rather than counted.
-  for (let r = 0; soaking ? keepGoing(r) : r < repeat; ) { if (await runRep(hist, str, strDir)) r++; }
+  for (let r = 0; soaking ? keepGoing(r) : r < repeat; ) { if (await runRepTracked(hist, str, strDir)) r++; }
   tagHistoryDir(strDir, groupName);
 } else {
   for (let h = 0; keepGoing(h); h++) {
