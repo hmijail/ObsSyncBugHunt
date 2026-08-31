@@ -4,7 +4,7 @@
 # vault). Set CAPTURE=1 to also expose VNC for the one-time login.
 #
 # The image ships no credentials. Run nodes mount /secrets read-only; the login
-# container mounts it read-write so `make capture` can write into it.
+# container mounts it read-write so `make capture-login` can write into it.
 set -euo pipefail
 
 VAULT_DIR=/root/vaults/TestVault

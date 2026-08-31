@@ -30,7 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { parse, serialize, normalize, usesLocal, requiredNodes, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
-import { nodeAddress } from "./isolate.js";
+import { nodeIp } from "./isolate.js";
 import { formatToken, NOTE_DIR } from "./types.js";
 import { runProcess } from "./exec.js";
 
@@ -101,12 +101,11 @@ export function generateScript(history: History, opts: ReproOpts): string {
     "",
   );
 
-  // Sparse, keyed by the actual node NUMBER (like NODE_IP/NODE_MACADDR already are) — not a
+  // Sparse, keyed by the actual node NUMBER (like NODE_IP already is) — not a
   // compact 0-based array. A history skipping a node (e.g. only N1 and N3) must not shift N3's
   // entry into slot 1: repro-lib.sh indexes NODES[$1] directly, no position/number translation.
   for (const d of opts.containers) {
-    const { ip, mac } = nodeAddress(`n${d}`);
-    lines.push(`NODES[${d}]=n${d}`, `NODE_IP[${d}]=${ip}`, `NODE_MACADDR[${d}]=${mac}`);
+    lines.push(`NODES[${d}]=n${d}`, `NODE_IP[${d}]=${nodeIp(`n${d}`)}`);
   }
   lines.push("");
 

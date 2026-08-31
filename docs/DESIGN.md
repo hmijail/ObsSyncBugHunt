@@ -9,13 +9,12 @@ explicitly recognizable path, log every step, fail hard on the unknown.
 
 Where a conclusion here is load-bearing enough that its silent expiry would corrupt results
 rather than merely break something, it gets an executable check instead of a paragraph — see
-`make net-check` under "Network identity" below.
+`make check-net` under "Network identity" below.
 
-## Network identity: pinning the same IP/MAC across reconnects
+## Network identity: pinning the same IP across reconnects
 
-`isolate.ts`'s `nodeAddress()` derives a fixed IP and MAC address per node (`n1` → `10.89.0.101`
-/ `6e:62:6e:65:74:65`, etc.) and re-applies it on every reconnect, rather than letting the engine
-assign a fresh one each time.
+`isolate.ts`'s `nodeIp()` derives a fixed IP per node (`n1` → `10.89.0.101`, etc.) and re-applies
+it on every reconnect, rather than letting the engine assign a fresh one each time.
 
 **The point is which experiment a `D`…`C` pair actually runs.** What we want to simulate is a
 device that loses connectivity for a few seconds and gets it back: its TCP connections to Sync
@@ -28,22 +27,47 @@ does the other is a run that means something different than its label.
 
 Keeping the **IP** is what secures this: TCP connections are keyed on the address 4-tuple, so an
 unchanged IP lets the stalled connections simply resume. Measured on Docker 29.7.2 (see
-`scripts/net-check.sh`): a container reconnected with `--ip` was reachable again within ~50ms of
+`scripts/check-net.sh`): a container reconnected with `--ip` was reachable again within ~50ms of
 the `network connect` command returning, and a peer-to-peer TCP stream held open across a 10s
 outage resumed with its byte stream intact and no gap.
 
-The **MAC** turns out not to be load-bearing for that goal, which is fortunate, because Docker
-cannot re-pin it: `docker network connect` has no `--mac-address` flag, and the plausible
-`--driver-opt com.docker.network.endpoint.{mac_address,macaddress,mac-address}` spellings are all
-accepted silently (exit 0) while a fresh random MAC is assigned anyway. Podman can, and still
-does. The reason losing it costs nothing: disconnecting destroys the container's interface, which
-takes its ARP cache with it, so on reconnect the node must re-ARP for its gateway — and that ARP
-request carries the new MAC, updating the peer's neighbour entry immediately. There is no stale-
-ARP blackhole to wait out. The MAC is therefore pinned where the engine supports it (recorded per
-reconnect in the `network-identity` event, `macPinned: true|false`) and skipped where it doesn't.
+### Dead end: pinning the MAC too
+
+The harness used to pin a per-node **MAC** alongside the IP (`6e:62:6e:65:74:<X>`), on the theory
+that a device Sync recognizes as unchanged would rejoin faster. It was removed; git history has
+the code if it is ever wanted back.
+
+It was never load-bearing. Disconnecting destroys the container's interface, and its ARP cache
+goes with it, so on reconnect the node must re-ARP for its gateway anyway — and that ARP request
+carries whatever MAC it now has, updating the peer's neighbour entry immediately. There is no
+stale-ARP blackhole to wait out, and nothing above layer 2 ever sees the address: the TCP 4-tuple
+that decides whether connections resume is IP and port only.
+
+Two things then made it worse than useless. It was the harness's **only** engine-specific
+behaviour: `docker network connect` has no `--mac-address` flag, and the plausible `--driver-opt
+com.docker.network.endpoint.{mac_address,macaddress,mac-address}` spellings are all accepted
+silently (exit 0) while a fresh random MAC is assigned anyway — so supporting it meant a
+capability probe (`connectPinsMac`), a conditional argument in four places, and a `macPinned`
+field on every `network-identity` event, all to record which of two identities survived a
+reconnect that behaves identically either way. And it produced a *measurement asymmetry between
+engines* for something the experiment does not depend on, which is precisely the kind of
+difference that invites false attribution when a finding shows up on one machine and not another.
+
+With it gone, podman and Docker are driven by identical commands with identical flags everywhere
+in the harness; the only remaining difference is the Makefile's explicit `--subnet` (the two
+engines default differently).
+
+The old MAC scheme carried one non-obvious constraint worth preserving in case it ever returns.
+The first byte was `0x6e` ('n', for "nbnet") rather than the more on-the-nose `0x6f` ('o', for
+"obnet") for a real reason: a MAC's first byte's least-significant bit is the I/G
+(individual/group) bit — 0 for unicast, 1 for multicast — and `0x6f` has it set. Podman's rootless
+backend (netavark) refuses to assign a multicast address to a real interface, confirmed live
+(`Error: netavark: create veth pair: Netlink error: Cannot assign requested address`) before
+switching to `0x6e`, which also has the U/L (locally-administered) bit set — correct for a
+made-up, non-vendor-assigned address.
 
 **This is an assumption about engine internals, so it is checked rather than trusted.**
-`make net-check` (`scripts/net-check.sh`) measures it deliberately on a disposable container —
+`make check-net` (`scripts/check-net.sh`) measures it deliberately on a disposable container —
 reconnect latency against a budget (default 1s) plus a hard assertion that the pinned IP survived
 — and `make check-assumptions` folds that in with the rest of the environment checks. That
 deliberate measurement is needed because a history containing no `D` never exercises the primitive
@@ -64,17 +88,6 @@ counts toward a history's `-BAD<pct>`.
 
 On a genuinely slow machine, raise the bar rather than lose the signal:
 `make ... RECONNECT_BUDGET_MS=2000`.
-
-The MAC address's first byte is `0x6e` ('n', for "nbnet") rather than the more on-the-nose `0x6f`
-('o', for "obnet") for a real constraint, not a spelling preference: a MAC address's first byte's
-least-significant bit is the I/G (individual/group) bit — 0 for a normal unicast address, 1 for
-multicast — and `0x6f` has that bit set. (This still matters wherever the MAC *is* pinned, i.e.
-podman and `<engine> run` on both.) Podman's rootless network backend (netavark) refuses to
-assign a multicast address to a real interface, confirmed live (`Error: netavark: create veth
-pair: Netlink error: Cannot assign requested address`) before switching to `0x6e`, which also has
-the U/L (locally-administered) bit set — correct for a made-up, non-vendor-assigned address. Only
-the first byte carries this constraint; the rest of the address is free to be anything (subject to
-staying valid hex, since the last byte encodes the node number and must stay a 2-hex-digit value).
 
 ## The local node (`L`): a grammar token, not a parallel code path
 

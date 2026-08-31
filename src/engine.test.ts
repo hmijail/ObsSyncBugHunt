@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { engineBin, engineVersion, connectPinsMac, resetEngineCache } from "./engine.js";
+import { engineBin, engineVersion, resetEngineCache } from "./engine.js";
 
 // Both `engineBin` and the capability probes are memoized per process, and every test here wants
 // a different answer — so each one sets up its own environment and resets the cache first.
@@ -41,21 +41,25 @@ test("engineBin: CONTAINER_ENGINE wins over anything on PATH", () => {
   assert.equal(engineBin(), "my-engine");
 });
 
-test("engineBin: prefers podman when both are installed", () => {
+test("engineBin: prefers docker when both are installed", () => {
   withEnv({ PATH: stubDir({ podman: "#!/bin/sh\n", docker: "#!/bin/sh\n" }) });
-  assert.equal(engineBin(), "podman");
+  assert.equal(engineBin(), "docker");
 });
 
-test("engineBin: picks docker when that's the only one installed", () => {
-  withEnv({ PATH: stubDir({ docker: "#!/bin/sh\n" }) });
-  assert.equal(engineBin(), "docker");
+// The podman fallback is not decoration: a shell `alias docker=podman` never reaches execFile
+// (which spawns without a shell), and macOS/brew ships no podman-docker package — so on plenty of
+// podman hosts the ONLY thing on PATH is the real `podman`, and finding it is what keeps the
+// harness working there.
+test("engineBin: picks podman when that's the only one installed", () => {
+  withEnv({ PATH: stubDir({ podman: "#!/bin/sh\n" }) });
+  assert.equal(engineBin(), "podman");
 });
 
 // Falling back rather than throwing is deliberate: the useful error is the one the real command
 // produces, against a visible argv, not an import-time crash far from the call site.
 test("engineBin: with neither installed, falls back to a name instead of throwing", () => {
   withEnv({ PATH: "" });
-  assert.equal(engineBin(), "docker");
+  assert.equal(engineBin(), "podman"); // the last candidate; the real error comes from the command
 });
 
 test("engineVersion: reports the engine's own self-report, not a guess", async () => {
@@ -64,23 +68,10 @@ test("engineVersion: reports the engine's own self-report, not a guess", async (
   assert.equal(await engineVersion(), "podman version 5.4.0");
 });
 
-// The capability that actually differs between engines, probed from the binary rather than
-// inferred from its name — the whole point being that a `docker`-NAMED podman shim must still
-// report podman's capabilities (and vice versa).
-test("connectPinsMac: true when `network connect --help` advertises --mac-address", async () => {
-  const dir = stubDir({ docker: "#!/bin/sh\necho '      --mac-address string   Container MAC'\n" });
-  withEnv({ PATH: "", CONTAINER_ENGINE: path.join(dir, "docker") });
-  assert.equal(await connectPinsMac(), true);
-});
-
-test("connectPinsMac: false when the flag isn't offered", async () => {
-  const dir = stubDir({ podman: "#!/bin/sh\necho '      --ip ip   IPv4 address'\n" });
-  withEnv({ PATH: "", CONTAINER_ENGINE: path.join(dir, "podman") });
-  assert.equal(await connectPinsMac(), false);
-});
-
-// A probe that can't run at all must read as "can't do it", never crash the harness.
-test("connectPinsMac: a missing/failing engine binary reads as false, not a throw", async () => {
+// A probe that can't run at all must degrade to an honest "unknown", never crash the harness —
+// the engine's absence should surface from the command that actually needed it, with its own
+// message, not from recording the version alongside a rep.
+test("engineVersion: a missing/failing engine binary reads as \"?\", not a throw", async () => {
   withEnv({ PATH: "", CONTAINER_ENGINE: "/nonexistent/engine-binary" });
-  assert.equal(await connectPinsMac(), false);
+  assert.equal(await engineVersion(), "?");
 });

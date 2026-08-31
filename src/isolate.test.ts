@@ -1,21 +1,50 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { nodeAddress, NetworkIsolator, EnvironmentAssumptionError } from "./isolate.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { nodeIp, NetworkIsolator, EnvironmentAssumptionError } from "./isolate.js";
 
-test("nodeAddress: n1 -> 10.89.0.101 / 6e:62:6e:65:74:65", () => {
-  assert.deepEqual(nodeAddress("n1"), { ip: "10.89.0.101", mac: "6e:62:6e:65:74:65" });
+test("nodeIp: n1 -> 10.89.0.101", () => {
+  assert.equal(nodeIp("n1"), "10.89.0.101");
 });
 
-test("nodeAddress: n2 -> 10.89.0.102 / 6e:62:6e:65:74:66", () => {
-  assert.deepEqual(nodeAddress("n2"), { ip: "10.89.0.102", mac: "6e:62:6e:65:74:66" });
+test("nodeIp: n2 -> 10.89.0.102", () => {
+  assert.equal(nodeIp("n2"), "10.89.0.102");
 });
 
-test("nodeAddress: a node name with no trailing digits throws", () => {
-  assert.throws(() => nodeAddress("login"), /can't derive a node number/);
+test("nodeIp: a node name with no trailing digits throws", () => {
+  assert.throws(() => nodeIp("login"), /can't derive a node number/);
 });
 
-test("nodeAddress: a node number that would overflow a single address byte throws", () => {
-  assert.throws(() => nodeAddress("n999"), /too large/);
+// `nodeIp` and the Makefile's SUBNET are two independently-written constants that MUST agree:
+// nodes are started and reconnected with `--ip <nodeIp(n)>` into a network created with that
+// subnet, so if they drift apart every `containers-up` and every `C` fails with an engine-level
+// error. `make check-assumptions` checks the live network against the addresses make computes;
+// this checks the addresses the HARNESS computes against the declared subnet — the half no
+// environment check can see, since editing this file leaves a correct network still correct.
+// Same "read the sibling file so the pair stays in step" idiom as repro.test.ts.
+test("nodeIp: every node address falls inside the Makefile's declared SUBNET", () => {
+  const makefile = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "Makefile"), "utf8");
+  const declared = /^SUBNET\s*:?=\s*(\d+\.\d+\.\d+\.\d+)\/(\d+)\s*$/m.exec(makefile);
+  assert.ok(declared, "Makefile must declare SUBNET as a CIDR");
+  const [, base, prefixStr] = declared;
+  const toInt = (ip: string) => ip.split(".").reduce((acc, o) => acc * 256 + Number(o), 0);
+  const size = 2 ** (32 - Number(prefixStr));
+  const netBase = Math.floor(toInt(base) / size) * size;
+  const inside = (ip: string) => toInt(ip) >= netBase && toInt(ip) < netBase + size;
+
+  for (const node of ["n1", "n2"]) {
+    assert.ok(inside(nodeIp(node)), `${node} -> ${nodeIp(node)} is outside ${base}/${prefixStr}`);
+  }
+  // The highest node number nodeIp will produce at all must fit too — otherwise the subnet is
+  // narrower than the addressing scheme and the failure only shows up at some larger NODES=.
+  assert.ok(inside(nodeIp("n155")), `n155 -> ${nodeIp("n155")} is outside ${base}/${prefixStr}`);
+});
+
+test("nodeIp: a node number that would overflow a single address byte throws", () => {
+  assert.throws(() => nodeIp("n999"), /too large/);
 });
 
 // Drive the private waitReach() directly (via the probeFn test seam), bypassing the public

@@ -3,13 +3,13 @@
 # number (1, 2, ...) for a numbered container, or the literal "L" for the local instance. Exit
 # codes from obsidian-cli/the container engine are never trustworthy (the CLI always exits 0 even
 # on error — see docs/cli-trust.md) — every decision below is made from actual reply text, never
-# $?. The one exception is the ENGINE's OWN commands (network connect/disconnect), whose exit
+# $?. The one exception is the engine's OWN commands (network connect/disconnect), whose exit
 # code IS meaningful.
 #
 # Expects these to already be set by the sourcing script: BIN, NODES, NETWORK, RUN_ID,
 # NOTE_DIR, TS (a fresh per-execution timestamp, so re-running the same script twice never
-# collides with the first run's notes), SEQ (a running counter, starts at 1), NODES/NODE_IP/
-# NODE_MACADDR (sparse arrays keyed by the actual node NUMBER, e.g. NODES[3]=n3 if the history
+# collides with the first run's notes), SEQ (a running counter, starts at 1), NODES/NODE_IP
+# (sparse arrays keyed by the actual node NUMBER, e.g. NODES[3]=n3 if the history
 # only ever touches N3 — never a compact 0-based array, since a history can skip numbers),
 # ALL_NODES (every configured node selector, numbers plus "L"
 # if configured — used only by Check, to hunt for a token across every place it could have
@@ -41,18 +41,10 @@ die() { echo "ABORT: $*" >&2; exit 1; }
 # generated script runs, not when it was generated — so one repro script stays valid across
 # machines with different engines. Override with CONTAINER_ENGINE=<binary>. Mirrors src/engine.ts,
 # which does the same for the harness proper; keep the two in step.
-ENGINE="${CONTAINER_ENGINE:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
-# Can this engine's `network connect` re-pin a MAC address? Podman can; Docker has no such flag
-# and silently assigns a fresh random MAC instead (--ip is honoured on both). ASKED of the binary
-# rather than inferred from its name, because podman also ships a `docker`-named shim.
-if $ENGINE network connect --help 2>&1 | grep -q -- '--mac-address'; then
-  ENGINE_PINS_MAC=1
-else
-  ENGINE_PINS_MAC=0
-fi
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)}"
 
 bin_for() {    # the command prefix to run obsidian-cli through
-  if [ "$1" = "L" ]; then echo "$LOCAL_BIN"; else echo "$ENGINE exec ${NODES[$1]} $BIN"; fi
+  if [ "$1" = "L" ]; then echo "$LOCAL_BIN"; else echo "$CONTAINER_ENGINE exec ${NODES[$1]} $BIN"; fi
 }
 nodeid_for() { # the real node-id string embedded in tokens (container name, or the local instance's own id)
   if [ "$1" = "L" ]; then echo "$LOCAL_NODE_ID"; else echo "${NODES[$1]}"; fi
@@ -90,17 +82,12 @@ Wait() {
   done
 }
 
-# Disconnect/Connect <node> — never called with "L". Unlike the CLI, the ENGINE's own exit code IS
+# Disconnect/Connect <node> — never called with "L". Unlike the CLI, the engine's own exit code IS
 # meaningful, so these check it directly (the one place in this file that does). Connect re-pins
-# the node's IP always, and its MAC only where the engine can (see ENGINE_PINS_MAC above); `$mac`
-# is deliberately unquoted so it expands to either two words or none, matching this file's
-# existing word-splitting idiom (`run $b ...`) and staying safe under bash 3.2's `set -u`.
-Disconnect() { run "$ENGINE" network disconnect "$NETWORK" "${NODES[$1]}" || die "disconnect failed for node $1"; }
-Connect()    {
-  local mac=""
-  [ "$ENGINE_PINS_MAC" = 1 ] && mac="--mac-address ${NODE_MACADDR[$1]}"
-  run "$ENGINE" network connect --ip "${NODE_IP[$1]}" $mac "$NETWORK" "${NODES[$1]}" || die "connect failed for node $1"
-}
+# the node's IP, which is what makes the reconnect a link blip rather than a network reset (see
+# docs/DESIGN.md); `--ip` is honoured by both engines, so there is nothing to probe for.
+Disconnect() { run "$CONTAINER_ENGINE" network disconnect "$NETWORK" "${NODES[$1]}" || die "disconnect failed for node $1"; }
+Connect()    { run "$CONTAINER_ENGINE" network connect --ip "${NODE_IP[$1]}" "$NETWORK" "${NODES[$1]}" || die "connect failed for node $1"; }
 Pause()      { sleep "$1"; }                                                                # Pause <seconds>
 
 # Check <letter> <token1> [<token2> ...] — the actual verdict: hunt for each token across every

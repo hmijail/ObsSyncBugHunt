@@ -30,13 +30,14 @@ test("generateScript: a plain append is a single, explicit function call — no 
   assert.doesNotMatch(script, /podman|docker/);
 });
 
-test("generateScript: disconnect/connect emit explicit calls, plus the pinned ip/mac as NODE_IP/NODE_MACADDR array entries", () => {
+test("generateScript: disconnect/connect emit explicit calls, plus the pinned ip as a NODE_IP array entry", () => {
   const script = generateScript(parse("N1DC"), baseOpts);
   assert.match(script, /^Disconnect 1$/m);
   assert.match(script, /^Connect 1$/m);
-  // Same pinned identity isolate.ts's own nodeAddress test asserts for n1.
+  // Same pinned address isolate.ts's own nodeIp test asserts for n1.
   assert.match(script, /^NODE_IP\[1\]=10\.89\.0\.101$/m);
-  assert.match(script, /^NODE_MACADDR\[1\]=6e:62:6e:65:74:65$/m);
+  // Only the IP is pinned — no MAC is emitted at all (see docs/DESIGN.md).
+  assert.doesNotMatch(script, /MACADDR|mac-address/);
 });
 
 test("generateScript: NODES is sparse, keyed by node NUMBER, not a compact 0-based array — a history skipping a node must not shift another node's slot", () => {
@@ -116,7 +117,7 @@ test("scripts/repro-lib.sh: every real command is wrapped in `run` for VERBOSE e
   for (const pattern of [
     /run \$b append/, /run \$b create/, /run \$b open/, /run \$b sync:status/,
     /run \$b read file/, /run \$b files folder/, /run \$b read path/,
-    /run "\$ENGINE" network disconnect/, /run "\$ENGINE" network connect/,
+    /run "\$CONTAINER_ENGINE" network disconnect/, /run "\$CONTAINER_ENGINE" network connect/,
   ]) {
     assert.match(lib, pattern);
   }
@@ -129,19 +130,23 @@ test("scripts/repro-lib.sh: Append aborts (die) if create doesn't report success
 
 test("scripts/repro-lib.sh: Disconnect/Connect abort (die) on a nonzero engine exit code", () => {
   const lib = reproLib();
-  assert.match(lib, /Disconnect\(\) \{ run "\$ENGINE" network disconnect .*\|\| die/);
-  assert.match(lib, /run "\$ENGINE" network connect .*\|\| die "connect failed/);
+  assert.match(lib, /Disconnect\(\) \{ run "\$CONTAINER_ENGINE" network disconnect .*\|\| die/);
+  assert.match(lib, /run "\$CONTAINER_ENGINE" network connect .*\|\| die "connect failed/);
 });
 
-// The generated repro must work on whichever engine the machine RUNNING it has — so the library
-// resolves the engine itself, and asks it (rather than its name) whether a reconnect can re-pin
-// the MAC. Mirrors src/engine.ts; these assertions are what keeps the pair in step.
-test("scripts/repro-lib.sh: resolves the engine at run time and probes its --mac-address support", () => {
+// The generated repro must work on whichever engine the machine RUNNING it has, so the library
+// resolves the engine itself rather than baking in the generating machine's choice. Mirrors
+// src/engine.ts; these assertions are what keeps the pair in step.
+test("scripts/repro-lib.sh: resolves the engine at run time, and pins only the IP on reconnect", () => {
   const lib = reproLib();
-  assert.match(lib, /ENGINE="\$\{CONTAINER_ENGINE:-\$\(command -v podman .*podman.*docker\)\}"/);
-  assert.match(lib, /\$ENGINE network connect --help .*grep -q -- '--mac-address'/);
-  assert.match(lib, /ENGINE_PINS_MAC=1/);
-  assert.match(lib, /ENGINE_PINS_MAC=0/);
-  // The IP is pinned unconditionally; only the MAC is conditional.
-  assert.match(lib, /network connect --ip "\$\{NODE_IP\[\$1\]\}" \$mac/);
+  // Asserts the BEHAVIOUR, not the preference order: CONTAINER_ENGINE wins, otherwise it detects
+  // between the two known engines. Which one is tried first is a tunable default (see
+  // src/engine.ts's CANDIDATES) and pinning it here just makes this test break on a policy change.
+  const engineLine = /^CONTAINER_ENGINE="\$\{CONTAINER_ENGINE:-\$\(command -v .*\)\}"$/m.exec(lib)?.[0] ?? "";
+  assert.ok(engineLine, "repro-lib.sh must resolve CONTAINER_ENGINE from the environment, else by detection");
+  assert.match(engineLine, /\bdocker\b/);
+  assert.match(engineLine, /\bpodman\b/);
+  // The IP is pinned, and nothing else: no MAC, and so no capability probe to go with it.
+  assert.match(lib, /network connect --ip "\$\{NODE_IP\[\$1\]\}" "\$NETWORK"/);
+  assert.doesNotMatch(lib, /mac-address|MACADDR|PINS_MAC/);
 });

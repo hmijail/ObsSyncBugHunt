@@ -5,7 +5,7 @@
 // container from its container network, then reattach — an authentic offline
 // window, no privileged networking required.
 
-import { connectPinsMac, engineBin } from "./engine.js";
+import { engineBin } from "./engine.js";
 import { runProcess } from "./exec.js";
 import type { ObsidianDriver } from "./driver.js";
 import type { NodeId } from "./types.js";
@@ -69,25 +69,21 @@ export class EnvironmentAssumptionError extends Error {
   }
 }
 
-// Pinned per-node network identity, so a reconnect restores the EXACT same IP/MAC the
-// container had before (and from its very first `containers-up` — see the Makefile) rather
-// than a fresh dynamically-assigned one — see docs/DESIGN.md for why, and for the story behind
-// the MAC address's first byte specifically.
+// Pinned per-node IP, so a reconnect restores the EXACT same address the container had before
+// (and from its very first `containers-up` — see the Makefile) rather than a fresh
+// dynamically-assigned one. That is what keeps a `C` a link blip: the 4-tuples of the node's
+// established connections to Sync stay valid, so they stall and resume instead of dying. See
+// docs/DESIGN.md for the measurement, and for why the MAC is NOT pinned alongside it.
 // Node number comes from the trailing digits of its name (n1 -> 1, n2 -> 2); X = 100 + number.
 // IP = 10.89.0.<X>. The Makefile's `net` target creates obsidian-net with an explicit
 // `--subnet 10.89.0.0/24` so this holds on any engine — it used to be merely Podman's default,
 // which silently made these addresses unassignable under Docker (default 172.x).
-// MAC = 6e:62:6e:65:74:<X in hex>. The first byte (0x6e = 'n') MUST keep its I/G bit (least
-// significant bit of the first byte) at 0 — a real interface MAC must be unicast, not
-// multicast — and its U/L bit at 1 (locally-administered, since this isn't vendor-assigned).
-// Only the first byte carries this constraint; the rest is free, but must stay valid 2-digit hex
-// (e.g. X=101 -> "65", not the invalid 3-char decimal "101").
-export function nodeAddress(node: NodeId): { ip: string; mac: string } {
+export function nodeIp(node: NodeId): string {
   const m = /(\d+)$/.exec(node);
-  if (!m) throw new Error(`can't derive a node number from "${node}" for IP/MAC pinning`);
+  if (!m) throw new Error(`can't derive a node number from "${node}" for IP pinning`);
   const x = 100 + Number(m[1]);
   if (x > 255) throw new Error(`node number too large for a single address byte: ${node} -> ${x}`);
-  return { ip: `10.89.0.${x}`, mac: `6e:62:6e:65:74:${x.toString(16).padStart(2, "0")}` };
+  return `10.89.0.${x}`;
 }
 
 /**
@@ -119,11 +115,11 @@ export class NetworkIsolator implements Isolator {
    * networking — instead of burying it in a JSONL nobody reads until morning.
    *
    * Whether this holds is a property of container-engine INTERNALS, which change under you: it
-   * was verified on Docker 29.7.2 at ~60ms, i.e. ~16x under this budget. `make net-check` and
+   * was verified on Docker 29.7.2 at ~60ms, i.e. ~16x under this budget. `make check-net` and
    * `make check-assumptions` measure it deliberately on a disposable container (a history with no
    * `D` never exercises it at all); this is the always-on guard riding on every real `C`.
    *
-   * The number compared here is coarser than net-check's — it includes the engine-exec cost of
+   * The number compared here is coarser than check-net's — it includes the engine-exec cost of
    * the probe itself, so a healthy reconnect still reports a few hundred ms — which is why the
    * budget is a full second rather than the ~60ms a bare reconnect actually takes. Raise it with
    * `--reconnect-budget-ms` / `make ... RECONNECT_BUDGET_MS=...` on a slow machine.
@@ -179,16 +175,13 @@ export class NetworkIsolator implements Isolator {
   }
 
   async connect(node: NodeId): Promise<void> {
-    const { ip, mac } = nodeAddress(node);
-    // The IP is re-pinned on every engine; the MAC only where `network connect` can do it
-    // (Podman yes, Docker no — see engine.ts's connectPinsMac). Emitted rather than assumed,
-    // so a rep's log says which of the two identities actually survived its reconnect.
-    const pinsMac = await connectPinsMac();
-    const macArgs = pinsMac ? ["--mac-address", mac] : [];
-    this.emit({ kind: "network-identity", node, ip, mac: pinsMac ? mac : null, macPinned: pinsMac });
-    await runProcess(engineBin(), ["network", "connect", "--ip", ip, ...macArgs, this.network, node]);
+    const ip = nodeIp(node);
+    // Emitted rather than assumed, so a rep's log says which address its reconnect actually
+    // restored. Only the IP is pinned — see docs/DESIGN.md.
+    this.emit({ kind: "network-identity", node, ip });
+    await runProcess(engineBin(), ["network", "connect", "--ip", ip, this.network, node]);
     const reconnectMs = await this.waitReach(node, true, "connect");
-    this.enforceBlipBudget(node, reconnectMs, { ip, macPinned: pinsMac });
+    this.enforceBlipBudget(node, reconnectMs, { ip });
   }
 
   /** The budget decision, split out from `connect()` so it can be unit-tested without a real
@@ -203,7 +196,7 @@ export class NetworkIsolator implements Isolator {
       "A D/C is supposed to be a brief link blip (connections stall, then resume), not a network reset.\n" +
       "  This slow, the node's connections to Sync will have died on timeout and Obsidian took its\n" +
       "  rejoin path instead — the histories no longer test what they say, so the run stopped.\n" +
-      "  Diagnose with:  make check-assumptions   (or just: make net-check)\n" +
+      "  Diagnose with:  make check-assumptions   (or just: make check-net)\n" +
       "  Background:     docs/DESIGN.md, \"Network identity\"\n" +
       "  If this machine is simply slow, raise the budget: make ... RECONNECT_BUDGET_MS=2000",
       { node, reconnectMs, budgetMs: this.reconnectBudgetMs, ...detail },

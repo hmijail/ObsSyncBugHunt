@@ -21,11 +21,11 @@
 #
 # Usage: wait-node.sh <container> [timeout_seconds]
 #
-# ENGINE (podman/docker) is normally passed in by the Makefile, which resolved it once; the
-# fallback keeps the script runnable by hand. Override with CONTAINER_ENGINE=<binary>.
+# CONTAINER_ENGINE (podman/docker) is normally exported by the Makefile, which resolved it once;
+# the fallback keeps the script runnable by hand.
 set -eu
 
-ENGINE="${ENGINE:-${CONTAINER_ENGINE:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}}"
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)}"
 node="$1"
 timeout_s="${2:-150}"
 cli=/opt/obsidian/obsidian-cli
@@ -40,7 +40,7 @@ elapsed() { echo "+$(( $(date +%s) - t0 ))s"; }
 alive() { [ "$shot_bytes" -ge "$shot_min" ] && [ "$windows" -ge 1 ] && [ "$notes" != ERR ]; }
 
 # 1. GUI process must exist.
-until "$ENGINE" exec "$node" pgrep -f /opt/obsidian/obsidian >/dev/null 2>&1; do
+until "$CONTAINER_ENGINE" exec "$node" pgrep -f /opt/obsidian/obsidian >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || { log "Obsidian process never appeared" >&2; exit 1; }
   sleep 1
 done
@@ -50,7 +50,7 @@ shot_bytes=0; windows=0; notes=ERR
 n=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
   n=$((n + 1))
-  report=$("$ENGINE" exec "$node" timeout 45 "$hc" 2>/dev/null | tail -1)
+  report=$("$CONTAINER_ENGINE" exec "$node" timeout 45 "$hc" 2>/dev/null | tail -1)
   shot_bytes=0; windows=0; notes=ERR
   case "$report" in shot_bytes=*) eval "$report" 2>/dev/null || true ;; esac
   log "health #$n $(elapsed): shot_bytes=$shot_bytes windows=$windows notes=$notes"
@@ -59,7 +59,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 if ! alive; then
   log "Obsidian never became alive — likely stuck on a blank screen (last: shot_bytes=$shot_bytes windows=$windows notes=$notes)" >&2
-  log "  screenshot: $ENGINE cp $node:/var/log/obsidian-shot.png ." >&2
+  log "  screenshot: $CONTAINER_ENGINE cp $node:/var/log/obsidian-shot.png ." >&2
   exit 2
 fi
 log "alive"
@@ -73,7 +73,7 @@ log "alive"
 n=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
   n=$((n + 1))
-  out=$("$ENGINE" exec "$node" timeout 20 "$cli" sync:status 2>/dev/null || true)
+  out=$("$CONTAINER_ENGINE" exec "$node" timeout 20 "$cli" sync:status 2>/dev/null || true)
   # Judge by output, portably (this script runs on macOS → BSD grep/awk, no GNU
   # sed alternation): a real "status: <synced|paused|syncing>" line means the
   # Sync subsystem answered.

@@ -13,3 +13,4 @@ secrets/
 .claude/settings.local.json
 # Personal editor settings
 .vscode/
+*.code-workspace

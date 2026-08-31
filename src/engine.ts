@@ -1,18 +1,21 @@
-// Which container engine drives the nodes, and what that engine can actually do.
+// Which container engine drives the nodes.
 //
 // The harness was written against Podman and now also runs on Docker. For everything the harness
 // does (build/run/rm/exec/cp/inspect/ps, network create/rm/connect/disconnect) the two CLIs take
-// the same arguments — with the divergences listed under `connectPinsMac` and in the Makefile's
-// `net` target.
+// the same arguments and the same flags, so there is no engine-specific codepath anywhere in the
+// harness — only the Makefile's `net` target, which passes an explicit `--subnet` because the two
+// engines have different defaults.
 //
-// Two questions are deliberately kept apart here:
+// This module therefore answers only two things: which binary to invoke (`engineBin` — cheap and
+// synchronous, it is on the hot path) and what it calls itself (`engineVersion`, recorded with
+// every rep because the engine is part of the stack under test).
 //
-//   1. WHICH BINARY to invoke — a name (`engineBin`). Cheap, synchronous, needed on the hot path.
-//   2. WHAT IT CAN DO — never inferred from that name. Podman ships a `docker`-named shim
-//      (podman-docker), so "the binary is called docker" does NOT imply Docker semantics, and
-//      Docker may grow a flag Podman has today. So capabilities are PROBED from the binary
-//      itself (`--help` output), the same "trust the reply text, not an assumption" rule the
-//      rest of this repo applies to obsidian-cli (see docs/cli-trust.md).
+// NOTE for anyone re-introducing an engine-specific behaviour here: do NOT branch on the binary's
+// NAME. Podman ships a `docker`-named shim (podman-docker), so "the binary is called docker" does
+// not imply Docker semantics. Probe the capability from the binary itself (`--help` output) — the
+// same "trust the reply text, not an assumption" rule this repo applies to obsidian-cli (see
+// docs/cli-trust.md). There used to be exactly one such probe, `connectPinsMac`; git history has
+// it if a similar one is ever needed.
 //
 // Override the choice with CONTAINER_ENGINE=<binary> (a bare name on PATH, or an absolute path).
 
@@ -21,25 +24,33 @@ import { accessSync, constants } from "node:fs";
 import path from "node:path";
 
 /**
- * Minimal one-shot process capture for the probes below.
+ * Minimal one-shot process capture for the `--version` probe below.
  *
  * Deliberately NOT exec.ts's `runProcess`: exec.ts has to ask this module which binary to run,
  * and importing back the other way would make the two modules circular. These probes need only
- * the combined output of a `--version`/`--help` call, none of ExecResult's timing/kill
- * bookkeeping, so a few lines here buy a one-way dependency (exec.ts -> engine.ts, never back).
+ * the combined output of a `--version` call, none of ExecResult's timing/kill bookkeeping,
+ * so a few lines here buy a one-way dependency (exec.ts -> engine.ts, never back).
  */
 function capture(file: string, args: string[]): Promise<string> {
   return new Promise((resolve) => {
     execFile(file, args, { timeout: 15_000 }, (_err, stdout, stderr) =>
-      // Ignore the error: a missing binary or an unknown subcommand is itself an answer here
-      // ("this engine can't do that"), and every caller below judges the TEXT, never the status.
+      // Ignore the error: a missing binary or an unknown subcommand is itself an answer here,
+      // and the caller below judges the TEXT, never the status.
       resolve(`${stdout ?? ""}\n${stderr ?? ""}`));
   });
 }
 
-/** Engines we know how to look for, in preference order. Podman first: if both are installed,
- *  the podman one is the one this project was developed against. */
-const CANDIDATES = ["podman", "docker"];
+/** Engines we know how to look for, in preference order.
+ *
+ *  Docker first. On an unknown machine `docker` is the likelier right call: Podman ships a real
+ *  `docker` executable via the podman-docker package, so on those hosts it reaches podman anyway
+ *  — harmlessly, since nothing here behaves differently per engine (see the header note).
+ *
+ *  Podman stays in the list because that fallback does real work. A shell `alias docker=podman`
+ *  (the advice people usually mean) is invisible here — `execFile` spawns without a shell, so an
+ *  alias yields ENOENT — and macOS/brew has no podman-docker package at all. On those hosts only
+ *  the real `podman` binary exists, and finding it is what keeps the harness working. */
+const CANDIDATES = ["docker", "podman"];
 
 function onPath(name: string): boolean {
   if (name.includes(path.sep)) {
@@ -69,10 +80,9 @@ export function engineBin(): string {
   return binCache;
 }
 
-/** Test seam: forget the memoized binary/capability probes (nothing else should call this). */
+/** Test seam: forget the memoized probes (nothing else should call this). */
 export function resetEngineCache(): void {
   binCache = undefined;
-  macCache = undefined;
   versionCache = undefined;
 }
 
@@ -82,30 +92,9 @@ let versionCache: Promise<string> | undefined;
  * The engine's own self-report (`<engine> --version`), e.g. "podman version 5.4.0" or
  * "Docker version 29.7.2, build a7dcaa6". Recorded alongside the Obsidian version in each rep's
  * `history` event: a finding is only meaningful next to the whole stack that produced it, and the
- * engine decides real things here (see `connectPinsMac`).
+ * engine is part of the stack under test, not neutral scaffolding.
  */
 export function engineVersion(): Promise<string> {
   versionCache ??= capture(engineBin(), ["--version"]).then((out) => out.trim() || "?");
   return versionCache;
-}
-
-let macCache: Promise<boolean> | undefined;
-
-/**
- * Can `<engine> network connect` re-pin a container's MAC address?
- *
- * Podman: yes (`--mac-address`). Docker: no — the flag does not exist, and the plausible
- * `--driver-opt com.docker.network.endpoint.{mac_address,macaddress,mac-address}` spellings were
- * tried against Docker 29.7.2 and are all accepted silently (exit 0) while a fresh random MAC is
- * assigned anyway. `--ip` does work on both, so a Docker reconnect keeps the node's IP and loses
- * only its MAC — see docs/DESIGN.md for why we pin either in the first place, and why losing the
- * MAC is a tolerable difference rather than a blocker.
- *
- * Probed from `network connect --help` rather than switched on the engine's name: the question is
- * whether the flag is there, and only the binary in front of us can answer that.
- */
-export function connectPinsMac(): Promise<boolean> {
-  macCache ??= capture(engineBin(), ["network", "connect", "--help"])
-    .then((out) => out.includes("--mac-address"));
-  return macCache;
 }
