@@ -4,9 +4,12 @@
 // history string IS the artifact, and we repeat each one (see run.ts).
 //
 // `generateHistory` coordinates cross-node edits by `turns`:
-//   barrier    — insert `W` before a cross-node edit (strict turns, no overlap)
-//   paced      — insert a default `P` instead (a timed pause → edits sometimes race)
-//   concurrent — insert nothing (maximum overlap)
+//   barrier   — insert `W` before a cross-node edit (strict turns, no overlap)
+//   paced     — insert a default `P` instead (a timed pause → edits sometimes race)
+//   immediate — insert nothing; the next edit follows with no coordination at all
+// (`immediate`, not "concurrent": the harness is a SINGLE thread of control standing in for one
+// user moving between devices, so nothing here ever runs at the same time. The mode removes the
+// delay between cross-node edits, it does not overlap them.)
 // Coordination only applies while both editors are online — you can't take a turn
 // across a partition. With `partitionProb>0` it also opens random `D`…`C`
 // partitions (one or more nodes go offline, edits diverge, then they heal). The result
@@ -14,7 +17,10 @@
 
 import { DEFAULT_PAUSE_SEC, normalize, type History } from "./dsl.js";
 
-export type Turns = "barrier" | "paced" | "concurrent";
+/** The single source of truth for the accepted turn modes: the type is derived from the list, so
+ *  run.ts can validate an incoming --turns against it without the two drifting apart. */
+export const TURN_MODES = ["barrier", "paced", "immediate"] as const;
+export type Turns = (typeof TURN_MODES)[number];
 
 export interface GenParams {
   nodes: number; // node count (>=1) — numbered nodes only, the local instance is layered on top, see localEnabled
@@ -101,7 +107,7 @@ export function generateHistory(params: GenParams): History {
     setNode(n);
     // Coordinate a cross-node edit per `turns`, but only while both editors are
     // online (you can't take a turn across a partition — divergence is the point).
-    if (turns !== "concurrent" && prevEditor && prevEditor !== n && !isOffline(n) && !isOffline(prevEditor)) {
+    if (turns !== "immediate" && prevEditor && prevEditor !== n && !isOffline(n) && !isOffline(prevEditor)) {
       ops.push(turns === "barrier" ? { cmd: "wait" } : { cmd: "pause", seconds: DEFAULT_PAUSE_SEC });
     }
     ops.push({ cmd: "append", note });

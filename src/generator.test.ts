@@ -78,10 +78,10 @@ test("paced turns: a P (not W) before every cross-node edit", () => {
   }
 });
 
-test("concurrent turns: no coordination at all", () => {
+test("immediate turns: no coordination at all", () => {
   for (let s = 1; s <= 10; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "concurrent", rng: mulberry32(s) });
-    assert.ok(!h.some((o) => o.cmd === "wait" || o.cmd === "pause"), `concurrent inserts no W/P: ${serialize(h)}`);
+    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "immediate", rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "wait" || o.cmd === "pause"), `immediate inserts no W/P: ${serialize(h)}`);
   }
 });
 

@@ -34,7 +34,7 @@
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
-//   --turns          barrier | paced | concurrent            (default barrier)
+//   --turns          barrier | paced | immediate             (default barrier)
 //   --pause-prob     chance of a ~10s pause after an edit     (default 0)
 //   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
 //                    participants — numbered nodes + local instance if "l" is in --nodes)
@@ -78,7 +78,7 @@ import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, NetworkIsolator, EnvironmentAssumptionError, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
-import { generateHistory, type GenParams, type Turns } from "./generator.js";
+import { generateHistory, TURN_MODES, type GenParams, type Turns } from "./generator.js";
 import { parse, serialize, normalize, requiredNodes, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
@@ -210,8 +210,16 @@ if (values["local-vault-pin"] && !localRequested) {
 
 const opsRange = (values.ops ?? "6-12").split("-").map(Number);
 const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
+// Rejected rather than silently defaulted. The old code fell back to "barrier" for anything it
+// didn't recognize, so a typo (or a mode renamed out from under a script) quietly ran the MOST
+// conservative pacing — the one least likely to surface a bug — while the rep's own record
+// claimed that was what you asked for.
 const turnsArg = values.turns ?? "barrier";
-const turns = (["barrier", "paced", "concurrent"].includes(turnsArg) ? turnsArg : "barrier") as Turns;
+if (!(TURN_MODES as readonly string[]).includes(turnsArg)) {
+  console.error(`--turns/TURNS must be one of: ${TURN_MODES.join(" | ")} — got "${turnsArg}".`);
+  process.exit(2);
+}
+const turns = turnsArg as Turns;
 const genParams: GenParams = {
   nodes: nodesList.length,
   ops,
