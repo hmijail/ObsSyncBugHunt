@@ -3,7 +3,11 @@
 A TypeScript test harness that hunts for **data loss in Obsidian Sync** when the
 same notes are edited alternatively on multiple devices, simulated in containers. Kind of a poor-man's semantic fuzzer for a simple distributed system, whipped up with help from Claude.
 
-Inspired by [Jepsen](https://jepsen.io/), which is overkill for Obsidian Sync.
+Inspired by [Jepsen](https://jepsen.io/), which would be overkill for something like Obsidian Sync.
+
+# Motivating example:
+
+XXX
 
 ## How come?
 
@@ -28,10 +32,7 @@ The result is code that is expected to only be read by an LLM, which learnt noth
 More detailed blog post coming soon.
 
 ## Requirements
-* Podman **or** Docker (2 vCPUs / 4GB RAM in the VM is enough for 2 Obsidian containers). Whichever
-  is installed is detected automatically; `make ... ENGINE=docker` (or `CONTAINER_ENGINE=...`) forces one.
-  The only functional difference is that Docker can't re-pin a container's MAC on reconnect — which
-  doesn't affect what `D`/`C` tests, and `make net-check` verifies that on your machine.
+* Podman or Docker (2 vCPUs / 4GB RAM in the VM is enough for 2 Obsidian containers).
 * Obsidian Sync subscription
 * Optionally a local (non-containerized) Obsidian instance.
 
@@ -44,18 +45,19 @@ Bugs that appear between 2 Linux Obsidian instances (in containers) are differen
 The test harness will be creating and editing lots of notes on your Sync vault. It will try to keep the vault safe, by only ever acting on notes inside a folder ("bughunt") in your vault. (In any case you should backup your vault; personally, until bugs are fixed I moved my vault out of Sync and into iCloud Drive)
 
 
-`make` is the easy entry point to the project, which maps to other tools as needed. `make help` lists every command.
+`make` is the easy entry point to the project, which maps to other tools as needed. `make help` lists every available command.
 
 Common flow:
 
 ```sh
 make install && make check        # install (npm ci) + typecheck + unit tests
 
-# Create two node containers:
-make build && make login
-# Connect through VNC to the container (localhost:5900). A pristine Obsidian is waiting. Configure it to Sync to a vault and "create conflict file". Enable the Obsidian CLI.
-make capture                      # extracts the login credentials into ./secrets (git-ignored)
+# Create node and prepare it for Obsidian Sync's login:
+make build-image && make login
+# Connect through VNC to the container (localhost:5900). A pristine Obsidian is waiting. Configure it to Sync to a vault and set it to "create conflict file". Enable the Obsidian CLI.
+make capture-login                # extracts the settings and login credentials into ./secrets
 make containers-up                # launch n1 + n2 fresh with the captured credentials
+make check-assumptions            # does everything look as expected? (run after updates, etc)
 make clean-data                   # OPTIONAL clean slate: empty the vault + wipe runs/
 
 make run HISTORY=N1AaWN2Aa REPEAT=3      # run one specific history
@@ -63,96 +65,27 @@ make soak HISTORY=N1AaWN2Aa              # soak one history until Ctrl-C
 make soak TURNS=paced                    # generate histories and run them until Ctrl-C
 make analyze                             # aggregate runs/ into a report
 
-make repro HISTORY=N1DAaWN2AaC           # turn that history into a bash script (bug repro with minimal machinery)
+make repro HISTORY=N1DAaWN2AaC           # turn that history into a shell script (bug reproduction with minimal machinery)
 ```
 
-## Which Obsidian is under test, and upgrading it
-
-Obsidian ships new releases constantly, and a bug appearing or vanishing across them is *the*
-interesting signal here — so the version is pinned, explicit, and cheap to change.
-
-`OBSIDIAN_VERSION` at the top of the `Makefile` is the single source of truth. It's baked into the
-image at build time and the image is tagged with it (`obsidian-node:1.13.7`), so builds of
-different versions coexist rather than overwriting each other.
-
-```sh
-make obsidian-latest                     # is there a newer release than the pinned one?
-# then edit OBSIDIAN_VERSION in the Makefile, and:
-make containers-up                       # rebuild + relaunch the nodes on the new build
-
-make containers-up OBSIDIAN_VERSION=1.12.7   # ...or try a version without committing to it
-make images                              # which versions are built locally
-```
-
-That last form is what makes bisecting a finding across releases practical: run the history,
-switch version, run it again. The captured `./secrets` login carries across versions — no repeat
-of the VNC login dance.
-
-Nothing relies on the pin being *honest*: every rep records the version the CLI itself
-self-reports (`obsidianVersion` in its `history` event), alongside the container engine
-(`containerEngine`). The run log is the authoritative record of what produced a result, not the
-Makefile.
-
-## Container engine
-
-Podman and Docker both work, and the one you have installed is detected automatically. Override
-with `make ... ENGINE=docker` or `CONTAINER_ENGINE=/path/to/binary` (capabilities are probed from
-the binary itself, so podman installed under a `docker` name is still correctly treated as podman).
-
-They differ in exactly one thing that matters: Docker's `network connect` cannot re-pin a MAC
-address, so a reconnected node keeps its IP but gets a fresh MAC. That doesn't change what a
-`D`/`C` tests — see `docs/DESIGN.md` — but since it's an assumption about engine internals, it's
-checked rather than assumed:
-
-```sh
-make net-check     # run after installing/switching/upgrading an engine
-```
-
-It measures, on a disposable container, whether a reconnect restores connectivity within 1s on the
-node's pinned IP — i.e. whether a `D`…`C` is still a brief *link blip* rather than a full network
-reset. Every real `C` re-checks the same budget in passing, and **aborts the run** if it's blown:
-past that point the fault primitive isn't doing what the histories say, so every subsequent rep
-would be meaningless too. The rep is tagged `-ENVFAIL` and the cause lands in `runs/ENVFAIL.log`.
-On a slow machine, raise the bar: `make ... RECONNECT_BUDGET_MS=2000`.
-
-## Checking the assumptions this harness rests on
-
-The harness depends on things outside it — the container engine, the Obsidian build, obsidian-cli's
-output formats — which change on someone else's schedule. A run started against a violated
-assumption doesn't crash; it produces plausible results about the wrong experiment.
-
-```sh
-make check-assumptions     # after a break, or an Obsidian / Docker / Podman update
-```
-
-Rare and thorough rather than quick (about a minute), and deliberately not wired into `make run`.
-It checks the engine, the network's subnet, the pinned image and that the running nodes' Obsidian
-matches the version they're tagged with, how far the pin has fallen behind upstream (advisory), the
-`D`/`C` blip property, and — the one worth the wall-clock — that **every obsidian-cli command the
-harness depends on still produces output the parsers recognize**.
-
-That last one is otherwise only discovered *reactively*: `cli-parse.ts` refuses to guess at output
-it doesn't recognize, so a format change becomes a `-UNKNOWN` rep — found mid-soak, one burned rep
-at a time. Since a format change is the likeliest breakage right after an Obsidian upgrade, this
-moves the discovery to before you commit to an overnight run. Steps needing no containers run
-first, so the target is useful even before `make containers-up` (the CLI sweep then reports as
-skipped rather than failing).
 
 # How it all works
 
+In a nutshell: we will set up a couple (or more!) Obsidian clients in containers, make them Sync, and then we'll create and edit notes in them, while checking that no data is lost. When it does, we'll record how repeatable is that case.
+
 ## A set of Obsidian clients, ready to Sync
 
-When you run `make build`, 2 containers will be built, prepared to run Obsidian. They will be connected to an internal network and to the internet.
+When you run `make build-image`, a container image will be prepared to run Obsidian. Then, `make login` will run it for you to connect through VNC. You will log in to your Obsidian Sync account, connect to a Sync vault, enable creation of conflict files, and enable the Obsidian CLI.
 
-Then, `make login` will prepare one of those containers for you to connect through VNC. You will log in to your Obsidian Sync account, connect to a Sync vault, enable creation of conflict files, and enable the Obsidian CLI.
+Next, `make capture-login` will extract from that container your Sync credentials and copy them into the `secrets` directory. This is so that multiple containers can reuse the same credentials, without manually setting up each one of them individually. This information never leaves your computer. **Don't publish that directory; it's already in `.gitignore`.**
 
-Next, `make capture` will extract from that container your Sync credentials and copy them into the `secrets` directory. This is so that multiple containers can reuse the same credentials, without manually setting up each one of them individually. This information never leaves your computer. **Don't publish that directory; it's already in `.gitignore`.**
+And then, `make containers-up` will start your nodes and get them syncing. If there's notes in the vault, they might take some time to finish their initial sync.
 
-And now, `make containers-up` will start your nodes and get them syncing. If there's notes in the vault, they might take some minutes to finish their initial sync. You can connect to each node through VNC, in the port 5900+(node number).
+If you want to see or interact with them, you can always connect to each node through VNC, in the port 5900+(node number).
 
 ## Generating sequences of Obsidian edits with a tiny DSL
 
-A test is a **history**: a string of user actions replayed against
+We will test sequences of actions, AKA a **history**: a string of user actions replayed against
 multiple Obsidian nodes. Commands are uppercase, parameters lowercase/digits.
 
 | Command | meaning |
@@ -164,17 +97,16 @@ multiple Obsidian nodes. Commands are uppercase, parameters lowercase/digits.
 | `W`    | wait until the active node reports that the last-edited note is synced |
 | `P<n>` | pause ~`n` seconds (default 10) |
 
-Example: `N1AaWN2Aa`= node 1 appends to note `a`, waits for sync; node 2
-appends to the same note.
+Example: `N1AaWN2Aa`= node 1 appends to note `a`, waits for sync; node 2 appends to the same note.
 
-Histories can be auto-generated or typed manually. They are run through a `normalize` pass so that histories that would be very similar in practice also look similar as a string:
-- A pause not adjacent to an action (`D`/`C`/`A`) floats forward to the next action (`N1PN2AaAa` → `N1N2PAaAa`)
+Histories can be auto-generated or typed manually. They are normalized so that histories that would be very similar in practice also look similar as a string. For example, history `N1PN2AaAa` is reduced to `N2PAa`:
+- A Pause not adjacent to an action (`D`/`C`/`A`) floats forward to the next action (`N1PN2AaAa` → `N1N2PAaAa`)
 - Redundant node selections vanish (`N1N2PAaAa` → `N2PAaAa`)
 - Contiguous Appends to the same note collapse into a single Append. (`N2PAaAa` → `N2PAa`)
 
-Timings are necessarily variable between repetitions of a history, since we don't have control of the Sync server, timing of the client's retries, network state, etc. This can cause results to change every time you repeat the history. Therefore histories are run `REPEAT` times to sample the distribution of end results. Also, to minimize variability in a given history if desired, command W waits until Obsidian itself reports the node is synced.
+Timings are necessarily variable between repetitions of a history, since we don't have control of the Sync server, timing of the client's retries, internet traffic, etc. This can cause results to change every time you repeat the history. Therefore histories are run for `REPEAT` times to sample the distribution of end results. Also, if one wants to minimize variability, command W waits until Obsidian itself reports the node is synced.
 
-Note that the harness models a single user using Obsidian across `NODES` devices, so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing, while Obsidian might be doing its thing. Similarly, W waits for the current node to report it is synced, but this also causes the other nodes to wait until that moment.
+Note that the harness models a single user using Obsidian across `NODES` devices, so there's a single thread of control doing everything. This means that e.g. a Pause command applies across all nodes at once: the control thread does nothing for n seconds, while the Obsidian nodes will keep doing their thing. Similarly, W waits for the current node to report it is synced, while the rest of nodes keep working.
 
 At the end of the history, the harness reconnects all nodes to the network,  waits for them all to report synced, and still waits for a settling window to ensure that no further changes happen (e.g. generation of conflict files, which later get synced, etc etc). Only then the end result is judged.
 
@@ -195,18 +127,11 @@ Every note the harness creates lives under the `bughunt/` folder, and
 `make clean-notes`/`make clean-data` only ever delete *inside* `bughunt/`. So even if pointed at a
 real, in-use vault, the harness should keep your own notes safe. Not recommended, though! **Again: best to make a backup if you do this.**
 
-### Practical example
+## Practical example
 
-Here's is a simple history string that already surfaces a very repeatable Obsidian Sync bug: **N2DN1AaWN2AaCW**
+Here's is a simple history string that already surfaces a repeatable Obsidian Sync bug: **N2DN1AaWN2AaCW**
 
-Still reproducing as of Obsidian **1.13.7** (re-checked 2026-08-15, 8/8 reps lost data — it was
-first found on 1.12.7). The lost token is still on the server, so this is the clients dropping an
-acknowledged edit rather than an upload that never happened:
-
-```json
-{"kind":"lost-forensic","token":"(n1-1-a)","writer":"n1",
- "serverRecoverable":true,"serverVersions":[1],"conflictFileFound":false}
-```
+(Found in Obsidian 1.12.7, still there in 1.13.7)
 
 - N2: selects N2 as the current node
 - D : disconnects the current node. (See below for different ways of disconnecting: disable network, disable sync)
@@ -219,14 +144,7 @@ acknowledged edit rather than an upload that never happened:
 - W : wait for sync
 
 Interestingly, this specific history results in very consistent data loss, but only in these specific conditions:
-* when disconnecting the containers' network ( `ISOLATOR=network`), but not when using the Obsidian CLI commands `sync:on` and `sync:off` (`ISOLATOR=sync`). Still a clean split on 1.13.7 — back to back on the same nodes, same vault, same history:
-
-  | isolator | reps | verdict | conflict files |
-  |---|---|---|---|
-  | `network` | 8 | 8 LOST | 0 |
-  | `sync`    | 5 | 5 PASS | 5 |
-
-  The `sync` case produces exactly the conflict file the `network` case is missing, which is what makes the loss a bug rather than a merge policy.
+* when disconnecting the containers' network ( `ISOLATOR=network`), but not when using the Obsidian CLI commands `sync:on` and `sync:off` (`ISOLATOR=sync`).
 * when it's 2 Linux containers syncing, but it seems to fail less consistenly when it's 1 Linux vs 1 Mac instance (i.e., **N2DLAaWN2AaCW**)
 
 Conversely, other bugs only happen between a Mac and a Linux instance, but not between 2 Linux instances. E.g. **N1DAaCLP9Aa**, reproducible in about 20% of repetitions (maybe dependent on CPU load?).
@@ -241,17 +159,13 @@ A history can edit the same note in different nodes. This can be done conservati
 
 ### Exercising sync recovery after disconnections
 
-The main expected source of bugs is synchronization across nodes, particularly when the nodes get disconnected and reconnected to the network while the notes change.
+The main expected source of bugs is synchronization across nodes, particularly when the nodes get disconnected and reconnected to the network while the notes might keep changing. Just as if you edited a note on your phone on the go, while connectivity comes and goes.
 
-`PARTITION_PROB` defines the probability of 'D'/'C' appearing in the history, causing a node going offline / online again.
+`PARTITION_PROB` defines the probability of 'D'/'C' appearing in a history, causing a node going offline / online again.
 
 The exact way in which nodes go offline is selected via `ISOLATOR`:
-
-- `network`: Default. Detach/attach the container from/to the container network. Each of the `D`/`C` commands block until a TCP probe to a numeric address confirms the network is actually dis/connected, to avoid the possibility of Sync squeezing through. A fixed IP (and MAC, where the engine supports re-pinning it) keeps the reconnect a brief *link blip* — established connections to Sync stall and resume — rather than a full network reset, where they'd die on timeout and Obsidian would take its rejoin path instead. That's a different experiment, so `make net-check` measures the assumption and every real `C` re-checks it against a 1s budget. (Ping is not used because of complexities of rootless container vs ICMP access.)
-- `sync`: Obsidian-cli `sync off` / `sync on` commands.
-
-`SCENARIO=stale` is a separate, more fixed mode: one node disconnects early and stays offline for a long (30s) window while the
-other node(s) keep editing the same note, then the stale node reconnects at the end. It mirrors the bug report of an unused device that connects after a long time offline and somehow causes a flood of conflicts.
+- `network`: Default. Detach/attach the container from/to the container network, while keeping its IP.
+- `sync`: Obsidian-cli `sync off` / `sync on` commands. Note that this is unrealistically benevolent to Obsidian!
 
 ## Outcomes
 
@@ -262,13 +176,14 @@ The result of each repetition of the history is recorded in a JSONL file under t
 | suffix | meaning |
 |---|---|
 | *(none)* | PASS |
-| `-LOST` | a token was writen but is gone |
+| `-LOST` | a token was writen but disappeared. **Data loss!** |
 | `-DUPL` | a token is duplicated |
 | `-NOUPLOAD` | a token was writen in a node but never reached the server |
 | `-OBSFAIL` | obsidian-cli reports something but the filesystem disagrees |
 | `-UNKNOWN` | some situation couldn't be recognised |
+| `-ENVFAIL` | a container took too long to reconnect |
 
-OBSFAIL and UNKNOWN mean that something is seriously wrong and needs special handling, so they are additionally logged to runs/OBSFAIL.log and runs/UNKNOWN.log, with data to reproduce the error.
+OBSFAIL, UNKNOWN and ENVFAIL mean that something is seriously wrong and needs special handling, so they are additionally logged to files in runs/{OBSFAIL, UNKNOWN, ENVFAIL}.log.
 
 `make analyze` aggregates all the runs' information into tables in `runs/analysis.md`, to ease eyeballing of failure patterns across many histories and repetitions.
 
@@ -299,14 +214,35 @@ The notes that are created by a run in Obsidian are named `bughunt/<repTs>-<lett
 is the DSL note letter the concrete note maps to. So e.g. a multi-note
 history (`NOTES>1`, `HISTORY=AaAb`) generates notes named `…-a-…`, `…-b-…`.
 
-Eery note the harness creates lives under the `bughunt/` folder, and
+Every note the harness creates lives under the `bughunt/` folder, and
 `make clean-notes`/`make clean-data` only ever delete *inside* `bughunt/`. So even if pointed at a
 real, in-use vault, the harness should keep your own notes safe.
 
 **Better make backups, though.**
 
+# Upgrading Obsidian
 
-## Parameters
+A new Obsidian version will eventually be released and you'll want to check if the bugs you found are still there.
+
+```sh
+make obsidian-latest                     # check latest GitHub .tar.gz release of Obsidian
+make obsidian-upgrade                    # update the Obsidian version number that will be used
+make containers-up                       # rebuild the image + relaunch the nodes
+make check-assumptions                   # does everything look right?
+```
+The captured login information should keep working all the same.
+
+
+# Checking the assumptions this harness rests on
+
+For our experiments to make sense, we depend on a few things to keep stable: the container engine and its networking behavior, the output format of the obsidian-cli command, etc. So there's a Makefile target to check that everything looks as expected.
+
+```sh
+make check-assumptions     # when coming back to the project after a long break, a software update, etc
+```
+
+
+# Parameters
 
 There are many ways to fine-tune how things run, though the defaults are sane. The table below shows the parameters available both at the `make` level (to be used as `VAR=value`: `make soak TURNS=paced`) and at the `npm` flag level (`npm run start -- --turns paced`).
 
@@ -317,14 +253,13 @@ There are many ways to fine-tune how things run, though the defaults are sane. T
 | `REPEAT` | `--repeat` | 10 | repeats per history |
 | `HISTORIES` | `--histories` | 1 | number of histories to run (≤0 = until killed) |
 | `DURATION_MIN` | `--duration-min` | — | run for N minutes instead of a count — **checked only between histories** |
-| `SCENARIO` | `--scenario` | `random` | `random` (generator) or `stale` (disconnect-pile-reconnect preset) |
 | `OPS` | `--ops` | `6-12` | edit-count range — counts **`A` only**; collapse may leave fewer. A single number (`9`) fixes the count (same as `9-9`) |
 | `NOTES` | `--notes` | 1 | distinct notes per history (1 = max contention) |
 | `TURNS` | `--turns` | `barrier` | cross-node coordination: `barrier` / `paced` / `concurrent` |
 | `PAUSE_PROB` | `--pause-prob` | 0 | chance of a ~10s pause after an edit |
 | `PARTITION_PROB` | `--partition-prob` | 0 | chance per edit of a `D`…`C` partition (needs 2+ total participants — numbered nodes + the local instance if `l` is in `NODES`; a single numbered node plus the local instance is enough) |
 | `ISOLATOR` | `--isolator` | `network` | `network` (partition) or `sync` (cooperative baseline) |
-| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2,l` / `obsidian-net` / `/opt/…` | container plumbing. `NODES` is only consulted when `HISTORY` is not set.  |
+| `NODES` / `NETWORK` / `OBSIDIAN_BIN` | `--nodes` / `--network` / `--bin` | `n1,n2` / `obsidian-net` / `/opt/…` | container plumbing. `NODES` is only consulted when `HISTORY` is not set.  |
 | `LOCAL_BIN` | `--local-bin` | `obsidian` | path to a **local** obsidian CLI binary, if used|
 | `LOCAL_NODE_ID` | `--local-node-id` | OS's hostname | the local instance's own Sync-reported device name, used to attribute its conflict files correctly |
 | `LOCAL_VAULT_PIN` | `--local-vault-pin` | off | Make most local-node commands explicitly target the vault captured at start. Enables GUI user to use another vault while testing is ongong.|
@@ -338,9 +273,10 @@ There are many ways to fine-tune how things run, though the defaults are sane. T
 | `RUNS_PREFIX` | `--runs-prefix` | current path | parent dir for the whole `runs/` tree |
 | `SKIP_SNAPSHOT` | `--skip-snapshot` | off | skip the whole pause-snapshot mechanism (no extra CLI calls during a `P`), in case it's suspected of perturbing timings/results |
 | `WOULD_FAIL_CHECK` | `--would-fail-check` | off | opt-in early-warning: during a `P`/`W` with every relevant node online, judge a fresh observation against the real oracle; logs `would-fail` (+ `WOULDFAIL.log`) on LOST/DUPL. Off by default — every check is a real extra CLI call against the black box under test |
+| `CONTAINER_ENGINE` | - | *auto* | `docker` if it's on `PATH`, otherwise `podman` |
+| `RECONNECT_BUDGET_MS` | `--reconnect-budget-ms` | 1000 | Containers must re-Connect in less than X ms |
 
-
-## Project Layout
+# Project Layout
 
 ```
 src/
@@ -352,7 +288,7 @@ src/
   cli-parse.ts   positively-recognized-output-only CLI parsers (cli-parse.test.ts; see docs/cli-trust.md)
   inconsistency.ts  classify + log a correctness-assumption violation (-OBSFAIL/-UNKNOWN) (inconsistency.test.ts)
   exec.ts        Local / container executors
-  engine.ts      which container engine (podman/docker) to drive, and what it can do (engine.test.ts)
+  engine.ts      which container engine (podman/docker) to drive (engine.test.ts)
   isolate.ts     fault primitives (network partition / sync toggle)
   net.ts         host-internet connectivity probe (tells a Sync stall apart from a host outage)
   types.ts       shared types (NodeId, ExecResult, token format, NOTE_DIR)
@@ -367,33 +303,33 @@ src/
 containers/      Dockerfile + entrypoint (Obsidian under Xvfb)
 scripts/
   wait-node.sh   block until a node is genuinely ready (GUI alive, then Sync CLI answering)
-  net-check.sh   verify a D/C reconnect is still a brief blip on this engine (make net-check)
+  check-net.sh   verify a D/C reconnect is still a brief blip on this engine (make check-net)
   check-assumptions.sh  the whole environment sanity pass  (make check-assumptions)
   repro-lib.sh   bash runtime sourced by every `make repro` script
 docs/
   cli-trust.md   why/how the harness never judges from CLI output it didn't positively recognize
-  DESIGN.md      architectural reasoning + dead ends (incl. why IP/MAC are pinned across reconnects)
-Makefile         container lifecycle: build -> login -> capture -> containers-up -> run
+  DESIGN.md      architectural reasoning + dead ends
+Makefile         container lifecycle and general entry points
 ```
 
 
 
-## Future work (?)
+# Future work (?)
 
 A reflection: Claude Code allows you to build ideas out very quickly. But many ideas should be discarded instead of built. Friction of idea implementation against reality used to be a good indicator of idea worth; if Claude Code removes that friction... what happens? (See `make repro` example in the blog post).
 
 So here's is a dump of ideas that may, or may not, be interesting or cool to work on.
 - Obsidian is driven through its CLI, hoping that it behaves just like it would when driven through the GUI. There's an Obsidian headless option, currently in beta, that could also be interesting to try. Maybe it'll surface bugs differently to either the Linux or Mac GUI versions.
 - Obsidian Sync's auto-merge mode is not tested yet. Conflict file mode is the official recommendation in the Obsidian forums' thread about data loss, so I thought I'd start here.
-- Outcome judgment is very lenient: as long as the input tokens are stored *somewhere* (actual note or conflict file), the result is considered OK. However, a real user surely wouldn't be happy if their inputs keep getting moved into conflict files randomly, or if conflict files are created gratuituously. So judgment should probably be made more... judgmental.
-- Both auto-merge and stricter judgment of conflict files would probably require keeping an internal model of acceptable results according to Obsidian Sync docs. That would probably be a big can of worms, given the closed-source nature of the beast.
+- Outcome judgment is very lenient towards Obsidian: as long as the input tokens are stored *somewhere* (actual note or conflict file), the result is considered OK. However, a real user surely wouldn't be happy if their inputs keep getting moved into conflict files randomly. So judgment should probably be made more... judgmental.
+- Both auto-merge and stricter judgment of conflict files would probably require keeping an internal model of acceptable results according to Obsidian Sync docs. That would probably be a big can of worms, given the closed-source nature of the beast and how little is pinned down in the docs.
 - I started this project inspired by Jepsen. Even if it's overkill for Obsidian Sync, there could be much to learn from it; plus there's a lot of other research on fuzzing a black box with semantics, surely also including internal models of legal outputs.
 - Relatedly, it'd be interesting to change the history generator so that it takes into account the failure rate of past histories to generate new ones, à la genetic algorithms. Just like AFL does.
-- It would be interesting to force network failures or slowness, once Sync is solid enough over a normal network.
-- The way in which Sync is blocked from working (network dis/connection vs obsidian-cli commands) changes the bugs found. What if we added some new interruption mechanism, like fully restarting Obsidian? (to model e.g. iOS quitting Obsidian because of memory pressure)
+- It would be interesting to force network failures or slowness, once Sync is solid enough over a well-behaved network.
+- In fact, the way in which Sync is blocked from working (network dis/connection vs obsidian-cli commands) changes the bugs found. This hints at Obsidian behaving specially on those commands. So, what if we added some new interruption mechanism, like suddenly killing Obsidian? (to model e.g. iOS quitting Obsidian because of memory pressure). Maybe some chaos / toxiproxy?
 - The code driving Obsidian Sync could be made generic to work on other sync backends. Would e.g. Obsidian-on-iCloud lose more or less data? What about Syncthing, etc?
-- In fact, the very Obsidian driver could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *lossy* it was.
-- The local node works directly on the host's own Obsidian instance, which limits what can be done with it: e.g., no network faults. It could be interesting to use `tart` to have a macOS VM and treat it as just another container.
+- In fact, the very Obsidian driver could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *data-lossy* it was.
+- The local node's purpose is to allow a Mac Obsidian client into the otherwise Linux mix. But since the local node works directly on the host's own Obsidian instance, this limits what can be done with it: e.g., no network faults (because it would also kill the containers' network). So it could be interesting to remove that local corner case and instead use `tart` to have a macOS VM, just as another ~container.
 - Another alternative would be to use macOS' `pfctl` to selectively block Obsidian Sync connections. But that gets into another can of worms with sudo, etc.
 - Conflict files are only supposed to appear in concrete Sync scenarios. The bugs found until now are pretty clearly about conflict files failing to be created by the Obsidian client. Tuning the pause lengths is an easy way to bias towards *which* client should create a conflict file. Therefore, could the pause time be enough to pinpoint a bug?
 - Looks like there's some correlation between container CPU availability and some bugs' reproducibility. Could this reduce to pause length again?
@@ -402,12 +338,10 @@ So here's is a dump of ideas that may, or may not, be interesting or cool to wor
 
 
 
-## Tooling
+# Tooling
 
-Node is pinned in `.nvmrc`, enforced by `engines` + `engine-strict`; use `npm ci`
-for lockfile-exact installs.
+Node is pinned in `.nvmrc`, enforced by `engines` + `engine-strict`; use `npm ci` for lockfile-exact installs.
 
+Podman and Docker on macOS. The images are built with a view to be easy to run on Linux and AWS-EC2, but didn't try.
 
-Podman on macOS originally; Docker on macOS since 2026-08-15, and both are supported. Built the images with a view to be easy to run in AWS-EC2, but didn't try.
-
-Developed using Claude Code, with Claude Opus 4.8 and Claude Sonnet 5, on a Claude Pro Claude subscription and no extra Claude credits.
+Developed using Claude Code, with Claude Opus 4.8 and Opus 5, on a Claude Pro Claude subscription and no extra Claude credits.
