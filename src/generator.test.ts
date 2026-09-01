@@ -125,9 +125,15 @@ test("partitions: a single numbered node + the local instance still partitions (
   assert.ok(sawPartition, "expected at least one partition with nodes:1 + localEnabled:true");
 });
 
-test("partitions: a single numbered node with NO local instance still never partitions (only one participant, nothing to stay online)", () => {
+test("partitions: a single numbered node DOES partition — editing offline then resyncing is worth sampling", () => {
+  // This used to be forbidden: a partition was gated on 2+ participants, on the reasoning that
+  // something must stay online to diverge against. But one node going offline, accumulating edits
+  // and rejoining is its own interesting case (does the upload survive?), and nothing about it
+  // needs a second participant.
+  let seen = 0;
   for (let s = 1; s <= 20; s++) {
     const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, rng: mulberry32(s) });
-    assert.ok(!h.some((o) => o.cmd === "disconnect"), `unexpected partition with only 1 participant: ${serialize(h)}`);
+    if (h.some((o) => o.cmd === "disconnect")) seen++;
   }
+  assert.ok(seen > 0, "a single node should be able to partition");
 });

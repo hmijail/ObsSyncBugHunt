@@ -121,6 +121,9 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(NOTES),--notes $(NOTES)) \
   $(if $(TURNS),--turns $(TURNS)) \
   $(if $(PAUSE_PROB),--pause-prob $(PAUSE_PROB)) \
+  $(if $(PAUSE_SEC),--pause-sec $(PAUSE_SEC)) \
+  $(if $(LONG_PAUSE_PROB),--long-pause-prob $(LONG_PAUSE_PROB)) \
+  $(if $(LONG_PAUSE_SEC),--long-pause-sec $(LONG_PAUSE_SEC)) \
   $(if $(PARTITION_PROB),--partition-prob $(PARTITION_PROB)) \
   $(if $(REPEAT),--repeat $(REPEAT)) \
   $(if $(DURATION_MIN),--duration-min $(DURATION_MIN)) \

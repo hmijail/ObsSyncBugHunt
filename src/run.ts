@@ -35,7 +35,10 @@
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
 //   --turns          barrier | paced | immediate             (default barrier)
-//   --pause-prob     chance of a ~10s pause after an edit     (default 0)
+//   --pause-prob     draw weight for a pause, vs an edit's 1   (default 0)
+//   --pause-sec      ordinary pause length                     (default 10)
+//   --long-pause-prob chance a pause is a long one instead     (default 0.15)
+//   --long-pause-sec  that long length                         (default 100)
 //   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
 //                    participants — numbered nodes + local instance if "l" is in --nodes)
 //   --repeat         reps per history                         (default 10)
@@ -152,6 +155,9 @@ const { values } = parseArgs({
     notes: { type: "string" },
     turns: { type: "string" },
     "pause-prob": { type: "string" },
+    "pause-sec": { type: "string" },
+    "long-pause-prob": { type: "string" },
+    "long-pause-sec": { type: "string" },
     "partition-prob": { type: "string" },
     generate: { type: "string" },
     "poll-sec": { type: "string" },
@@ -226,6 +232,9 @@ const genParams: GenParams = {
   notes: Number(values.notes ?? 1),
   turns,
   pauseProb: Number(values["pause-prob"] ?? 0),
+  ...(values["pause-sec"] !== undefined ? { pauseSec: Number(values["pause-sec"]) } : {}),
+  ...(values["long-pause-prob"] !== undefined ? { longPauseProb: Number(values["long-pause-prob"]) } : {}),
+  ...(values["long-pause-sec"] !== undefined ? { longPauseSec: Number(values["long-pause-sec"]) } : {}),
   partitionProb: Number(values["partition-prob"] ?? 0),
   localEnabled: localRequested,
 };
