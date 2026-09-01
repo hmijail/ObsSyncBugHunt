@@ -65,7 +65,7 @@ test("collapse: no two adjacent collapsible ops of the same kind", () => {
 
 test("FORCED_TURNS=W: a W before every cross-node edit", () => {
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: parse("W"), rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: parse("W"), partitionProb: 0, rng: mulberry32(s) });
     assert.equal(crossNodeUncoordinated(h, "wait"), 0, `should W before cross-node edits: ${serialize(h)}`);
   }
 });
@@ -121,7 +121,7 @@ test("FORCED_TURNS is emitted on the node that just edited, not the one about to
   // glance at the sync indicator a user really takes before switching devices; on the new node it
   // would be n2 reporting synced while possibly unaware n1's edit exists at all.
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [4, 8], forcedTurns: parse("W"), waitProb: 0, pauseProb: 0, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 2, ops: [4, 8], forcedTurns: parse("W"), waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s) });
     for (let i = 0; i < h.length; i++) {
       if (h[i].cmd !== "wait") continue;
       // The op right after a forced W is the selector moving to the NEW node; the W therefore ran

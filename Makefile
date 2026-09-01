@@ -68,7 +68,7 @@ SUBNET     := 10.89.0.0/24
 # switch for the local instance (DSL's `L`) — LOCAL_BIN below only supplies its binary path; add it
 # (NODES="n1 n2 l") to include it in historyless generation. container-lifecycle targets below use
 # CONTAINER_NODES (NODES minus "l") so they never try to manage it as a container.
-NODES      := n1 n2
+NODES      ?= n1 n2
 # NODES is space-separated internally (NODES_CSV below comma-joins it for the CLI flag) — but
 # `make soak NODES=n1,l` (comma-separated, matching how the CLI itself takes --nodes) is a
 # completely natural thing to type, and silently produced a single mangled word ("n1,l") that
@@ -113,6 +113,11 @@ CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 # EMPTY is meaningful: no forced hand-off at all. `$(if ...)` treats empty as unset, which would
 # silently fall back to the default W — the same silent-wrong-experiment failure that strict
 # --forced-turns validation exists to prevent — so presence is tested with `$(origin)` instead.
+ifdef RUNS_PREFIX
+$(error RUNS_PREFIX= is now RUNS_DIR=, and its meaning changed: it is the directory itself, \
+not a parent with "runs" appended. RUNS_PREFIX=/tmp/x becomes RUNS_DIR=/tmp/x/runs)
+endif
+
 ifdef TURNS
 $(error TURNS= is now FORCED_TURNS=, holding a DSL substring rather than a mode name: \
 barrier -> FORCED_TURNS=W, paced -> FORCED_TURNS=P (or P60 for a longer one), \
@@ -153,7 +158,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
   $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
   $(if $(RECONNECT_BUDGET_MS),--reconnect-budget-ms $(RECONNECT_BUDGET_MS)) \
-  $(if $(RUNS_PREFIX),--runs-prefix $(RUNS_PREFIX)) \
+  $(if $(RUNS_DIR),--runs-dir $(RUNS_DIR)) \
   $(if $(SKIP_SNAPSHOT),--skip-snapshot) \
   $(if $(WOULD_FAIL_CHECK),--would-fail-check)
 
@@ -314,9 +319,10 @@ campaign: solo-check reconnect-nodes ## Run HISTORIES histories and tally the er
 soak: solo-check reconnect-nodes ## Run until stopped (Ctrl-C); DURATION_MIN=N for a fixed span. HISTORY=<dsl> soaks that one history
 	npm run start -- --histories 0 $(RUN_FLAGS)
 
-# RUNS_PREFIX-aware path to the runs/ tree, so analyze/clean-runs/clean-data stay consistent
+# Where run results live. One variable, and its value IS the directory — it used to be RUNS_PREFIX,
+# a PARENT to which "runs" was appended, which needed a second derived variable to say one thing.
 # with wherever `make run`/`soak` (via --runs-prefix) put it.
-RUNS_DIR := $(if $(RUNS_PREFIX),$(RUNS_PREFIX)/runs,runs)
+RUNS_DIR ?= runs
 
 analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync-time distribution)
 	npm run analyze -- $(RUNS_DIR)

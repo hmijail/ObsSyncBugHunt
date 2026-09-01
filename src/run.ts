@@ -63,7 +63,7 @@
 //                    was a network reset rather than a link blip, so the histories stopped testing
 //                    what they say — see isolate.ts's reconnectBudgetMs. Raise it on a slow
 //                    machine; `make check-assumptions` measures what this machine actually does.
-//   --runs-prefix    parent dir for runs/ (default: cwd, i.e. plain ./runs)
+//   --runs-dir       where run results go               (default ./runs)
 //   --skip-snapshot  skip the whole pause-snapshot mechanism (no extra CLI calls at all during a
 //                    P) — in case it's suspected of perturbing timings/results. On by default.
 //   --would-fail-check  opt-in early-warning: during a P/W with every relevant node online, judge
@@ -175,7 +175,7 @@ const { values } = parseArgs({
     "reconnect-budget-ms": { type: "string" },
     "skip-host-check": { type: "boolean" },
     "vault-path": { type: "string" },
-    "runs-prefix": { type: "string" },
+    "runs-dir": { type: "string" },
     "skip-snapshot": { type: "boolean" },
     "would-fail-check": { type: "boolean" },
     "local-vault-pin": { type: "boolean" },
@@ -194,7 +194,22 @@ const steps = Number(values.steps ?? 0); // with --history: run only its first N
 
 // Normalize a hand-typed --history up front (before any container is touched) — both so an
 // invalid string fails fast, and because its participants (below) are derived from it.
-const parsedHistory = historyArg ? normalize(parse(historyArg)) : undefined;
+// A prefix is an ordinary history fragment, so anything the DSL accepts is allowed — normalize
+// still rejects what cannot be honoured (a D/C on the local node).
+let prefix: GenParams["prefix"];
+if (values.prefix) {
+  try {
+    prefix = parse(values.prefix);
+  } catch (e) {
+    console.error(`--prefix/PREFIX is not a valid history: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(2);
+  }
+}
+
+// The prefix applies to an EXPLICIT --history too, not only to generated ones: it is setup ("get a
+// note created and settled first"), which a hand-written history needs just as much. Ignoring it
+// here would be the silent-wrong-experiment failure — you asked to be primed and quietly were not.
+const parsedHistory = historyArg ? normalize([...(prefix ?? []), ...parse(historyArg)]) : undefined;
 
 // With --history, the DSL string itself says exactly which containers/local instance it needs
 // (see dsl.ts's requiredNodes) — --nodes/NODES is not consulted at all in this mode, so its value
@@ -227,18 +242,6 @@ const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
 // which is the one least likely to surface a bug, while the rep's record claims otherwise.
 // An EMPTY value is meaningful (no forced hand-off at all) and distinct from the flag being absent,
 // so the check is on presence, not truthiness.
-// A prefix is an ordinary history fragment, so anything the DSL accepts is allowed — normalize
-// still rejects what cannot be honoured (a D/C on the local node).
-let prefix: GenParams["prefix"];
-if (values.prefix) {
-  try {
-    prefix = parse(values.prefix);
-  } catch (e) {
-    console.error(`--prefix/PREFIX is not a valid history: ${e instanceof Error ? e.message : String(e)}`);
-    process.exit(2);
-  }
-}
-
 let forcedTurns = DEFAULT_FORCED_TURNS;
 if (values["forced-turns"] !== undefined) {
   try {
@@ -259,7 +262,7 @@ const genParams: GenParams = {
   ...(values["pause-sec"] !== undefined ? { pauseSec: Number(values["pause-sec"]) } : {}),
   ...(values["long-pause-prob"] !== undefined ? { longPauseProb: Number(values["long-pause-prob"]) } : {}),
   ...(values["long-pause-sec"] !== undefined ? { longPauseSec: Number(values["long-pause-sec"]) } : {}),
-  partitionProb: Number(values["partition-prob"] ?? 0),
+  ...(values["partition-prob"] !== undefined ? { partitionProb: Number(values["partition-prob"]) } : {}),
   localEnabled: localRequested,
 };
 
@@ -314,7 +317,9 @@ async function localVaultName(): Promise<string | undefined> {
 
 // Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
 // cwd (e.g. a bigger disk). Default (no flag) keeps today's behavior: plain "runs".
-const runsRoot = values["runs-prefix"] ? path.join(values["runs-prefix"], "runs") : "runs";
+// The value IS the directory, not a parent to append "runs" to — which is what "prefix" used to
+// mean and what made two variables necessary to say one thing.
+const runsRoot = values["runs-dir"] ?? "runs";
 
 // Vault's on-disk root in the container — enables the filesystem second-source / CLI-vs-FS
 // cross-check (see docs/cli-trust.md). Override with --vault-path if the image differs.

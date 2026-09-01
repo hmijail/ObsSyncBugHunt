@@ -73,7 +73,7 @@ export interface GenParams {
   forcedTurns?: History; // ops spliced in at a cross-node hand-off (default: a single W)
   waitProb?: number; // draw weight for a standalone `W`, relative to an append's 1 (default 0.2)
   pauseProb?: number; // draw weight for `P`, relative to an append's weight of 1 (default 0.3)
-  partitionProb?: number; // draw weight for `D` and for `C`, each relative to 1 (default 0)
+  partitionProb?: number; // draw weight for `D` and for `C`, each relative to 1 (default 0.4)
   pauseSec?: number; // ordinary pause length (default DEFAULT_PAUSE_SEC)
   longPauseProb?: number; // chance an emitted pause is a LONG one rather than pauseSec (default 0.25)
   longPauseSec?: number; // that long length (default 100)
@@ -89,6 +89,10 @@ const DEFAULT_LONG_PAUSE_SEC = 100;
  *  default run saw came from a rule that emitted one before every reconnect — so removing that rule
  *  would have left a default soak with no pauses at all, unable to reach the boundary above. */
 const DEFAULT_PAUSE_PROB = 0.3;
+/** Draw weight for `D` and for `C`. Non-zero by default because a partition is the fault this
+ *  harness exists to explore, and a default soak that never opens one is exercising the least
+ *  interesting corner of the space. */
+const DEFAULT_PARTITION_PROB = 0.4;
 /** How often a pause is a long one — CONDITIONAL on one being emitted at all, since `pauseProb`
  *  decides whether there is a pause and this only decides its length. So a quarter of the pauses in
  *  a history are long: often enough that a soak crosses the boundary regularly, rare enough that
@@ -127,8 +131,8 @@ export function generateHistory(params: GenParams): History {
   // parameters have always meant at their extremes.
   const weights: [Kind, number][] = [
     ["append", 1],
-    ["disconnect", params.partitionProb ?? 0],
-    ["connect", params.partitionProb ?? 0],
+    ["disconnect", params.partitionProb ?? DEFAULT_PARTITION_PROB],
+    ["connect", params.partitionProb ?? DEFAULT_PARTITION_PROB],
     ["pause", params.pauseProb ?? DEFAULT_PAUSE_PROB],
     ["wait", params.waitProb ?? DEFAULT_WAIT_PROB],
   ];
