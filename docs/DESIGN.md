@@ -89,6 +89,52 @@ counts toward a history's `-BAD<pct>`.
 On a genuinely slow machine, raise the bar rather than lose the signal:
 `make ... RECONNECT_BUDGET_MS=2000`.
 
+## `W` is a self-report, so where a forced turn sits decides whether it means anything
+
+`W` waits until the **active** node's own client reports `synced` — never a verified fact about the
+server or the other node. A sync can be pending with nobody able to tell; that is the whole premise
+of `docs/cli-trust.md`. Which node is active when the `W` runs therefore decides what it is worth.
+
+The generator used to force its `TURNS=barrier` wait *after* moving the cursor, producing
+`N1AaN2WAa`: n2 waits before editing. But n2 has not edited, so it has nothing pending, so its
+client reports `synced` immediately — and it can do so while entirely unaware that n1's edit exists.
+The `W` then returns as fast as the harness itself allows.
+
+Measured over 1,973 mid-history `W`s recorded in `runs/`:
+
+| | n | min | median | p90 | max |
+|---|---|---|---|---|---|
+| mid-history `W` (old placement) | 1973 | 4s | 5s | 7s | 16s |
+| final settle | 1401 | 16s | 23s | 60s | 112s |
+
+**82% of them (1630/1973) returned at 4-6s**, the mechanism's own floor. They were not waiting *for*
+anything; they were serving out the harness's quiet window. Empirically `TURNS=barrier` was
+`FORCED_TURNS=P5`. The final settle, which waits on every node for every note, is the contrast: it
+genuinely waits.
+
+This matters beyond tidiness. Soaks run under the old placement were sampling near-unpaced hand-offs
+with an incidental five-second delay, not the barrier their history strings implied — so losses found
+there came from a more aggressive regime than the `W`s suggested.
+
+Hence `FORCED_TURNS` is now emitted **before** the cursor moves, so it runs on the node that just
+edited: `N1AaWN2Aa`. That is the glance at the sync indicator a user really takes before picking up
+another device — blind spot and all, since it is still only a self-report. The blind spot is the
+point: the interesting question is not "wait until it is safe" but "wait until Obsidian says it is
+safe", and the gap between those is where the bug lives.
+
+### The ~4s floor is the harness's paranoia, not a user model
+
+It is tempting to read that floor as simulating a user studying the sync icon. It is not. It comes
+from `wSettleSec` (default 4), the window `waitForSynced` requires the observed state to hold
+*unchanged* before believing it — because a single `synced` reading can be transient, and sampling
+mid-flux is how the harness would fabricate verdicts. `minFloorSec` (default 3) sits underneath it
+for the same kind of reason.
+
+Both are knobs (`--w-settle-sec`, `--min-floor-sec`), so a more aggressive experiment is available —
+but lowering only `wSettleSec` gets you to 3s, not 0, since the floor then dominates. Lowering both
+buys speed by trusting a single sample, which is the one thing this codebase consistently refuses to
+do. Worth knowing the lever exists; not worth pulling by default.
+
 ## The local node (`L`): a grammar token, not a parallel code path
 
 Adding a real Obsidian instance running directly on the host as a harness participant could have
