@@ -80,9 +80,23 @@ test("paced turns: a P (not W) before every cross-node edit", () => {
 
 test("immediate turns: no coordination at all", () => {
   for (let s = 1; s <= 10; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "immediate", rng: mulberry32(s) });
+    // pauseProb 0 so the ONLY thing that could emit a P is coordination — pauses are otherwise
+    // drawn on their own now, and a P from that draw would say nothing about `turns`.
+    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "immediate", pauseProb: 0, rng: mulberry32(s) });
     assert.ok(!h.some((o) => o.cmd === "wait" || o.cmd === "pause"), `immediate inserts no W/P: ${serialize(h)}`);
   }
+});
+
+test("pauses are on by default, so a default soak can reach a long offline window", () => {
+  // Regression guard for the reason PAUSE_PROB stopped defaulting to 0: with no pauses at all, the
+  // long-pause draw is unreachable and the generator cannot cross the ~60s boundary where Obsidian
+  // writes a conflict file instead of losing the edit.
+  let withPause = 0;
+  for (let s = 1; s <= 40; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 10], rng: mulberry32(s) });
+    if (h.some((o) => o.cmd === "pause")) withPause++;
+  }
+  assert.ok(withPause > 20, `expected most default histories to contain a pause, got ${withPause}/40`);
 });
 
 test("partitions: D/C balanced, healed by the end, and can overlap (all-offline)", () => {

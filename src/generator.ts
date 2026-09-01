@@ -38,10 +38,10 @@ export interface GenParams {
   ops: [number, number]; // inclusive range for the number of EDITS (counts `A` only)
   notes?: number; // distinct notes (default 1 = max contention)
   turns?: Turns; // cross-node coordination (default "barrier")
-  pauseProb?: number; // draw weight for `P`, relative to an append's weight of 1 (default 0)
+  pauseProb?: number; // draw weight for `P`, relative to an append's weight of 1 (default 0.3)
   partitionProb?: number; // draw weight for `D` and for `C`, each relative to 1 (default 0)
   pauseSec?: number; // ordinary pause length (default DEFAULT_PAUSE_SEC)
-  longPauseProb?: number; // chance a pause is a LONG one instead (default 0.15)
+  longPauseProb?: number; // chance a pause is a LONG one instead (default: a quarter of pauseProb's)
   longPauseSec?: number; // that long length (default 100)
   localEnabled?: boolean; // include the local instance (L) as an edit target; NEVER a D/C target
   rng?: () => number; // default Math.random; injectable for tests
@@ -51,10 +51,13 @@ export interface GenParams {
  *  conflict file rather than silently dropping the edit. Below it, the loss is ~90-100% reproducible;
  *  above it, zero. A generator that cannot reach both sides cannot find the boundary. */
 const DEFAULT_LONG_PAUSE_SEC = 100;
-/** How often a pause is a long one. The one number here chosen by judgement rather than measurement:
- *  high enough that a soak reaches the far side of that boundary regularly, low enough that most
- *  histories stay quick. */
-const DEFAULT_LONG_PAUSE_PROB = 0.15;
+/** Pauses are on by default. They used to be off (`PAUSE_PROB` defaulted to 0) and the only pauses a
+ *  default run saw came from a rule that emitted one before every reconnect — so removing that rule
+ *  would have left a default soak with no pauses at all, unable to reach the boundary above. */
+const DEFAULT_PAUSE_PROB = 0.3;
+/** How often a pause is a long one, given that one is emitted. A quarter of the pause weight: often
+ *  enough that a soak crosses the boundary regularly, rare enough that most histories stay quick. */
+const DEFAULT_LONG_PAUSE_PROB = DEFAULT_PAUSE_PROB / 4;
 
 function randInt(rng: () => number, min: number, max: number): number {
   return min + Math.floor(rng() * (max - min + 1));
@@ -85,7 +88,7 @@ export function generateHistory(params: GenParams): History {
     ["append", 1],
     ["disconnect", params.partitionProb ?? 0],
     ["connect", params.partitionProb ?? 0],
-    ["pause", params.pauseProb ?? 0],
+    ["pause", params.pauseProb ?? DEFAULT_PAUSE_PROB],
   ];
   const total = weights.reduce((s, [, w]) => s + w, 0);
   const drawKind = (): Kind => {

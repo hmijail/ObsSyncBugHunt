@@ -35,9 +35,9 @@
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
 //   --turns          barrier | paced | immediate             (default barrier)
-//   --pause-prob     draw weight for a pause, vs an edit's 1   (default 0)
+//   --pause-prob     draw weight for a pause, vs an edit's 1   (default 0.3)
 //   --pause-sec      ordinary pause length                     (default 10)
-//   --long-pause-prob chance a pause is a long one instead     (default 0.15)
+//   --long-pause-prob chance a pause is a long one instead     (default 0.075)
 //   --long-pause-sec  that long length                         (default 100)
 //   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
 //                    participants — numbered nodes + local instance if "l" is in --nodes)
@@ -231,7 +231,7 @@ const genParams: GenParams = {
   ops,
   notes: Number(values.notes ?? 1),
   turns,
-  pauseProb: Number(values["pause-prob"] ?? 0),
+  ...(values["pause-prob"] !== undefined ? { pauseProb: Number(values["pause-prob"]) } : {}),
   ...(values["pause-sec"] !== undefined ? { pauseSec: Number(values["pause-sec"]) } : {}),
   ...(values["long-pause-prob"] !== undefined ? { longPauseProb: Number(values["long-pause-prob"]) } : {}),
   ...(values["long-pause-sec"] !== undefined ? { longPauseSec: Number(values["long-pause-sec"]) } : {}),
