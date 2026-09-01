@@ -34,8 +34,12 @@ export type History = Op[];
 
 export const DEFAULT_PAUSE_SEC = 10;
 
-// The ops a pause is "noticeable" next to (and the ones a node-set exists to serve).
-const ACTIONS = new Set<Cmd>(["disconnect", "connect", "append"]);
+// The ops a pause is "noticeable" next to, i.e. the ones that ANCHOR it rather than let it float.
+// `wait` belongs here even though it changes no state: it consumes real time and does something, so
+// a pause written beside one was put there on purpose. Leaving it out let a pause cross to the far
+// side of a W — `N1AaN2P30WAb` became `N1AaN2WP30Ab`, turning "pause 30s, THEN check sync, then
+// edit" into "check sync, THEN pause 30s, then edit". Two different experiments, silently swapped.
+const ACTIONS = new Set<Cmd>(["disconnect", "connect", "append", "wait"]);
 const isAction = (op: Op | undefined) => op != null && ACTIONS.has(op.cmd);
 
 /** Parse a history string into ops. Whitespace is ignored (for readability). */

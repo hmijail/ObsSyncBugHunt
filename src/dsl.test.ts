@@ -125,6 +125,15 @@ test("normalize: faults that genuinely change state survive, interleaved across 
   assert.equal(norm("N1DAaN2CAaN1C"), "N1DAaN2AaN1C"); // only n2's C is bogus
 });
 
+test("normalize: a pause never crosses to the other side of a W", () => {
+  // A W changes no state but consumes real time and does something, so a pause written beside one
+  // was put there deliberately. Treating it as non-anchoring let the pause float PAST it:
+  // `N1AaN2P30WAb` became `N1AaN2WP30Ab`, turning "pause 30s, then check sync, then edit" into
+  // "check sync, then pause 30s, then edit" — two different experiments, silently swapped.
+  assert.equal(norm("N1AaN2P30WAb"), "N1AaN2P30WAb");
+  assert.equal(norm("N1AaWP30N2Ab"), "N1AaWP30N2Ab");
+});
+
 test("normalize: a W on an offline node is dropped — waiting there cannot make progress", () => {
   assert.equal(norm("N1AaDW"), "N1AaD");
 });
