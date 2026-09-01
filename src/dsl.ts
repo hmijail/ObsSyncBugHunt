@@ -203,8 +203,8 @@ function collapseAdjacent(h: History): History {
   return out;
 }
 
-/** Drop `D`/`C` that cannot do anything, by tracking which nodes are actually offline as the
- *  history runs. `collapseAdjacent` already removes ADJACENT duplicates (`DD`, `CC`), but a
+/** Drop ops that cannot do anything, by tracking as the history runs which nodes are offline,
+ *  whether anything has been appended, and whether anything at all has happened yet. `collapseAdjacent` already removes ADJACENT duplicates (`DD`, `CC`), but a
  *  redundant fault separated by other ops — or aimed at a node that was never disconnected —
  *  survived it: `N1DAaWN2AaC` "reconnects" n2, which had been online the whole time.
  *
@@ -220,19 +220,36 @@ function collapseAdjacent(h: History): History {
  *  happily. With no-ops gone, every surviving D/C is meaningful, so that strictness becomes a
  *  genuine signal instead of a false alarm.
  *
- *  The local node is deliberately left ALONE: it can never go offline, so every `D`/`C` aimed at
- *  it would look like a no-op here, and silently dropping them would rob
- *  assertLocalAlwaysConnected of the very ops it exists to reject. */
-function dropNoopFaults(h: History): History {
+ *  The local node's `D`/`C` are deliberately left ALONE. It can never go offline, so they would
+ *  all look inert here — but they are not merely wasteful, they are UNSATISFIABLE: the local node
+ *  is the host's own Obsidian, and disconnecting it would take the containers' bridge and the
+ *  harness's own connectivity with it. Rewriting is only ever right when it preserves behaviour;
+ *  a request that cannot be honoured must be refused instead, which is assertLocalAlwaysConnected's
+ *  job. Dropping them here would rob it of the very ops it exists to reject. */
+function dropInertOps(h: History): History {
   const out: History = [];
   let active: number | "local" = 1; // implicit starting cursor, same convention as requiredNodes
   const offline = new Set<number>();
+  let appended = false; // an A has happened, so a W has something to wait on
+  let acted = false;    // a D/C/A has happened, so the vault is no longer merely idle
   for (const op of h) {
     if (op.cmd === "node") {
       assert(op.node !== undefined, "'node' op must carry a node field");
       active = op.node;
     } else if (op.cmd === "local") {
       active = "local";
+    } else if (op.cmd === "pause") {
+      // A pause before anything has happened cannot do anything: run.ts's preflight requires every
+      // node reachable and `synced` before a rep starts, so there is nothing in flight for it to
+      // let settle — it only postpones an already-quiescent state. AFTER the first action it is
+      // load-bearing (it is what extends an offline window), so only the leading ones go.
+      if (!acted) continue;
+    } else if (op.cmd === "wait") {
+      // Both cases mirror execute.ts's own op loop: with nothing appended there is no note to wait
+      // on (`if (!activeNote) break;`), and on an offline node waiting cannot make progress (it
+      // logs `wait-skip` and breaks).
+      if (!appended) continue;
+      if (active !== "local" && offline.has(active)) continue;
     } else if (active !== "local" && (op.cmd === "disconnect" || op.cmd === "connect")) {
       const isOffline = offline.has(active);
       if (op.cmd === "disconnect") {
@@ -243,6 +260,8 @@ function dropNoopFaults(h: History): History {
         offline.delete(active);
       }
     }
+    if (op.cmd === "append") appended = true;
+    if (op.cmd === "append" || op.cmd === "disconnect" || op.cmd === "connect") acted = true;
     out.push({ ...op });
   }
   return out;
@@ -250,9 +269,9 @@ function dropNoopFaults(h: History): History {
 
 /** Canonicalize a history so the printed/serialized form is exactly what executes. */
 export function normalize(h: History): History {
-  // dropNoopFaults runs BEFORE dropRedundantNodes so a selector left pointing at nothing by a
-  // removed fault (`N1DAaN2C` -> `N1DAaN2` -> `N1DAa`) is cleaned up in the same pass.
-  const result = collapseAdjacent(dropRedundantNodes(dropNoopFaults(floatPauses(h))));
+  // dropInertOps runs BEFORE dropRedundantNodes so a selector left pointing at nothing by a
+  // removed op (`N1DAaN2C` -> `N1DAaN2` -> `N1DAa`) is cleaned up in the same pass.
+  const result = collapseAdjacent(dropRedundantNodes(dropInertOps(floatPauses(h))));
   assertLocalAlwaysConnected(result);
   return result;
 }

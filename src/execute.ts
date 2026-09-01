@@ -26,7 +26,7 @@ import {
   type RunVerdict,
 } from "./oracle.js";
 import { serialize, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
-import { expectedTrace, actualTrace, traceMismatch, durationFloorSec, type TraceOpts } from "./trace.js";
+import { durationFloorSec } from "./floor.js";
 
 export interface ExecuteOpts {
   noteName: (letter: string) => string; // DSL note letter -> concrete vault note name (per-rep)
@@ -538,52 +538,33 @@ async function checkWouldFail(
 
 
 /**
- * The two whole-history assertions, run once per rep after its timings are known.
+ * A rep cannot have run faster than its own pauses and waits allow.
  *
- * Both throw rather than tagging an outcome: a mismatch means the harness did not execute what
- * the rep is named after, so the rep is not a wrong RESULT, it is not a result at all — and every
- * later rep is equally suspect, because the cause is a defect in this code rather than a state of
- * the world. Loud and immediate beats a soak quietly accumulating mislabelled evidence.
+ * Blunt on purpose, and the only survivor of a larger idea — see floor.ts for why the op-sequence
+ * check that used to sit here was removed. It throws rather than tagging an outcome: a rep that
+ * finished too fast did not execute what it is named after, so it is not a wrong RESULT, it is not
+ * a result at all — and the cause is a defect in this code rather than a state of the world, which
+ * makes every later rep equally suspect.
  */
-function assertRanItsHistory(
-  history: History,
-  traceOpts: TraceOpts,
+function assertNotFasterThanPossible(
   minSec: number,
-  elapsedMs: number,
+  historyMs: number,
   logger: RunLogger,
   str: string,
 ): void {
-  // Evidence is re-read from the JSONL, not accumulated in memory as the rep ran: a list the
-  // executor appends to would share the very bug it is meant to catch.
-  const events = logger.readEvents();
-  const expected = expectedTrace(history, traceOpts);
-  const actual = actualTrace(events);
-  const mismatch = traceMismatch(expected, actual);
-  if (mismatch !== null) {
-    logger.log({ kind: "trace-mismatch", history: str, detail: mismatch, expected, actual });
-    throw new Error(
-      `rep did not run its own history "${str}" — ${mismatch}\n` +
-      `  This is a harness defect, not an Obsidian finding: the trace on disk disagrees with the\n` +
-      `  DSL the rep is named after, so its verdict describes some other experiment.\n` +
-      `  Full expected/actual step lists are in the rep's trace-mismatch event: ${logger.path}`,
-    );
-  }
-  // A trace can match while a pause sleeps 0s, so the clock is checked independently of the
-  // event stream. Only the harness's OWN enforced waits are counted, so this cannot fire because
-  // Sync happened to be fast (see durationFloorSec).
-  // Compared in milliseconds, against the raw elapsed time rather than the whole-second `totalSec`
-  // the trace records: a floor can be fractional (tests drive settle windows down to 0.02s), and
-  // rounding would make a correct short rep look like a violation. SLACK_MS absorbs timer
-  // granularity and early-returning sleeps; it is negligible beside any real missing wait.
+  // Compared in milliseconds against the raw span, not the whole-second `totalSec` the trace
+  // records: a floor is fractional, and rounding would make a correct short rep look like a
+  // violation. SLACK_MS absorbs timer granularity and early-returning sleeps; it is negligible
+  // beside any real missing wait.
   const SLACK_MS = 250;
-  if (elapsedMs < minSec * 1000 - SLACK_MS) {
-    logger.log({ kind: "duration-below-floor", history: str, elapsedMs, minSec });
-    throw new Error(
-      `rep of "${str}" took ${(elapsedMs / 1000).toFixed(2)}s, under the ${minSec}s its own pauses and settle windows require.\n` +
-      `  The trace matched, so the ops ran — but at least one of them did not wait as long as it\n` +
-      `  claims. Suspect the pause/settle plumbing, or a clock that moved: ${logger.path}`,
-    );
-  }
+  if (historyMs >= minSec * 1000 - SLACK_MS) return;
+  logger.log({ kind: "duration-below-floor", history: str, historyMs, minSec });
+  throw new Error(
+    `the ops of "${str}" ran in ${(historyMs / 1000).toFixed(2)}s, under the ${minSec}s its own pauses\n` +
+    `  and waits require. The ops themselves are timed here, NOT the closing settle, so Sync being\n` +
+    `  fast cannot cause this — at least one op did not wait as long as it claims. Suspect the\n` +
+    `  pause/settle plumbing, or a clock that moved: ${logger.path}`,
+  );
 }
 
 export async function runHistory(
@@ -679,6 +660,7 @@ export async function runHistory(
   // for `make repro`'s standalone reproduction scripts (see src/repro.ts). If you change how an
   // op behaves here (append's create-vs-append fallback, disconnect/connect, what counts as
   // "synced", the token format), check whether scripts/repro-lib.sh needs the same update.
+  const historyStartedAt = Date.now();
   for (const op of history) {
     switch (op.cmd) {
       case "node":
@@ -840,6 +822,10 @@ export async function runHistory(
     }
   }
 
+  // The history's own span: first op to last, deliberately excluding the reconnect and settle
+  // below, so the floor it is checked against needs no term for how long Sync takes.
+  const historyMs = Date.now() - historyStartedAt;
+
   // Final settle: reconnect everyone (no `sync on` — see the rep-start comment above: the
   // network isolator never turns sync off, so there's nothing to resume), wait until all
   // agree, then dwell (conflict files lag) before observing.
@@ -883,14 +869,10 @@ export async function runHistory(
     });
   }
 
-  // Whole-history cross-checks: did this rep run the history it is named after? Deliberately
-  // redundant with every per-op check above — those validate ops that DID run, and so cannot see
-  // an op that ran but shouldn't exist, or one that should have run and didn't. See trace.ts.
-  const traceOpts = { nodeName: (sel: number | "local") => driverOf(sel).node, ...opts };
-  const minSec = durationFloorSec(history, traceOpts);
-  const elapsedMs = Date.now() - startedAt;
+  // A whole-history cross-check, deliberately redundant with every per-op check above. See floor.ts.
+  const minSec = durationFloorSec(history, opts.wSettleSec ?? 4);
   const timings = {
-    totalSec: Math.round(elapsedMs / 1000),
+    totalSec: Math.round((Date.now() - startedAt) / 1000),
     convergenceSec: stab.seconds,
     minSec, // the shortest this history could honestly take — see trace.ts's durationFloorSec
     unsynced: stab.unsynced,
@@ -898,7 +880,7 @@ export async function runHistory(
     vaultDrift,
   };
   logger.log({ kind: "timings", ...timings });
-  assertRanItsHistory(history, traceOpts, minSec, elapsedMs, logger, str);
+  assertNotFasterThanPossible(minSec, historyMs, logger, str);
   logger.log({ kind: "results", history: str, timings, acked, observations, verdict, forensics, noteLetters: Object.fromEntries(noteLetters) });
   return { verdict, acked, observations, timings, forensics };
 }

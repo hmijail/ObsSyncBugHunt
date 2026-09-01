@@ -13,11 +13,10 @@ import type { RunLogger } from "./history.js";
 import type { Executor } from "./exec.js";
 import type { ExecResult } from "./types.js";
 
-/** A RunLogger stub that keeps its events in memory. runHistory re-reads its own trace to confirm
- *  the rep actually ran the history it was given (see trace.ts), so every stub must be able to
- *  answer `readEvents` — tests that don't inspect the log just let the array go unread. */
+/** A RunLogger stub that keeps its events in memory — tests that don't inspect the log just let the
+ *  array go unread. */
 const stubLogger = (events: Record<string, unknown>[] = []) =>
-  ({ log: (e: Record<string, unknown>) => events.push(e), readEvents: () => events }) as unknown as RunLogger;
+  ({ log: (e: Record<string, unknown>) => events.push(e) }) as unknown as RunLogger;
 
 // Stub that answers `files folder=…` (CLI listing) and `ls -1 …` (FS listing) from canned
 // strings, so we can drive the CLI-vs-FS cross-check without a live node.

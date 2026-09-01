@@ -56,12 +56,13 @@ test("rejects malformed strings", () => {
 const norm = (s: string) => serialize(normalize(parse(s)));
 
 test("normalize: a floating pause moves to the next action; the emptied node section vanishes", () => {
-  assert.equal(norm("N1PN2Aa"), "N2PAa"); // P not adjacent to an action → floats before Aa; N1 drops
+  // An action must precede the P, or dropInertOps removes it as a leading pause (see below).
+  assert.equal(norm("N1AaN2PN1Ab"), "N1AaPAb"); // P sits between selectors → floats before Ab; both vanish
 });
 
 test("normalize: a pause adjacent to an action stays put", () => {
   assert.equal(norm("N1DPN2Aa"), "N1DPN2Aa"); // P right after D (an action) is anchored
-  assert.equal(norm("N1PAa"), "N1PAa"); // P right before A (an action) is anchored
+  assert.equal(norm("N1AaPN2Ab"), "N1AaPN2Ab"); // P right after A (an action) is anchored
 });
 
 test("normalize: a floating pause with no following action is dropped", () => {
@@ -69,7 +70,7 @@ test("normalize: a floating pause with no following action is dropped", () => {
 });
 
 test("normalize: floated pauses sum and redundant nodes collapse", () => {
-  assert.equal(norm("N1PPN2Aa"), "N2P20Aa");
+  assert.equal(norm("N1AaN2PPN1Ab"), "N1AaP20Ab");
 });
 
 test("normalize: adjacent same-note appends collapse; different notes don't", () => {
@@ -98,7 +99,9 @@ test("normalize: L collapses redundantly just like N does", () => {
 // isolators, so this only makes the string say what runs; it also stops `make repro` from
 // aborting on an engine command that was never going to do anything.
 test("normalize: a C on a node that was never disconnected is dropped", () => {
-  assert.equal(norm("N1DAaWN2AaC"), "N1DAaWN2Aa"); // the C targets n2, which stayed online
+  assert.equal(norm("N1AaWN2AaC"), "N1AaWN2Aa"); // the C targets n2, which stayed online
+  // Both rules fire here: the C is inert AND the W sits on n1, which this history disconnected.
+  assert.equal(norm("N1DAaWN2AaC"), "N1DAaN2Aa");
   assert.equal(norm("N1CAa"), "N1Aa");             // a C with no D anywhere
 });
 
@@ -122,6 +125,28 @@ test("normalize: faults that genuinely change state survive, interleaved across 
   assert.equal(norm("N1DAaN2CAaN1C"), "N1DAaN2AaN1C"); // only n2's C is bogus
 });
 
+test("normalize: a W on an offline node is dropped — waiting there cannot make progress", () => {
+  assert.equal(norm("N1AaDW"), "N1AaD");
+});
+
+test("normalize: a W before any append is dropped — there is no note to wait on yet", () => {
+  assert.equal(norm("N1WAa"), "N1Aa");
+});
+
+test("normalize: a pause before the FIRST action is dropped, but one after it survives", () => {
+  // Before anything happens every node is reachable and `synced` (run.ts's preflight guarantees
+  // it), so a pause only postpones an idle state. After an action it is load-bearing — this is
+  // exactly the pause that extends an offline window.
+  assert.equal(norm("P60N1Aa"), "N1Aa");
+  assert.equal(norm("N1P60DAa"), "N1DAa");
+  assert.equal(norm("N1DP60Aa"), "N1DP60Aa");
+});
+
+test("normalize: dropping an inert op lets collapseAdjacent merge what it left adjacent", () => {
+  // The W goes because n1 is offline, which puts the two appends next to each other.
+  assert.equal(norm("N1AaDWAa"), "N1AaDAa");
+});
+
 test("normalize: D/C while the local instance is active is rejected — it must always stay connected", () => {
   assert.throws(() => normalize(parse("LD")), /local node.*always-connected/);
   assert.throws(() => normalize(parse("LC")), /local node.*always-connected/);
@@ -130,7 +155,10 @@ test("normalize: D/C while the local instance is active is rejected — it must 
 
 test("normalize: D/C on a numbered node is unaffected by the local-instance safety check", () => {
   assert.equal(norm("N1DC"), "N1DC");
-  assert.equal(norm("N1DCLW"), "N1DCLW"); // disconnecting N1, THEN selecting the local instance, is fine
+  // The trailing W goes (nothing appended yet, so no note to wait on), taking the now-unused L
+  // with it — but the point stands: a D/C on a NUMBERED node followed by selecting L is accepted.
+  assert.equal(norm("N1DCLW"), "N1DC");
+  assert.equal(norm("N1DCLAa"), "N1DCLAa"); // and L may edit freely once selected
 });
 
 test("usesLocal: true iff the history ever selects the local instance", () => {
