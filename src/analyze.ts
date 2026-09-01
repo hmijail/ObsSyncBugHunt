@@ -7,9 +7,9 @@
 // buildStateCells), grouped first by outcome (PASS/LOST/DUPL/...). Groups are per history
 // string only, NEVER merged across different histories — note letters/tokens from
 // unrelated DSL structures aren't comparable. A history that's all-PASS and landed in the
-// exact same state every rep has nothing to dig into, so it's pulled out of the per-history
-// sections entirely and listed, one row per history with its rep count and its own
-// convergence-time stats, in a trailing `# No data loss` table instead. History sections
+// exact same state every rep has nothing to dig into, so it renders SHORT in place — heading and
+// one-line stats, no state table — and is additionally listed, one row per history with its rep
+// count and its own convergence-time stats, in a trailing `# No data loss` table. History sections
 // render at `#`; their category tables at `##`. Both the per-history sections and that
 // table are ordered newest-first (history dirnames are `DDTHHMMSS-<dsl>`
 // prefixed, so plain descending string comparison is chronological). Every timing stat uses
@@ -233,6 +233,14 @@ export function renderCategoryTable(category: string, byState: Map<string, State
   return [`## ${category}`, "", headerRow, sepRow, ...rows, ""].join("\n");
 }
 
+/** A clean history in its chronological place: heading and one-line stats, nothing else. Every rep
+ *  landed in the same state, so a state table would be one row repeated — but omitting the history
+ *  entirely (as this used to) meant reading the file in time order silently skipped it. The
+ *  trailing "No data loss" table still gathers them for side-by-side scanning. */
+export function renderBrief(str: string, g: Group): string {
+  return [`# ${str}`, line(g), ""].join("\n");
+}
+
 export function renderGroup(str: string, g: Group): string {
   const sections = [`# ${str}`, line(g), ""];
   for (const category of CATEGORY_ORDER) {
@@ -326,11 +334,12 @@ export function main(base: string): void {
   // even convergence-time stats) across unrelated histories would be exactly the "collapsing
   // across different histories" mistake — this sort only reorders whole groups, never merges them.
   const active = [...groups.entries()].filter(([, g]) => g.reps > 0 || g.envfail > 0).sort(([a], [b]) => b.localeCompare(a));
-  const interesting = active.filter(([, g]) => !isUninteresting(g));
   const uninteresting = active.filter(([, g]) => isUninteresting(g));
 
   const totalReps = [...groups.values()].reduce((s, g) => s + g.reps, 0);
-  const sections = interesting.map(([str, g]) => renderGroup(str, g));
+  // Every history appears in chronological order; the clean ones just render short. They are ALSO
+  // summarised together in the trailing table.
+  const sections = active.map(([str, g]) => (isUninteresting(g) ? renderBrief(str, g) : renderGroup(str, g)));
   if (uninteresting.length > 0) sections.push(renderNoDataLoss(uninteresting));
   const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");
