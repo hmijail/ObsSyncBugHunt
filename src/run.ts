@@ -37,7 +37,7 @@
 //   --turns          barrier | paced | immediate             (default barrier)
 //   --pause-prob     draw weight for a pause, vs an edit's 1   (default 0.3)
 //   --pause-sec      ordinary pause length                     (default 10)
-//   --long-pause-prob chance a pause is a long one instead     (default 0.075)
+//   --long-pause-prob chance an emitted pause is a long one    (default 0.25)
 //   --long-pause-sec  that long length                         (default 100)
 //   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
 //                    participants — numbered nodes + local instance if "l" is in --nodes)

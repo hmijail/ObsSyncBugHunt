@@ -41,7 +41,7 @@ export interface GenParams {
   pauseProb?: number; // draw weight for `P`, relative to an append's weight of 1 (default 0.3)
   partitionProb?: number; // draw weight for `D` and for `C`, each relative to 1 (default 0)
   pauseSec?: number; // ordinary pause length (default DEFAULT_PAUSE_SEC)
-  longPauseProb?: number; // chance a pause is a LONG one instead (default: a quarter of pauseProb's)
+  longPauseProb?: number; // chance an emitted pause is a LONG one rather than pauseSec (default 0.25)
   longPauseSec?: number; // that long length (default 100)
   localEnabled?: boolean; // include the local instance (L) as an edit target; NEVER a D/C target
   rng?: () => number; // default Math.random; injectable for tests
@@ -55,9 +55,11 @@ const DEFAULT_LONG_PAUSE_SEC = 100;
  *  default run saw came from a rule that emitted one before every reconnect — so removing that rule
  *  would have left a default soak with no pauses at all, unable to reach the boundary above. */
 const DEFAULT_PAUSE_PROB = 0.3;
-/** How often a pause is a long one, given that one is emitted. A quarter of the pause weight: often
- *  enough that a soak crosses the boundary regularly, rare enough that most histories stay quick. */
-const DEFAULT_LONG_PAUSE_PROB = DEFAULT_PAUSE_PROB / 4;
+/** How often a pause is a long one — CONDITIONAL on one being emitted at all, since `pauseProb`
+ *  decides whether there is a pause and this only decides its length. So a quarter of the pauses in
+ *  a history are long: often enough that a soak crosses the boundary regularly, rare enough that
+ *  most histories stay quick. */
+const DEFAULT_LONG_PAUSE_PROB = 0.25;
 
 function randInt(rng: () => number, min: number, max: number): number {
   return min + Math.floor(rng() * (max - min + 1));
