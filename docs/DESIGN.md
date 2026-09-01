@@ -161,19 +161,33 @@ What it does support is what it is already used for: `total < 1` means a note ne
 server at all, which is `-NOUPLOAD`. That remains a hidden signal reaching a verdict, deliberately —
 it catches a note living on exactly one device, a durability failure the user cannot see.
 
-### Two claims in the code that this did not reproduce
+### The long blocks are real — but the code names the wrong cause
 
-`execute.ts` justifies reading the baseline lazily because `sync:history total` "blocks until the
-queried node has caught up", and `driver.ts` bounds each attempt because such reads "can themselves
-silently block for a long time". Neither reproduced here: **every** call returned in 150-195ms,
-including the first one on a just-reconnected node with a pending version — the exact scenario the
-comment describes.
+`execute.ts` reads the baseline lazily because `sync:history total` "blocks until the queried node
+has **caught up**", and `driver.ts` bounds each attempt against reads that "can silently block for a
+long time". The blocking is real. The stated cause is not.
 
-That is not a refutation. The backlog here was one version after a three-second partition, while the
-comment cites ~70s stalls, so the conditions plausibly differ. But it does mean the lazy-baseline
-gymnastics in `waitForSynced` rest on an unverified premise, and the probe exists to re-check it
-cheaply — after an Obsidian upgrade, or before anyone simplifies that code on the assumption the
-blocking is real.
+A node that is merely behind answers fine: every call in steps 1-6 returned in 150-200ms, including
+the first on a just-reconnected node with a version still pending. What actually blocks is a node
+with **no network at all** (probe step 7):
+
+    n2 disconnected
+    attempts 1-8   5.0s each, killed at the per-attempt cap   <- 40s of genuine blocking
+    attempt  9     4.0s, "Failed to retrieve sync history: Cannot read properties of null (reading 'send')"
+    attempts 10-15 ~0.1s each, "Error: Sync is in error state. Check sync settings."
+    total wall time 75.3s
+
+So the client hangs while it still believes it can reach the server, throws an internal error as it
+gives up, and only then starts answering promptly with a recognizable refusal.
+
+The lazy baseline therefore protects correctly, but by accident: it is gated on `everySynced`, and a
+disconnected node cannot report `synced` — not because "synced" implies caught up, but because it
+implies *has a network*. Worth knowing before anyone simplifies that gate away on the grounds that
+catching up is fast. It is; being offline is not.
+
+It also explains the shape of the defences: `RECOGNIZE_CALL_TIMEOUT_MS` turns those 5s hangs into a
+visible retry sequence instead of one silent 40s stall, which is exactly what the retry log above
+shows.
 
 ## The local node (`L`): a grammar token, not a parallel code path
 

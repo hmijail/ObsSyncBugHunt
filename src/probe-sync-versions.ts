@@ -22,6 +22,8 @@ import { parseArgs } from "node:util";
 import { ContainerExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
 import { readCanonical } from "./runner.js";
+import { engineBin } from "./engine.js";
+import { runProcess } from "./exec.js";
 import { NOTE_DIR } from "./types.js";
 
 const { values } = parseArgs({ options: { nodes: { type: "string" }, bin: { type: "string" } } });
@@ -43,6 +45,8 @@ const say = (s: string) => console.log(`  ${s}`);
 
 const note = `${NOTE_DIR}/probe-${Date.now().toString(36)}`;
 const TOKEN = "(probe-token)";
+
+const engine = engineBin();
 
 async function main(): Promise<void> {
   console.log(`probe-sync-versions: note=${note} nodes=${names.join(",")}\n`);
@@ -103,8 +107,6 @@ async function main(): Promise<void> {
   // cannot test that. Do it directly: take n2 offline, let n1 write while it is away, bring it back
   // and time the very first `total` against the first content read.
   console.log("\n6. after a real partition — the case the `blocks until caught up` comment describes");
-  const engine = (await import("./engine.js")).engineBin();
-  const { runProcess } = await import("./exec.js");
   await runProcess(engine, ["network", "disconnect", "obsidian-net", names[1]]);
   say(`${stamp()} n2 disconnected`);
   await n1.appendLine(note, "(offline-token)");
@@ -121,10 +123,40 @@ async function main(): Promise<void> {
     await new Promise((r) => setTimeout(r, 1000));
   }
 
+  // --- 7. sync:* calls while the node is OFFLINE ---------------------------------------------
+  // The long blocks this code defends against were real once. If they are gone in the current
+  // Obsidian, the likeliest surviving cause is asking a Sync question with no network at all — the
+  // client cannot reach the server and may sit there rather than answer. Timed here, because
+  // "answers in 200ms" and "answers after a 100s bounded-retry sequence" are the same code path
+  // from the caller's side and only the clock tells them apart.
+  console.log("\n7. sync:* while the node is DISCONNECTED (a likelier cause of the historical stalls)");
+  await runProcess(engine, ["network", "disconnect", "obsidian-net", names[1]]);
+  say(`${stamp()} n2 disconnected`);
+  try {
+    // Both calls are expected to END in unrecognized output — that IS the result. What matters is
+    // the clock: how much of the wall time was real blocking before the CLI started answering.
+    const offTotal = await ms(() => n2.syncVersionsTotal(note).catch((e: unknown) => e));
+    const v = offTotal.v;
+    const shown = v instanceof Error ? `threw after its retries: ${v.message.slice(0, 60)}…` : JSON.stringify(v);
+    say(`${stamp()} sync:history total -> ${shown}`);
+    say(`${stamp()}   total wall time ${(offTotal.ms / 1000).toFixed(1)}s — the retry log above shows how much was blocking`);
+  } finally {
+    // ALWAYS reconnect: the calls above are expected to throw, and leaving a node partitioned
+    // would silently poison whatever runs next.
+    await runProcess(engine, ["network", "connect", "--ip", `10.89.0.${100 + Number(names[1].replace(/\D/g, ""))}`, "obsidian-net", names[1]]);
+    say(`${stamp()} n2 reconnected`);
+  }
+
   console.log(`\nLeft behind: ${note}.md on both nodes (\`make clean-notes\` removes it).`);
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error(e instanceof Error ? e.message : String(e));
+  // This probe deliberately partitions a node. However it fails, put the network back — a probe
+  // that leaves the apparatus broken is worse than no probe.
+  try {
+    await runProcess(engine, ["network", "connect", "--ip", `10.89.0.${100 + Number(names[1].replace(/\D/g, ""))}`, "obsidian-net", names[1]]);
+    console.error(`  (reconnected ${names[1]} on the way out)`);
+  } catch { /* best effort */ }
   process.exit(1);
 });
