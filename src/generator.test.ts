@@ -70,6 +70,22 @@ test("FORCED_TURNS=W: a W before every cross-node edit", () => {
   }
 });
 
+test("FORCED_TURNS is emitted on the node that just edited, not the one about to", () => {
+  // `N1AaWN2Aa`, never `N1AaN2WAa`. Not cosmetic: `W` only ever means "the ACTIVE node's client
+  // reports synced", not that anything actually arrived anywhere. On the old node that is the
+  // glance at the sync indicator a user really takes before switching devices; on the new node it
+  // would be n2 reporting synced while possibly unaware n1's edit exists at all.
+  for (let s = 1; s <= 20; s++) {
+    const h = generateHistory({ nodes: 2, ops: [4, 8], forcedTurns: parse("W"), waitProb: 0, pauseProb: 0, rng: mulberry32(s) });
+    for (let i = 0; i < h.length; i++) {
+      if (h[i].cmd !== "wait") continue;
+      // The op right after a forced W is the selector moving to the NEW node; the W therefore ran
+      // while the previous editor was still active.
+      assert.equal(h[i + 1]?.cmd, "node", `a forced W should be followed by the node switch: ${serialize(h)}`);
+    }
+  }
+});
+
 test("FORCED_TURNS=P60: the hand-off pause takes the length from the spec", () => {
   for (let s = 1; s <= 20; s++) {
     // waitProb 0 so the only W that could appear would be a forced one — there are none here.

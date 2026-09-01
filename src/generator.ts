@@ -162,11 +162,23 @@ export function generateHistory(params: GenParams): History {
         // excluded entirely from the D/C draw.
         const draw = randInt(rng, 1, nodeCount + (localEnabled ? 1 : 0));
         const n: number | "local" = draw <= nodeCount ? draw : "local";
-        setNode(n);
-        // Force a turn at the hand-off. No online/offline condition: a `W` across a partition is
-        // inert and normalize drops it, and a `P` across one lengthens divergence, which is exactly
-        // what we want to sample.
+        // Force a turn at the hand-off, emitted BEFORE the cursor moves so it runs on the node that
+        // just edited: `N1AaWN2Aa`, not `N1AaN2WAa`.
+        //
+        // `W` waits on whichever node is ACTIVE, and all it ever establishes is that THAT node's own
+        // client reports `synced` — never a verified fact about the server or the peer. A sync can
+        // still be pending with no way for anyone to know (docs/cli-trust.md). So the placement
+        // decides which client's self-report gates the hand-off:
+        //
+        //   old node (this)  "my device says I'm good to go" — precisely what a user checks before
+        //                    picking up the other device, blind spot and all
+        //   new node (was)   n2 saying "I'm synced", which it can report while entirely unaware
+        //                    n1's edit exists: a check no user performs, on a signal saying less
+        //
+        // No online/offline condition: a `W` across a partition is inert and normalize drops it,
+        // and a `P` across one lengthens divergence, which is what we want to sample.
         if (prevEditor && prevEditor !== n) for (const t of forcedTurns) ops.push({ ...t });
+        setNode(n);
         ops.push({ cmd: "append", note: pick(rng, letters) });
         prevEditor = n;
         appends++;
