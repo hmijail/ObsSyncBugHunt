@@ -26,18 +26,51 @@
 // ("immediate", not "concurrent": the harness is a SINGLE thread of control standing in for one
 // user moving between devices, so nothing here ever runs at the same time.)
 
-import { DEFAULT_PAUSE_SEC, normalize, type History } from "./dsl.js";
+import { DEFAULT_PAUSE_SEC, normalize, parse, serialize, type History } from "./dsl.js";
 
-/** The single source of truth for the accepted turn modes: the type is derived from the list, so
- *  run.ts can validate an incoming --turns against it without the two drifting apart. */
-export const TURN_MODES = ["barrier", "paced", "immediate"] as const;
-export type Turns = (typeof TURN_MODES)[number];
+/**
+ * What the generator FORCES at a cross-node hand-off, written in the DSL itself:
+ *
+ *     W        wait until synced before handing over   (the default)
+ *     P        a DEFAULT_PAUSE_SEC pause
+ *     P60      a 60s pause
+ *     WP30     wait for synced, then 30s more
+ *     (empty)  nothing — hand over instantly
+ *
+ * "Forced" is the load-bearing word. This governs ONLY the hand-off; the `W`s and `P`s elsewhere in
+ * a history come from their own draw weights, so an empty value does not mean a history without
+ * waits, it means one where the hand-off itself imposes none. That last case is not a realistic
+ * Obsidian usage pattern — it is a stress test, asking whether Sync copes when a user switches
+ * devices with no settling at all.
+ *
+ * Only `W` and `P` are accepted. An `A` would silently inflate the edit count; a `D` would corrupt
+ * the offline tracking the generator and normalize both rely on. So this rejects rather than
+ * ignores.
+ */
+export function parseForcedTurns(spec: string): History {
+  const ops = parse(spec);
+  const bad = ops.find((o) => o.cmd !== "wait" && o.cmd !== "pause");
+  if (bad) {
+    throw new Error(
+      `--forced-turns/FORCED_TURNS may only contain W and P ops, got "${bad.cmd}" in "${spec}".\n` +
+      `  Accepted: W (wait for synced), P or P<seconds> (pause), a combination like WP30, or empty\n` +
+      `  for no forced hand-off at all.`,
+    );
+  }
+  return ops;
+}
+
+/** What `FORCED_TURNS` defaults to when unset: wait for synced before handing over. */
+export const DEFAULT_FORCED_TURNS: History = [{ cmd: "wait" }];
+/** For error messages and logs — the DSL spelling of whatever is in force. */
+export const showForcedTurns = (h: History): string => serialize(h) || "(none)";
 
 export interface GenParams {
   nodes: number; // node count (>=1) — numbered nodes only, the local instance is layered on top
   ops: [number, number]; // inclusive range for the number of EDITS (counts `A` only)
   notes?: number; // distinct notes (default 1 = max contention)
-  turns?: Turns; // cross-node coordination (default "barrier")
+  forcedTurns?: History; // ops spliced in at a cross-node hand-off (default: a single W)
+  waitProb?: number; // draw weight for a standalone `W`, relative to an append's 1 (default 0.2)
   pauseProb?: number; // draw weight for `P`, relative to an append's weight of 1 (default 0.3)
   partitionProb?: number; // draw weight for `D` and for `C`, each relative to 1 (default 0)
   pauseSec?: number; // ordinary pause length (default DEFAULT_PAUSE_SEC)
@@ -60,6 +93,11 @@ const DEFAULT_PAUSE_PROB = 0.3;
  *  a history are long: often enough that a soak crosses the boundary regularly, rare enough that
  *  most histories stay quick. */
 const DEFAULT_LONG_PAUSE_PROB = 0.25;
+/** Draw weight for a standalone `W` — "the user waited for it to show up", which is a different act
+ *  from the hand-off turn FORCED_TURNS imposes. Judgement, like the long-pause weight: enough to
+ *  vary the shape without swamping histories in waits. With FORCED_TURNS=W a drawn W landing beside
+ *  a forced one just collapses, so this mostly shows up when the forced turn is a pause or nothing. */
+const DEFAULT_WAIT_PROB = 0.2;
 
 function randInt(rng: () => number, min: number, max: number): number {
   return min + Math.floor(rng() * (max - min + 1));
@@ -70,12 +108,12 @@ function pick<T>(rng: () => number, arr: T[]): T {
 
 const LETTERS = "abcdefghijklmnopqrstuvwxyz".split("");
 
-type Kind = "append" | "disconnect" | "connect" | "pause";
+type Kind = "append" | "disconnect" | "connect" | "pause" | "wait";
 
 export function generateHistory(params: GenParams): History {
   const rng = params.rng ?? Math.random;
   const nodeCount = params.nodes;
-  const turns = params.turns ?? "barrier";
+  const forcedTurns = params.forcedTurns ?? DEFAULT_FORCED_TURNS;
   const localEnabled = params.localEnabled ?? false;
   const pauseSec = params.pauseSec ?? DEFAULT_PAUSE_SEC;
   const longPauseProb = params.longPauseProb ?? DEFAULT_LONG_PAUSE_PROB;
@@ -91,6 +129,7 @@ export function generateHistory(params: GenParams): History {
     ["disconnect", params.partitionProb ?? 0],
     ["connect", params.partitionProb ?? 0],
     ["pause", params.pauseProb ?? DEFAULT_PAUSE_PROB],
+    ["wait", params.waitProb ?? DEFAULT_WAIT_PROB],
   ];
   const total = weights.reduce((s, [, w]) => s + w, 0);
   const drawKind = (): Kind => {
@@ -124,12 +163,10 @@ export function generateHistory(params: GenParams): History {
         const draw = randInt(rng, 1, nodeCount + (localEnabled ? 1 : 0));
         const n: number | "local" = draw <= nodeCount ? draw : "local";
         setNode(n);
-        // Coordinate a cross-node edit per `turns`. No online/offline condition: a `W` across a
-        // partition is inert and normalize drops it, and a `P` across one lengthens divergence,
-        // which is exactly what we want to sample.
-        if (turns !== "immediate" && prevEditor && prevEditor !== n) {
-          ops.push(turns === "barrier" ? { cmd: "wait" } : { cmd: "pause", seconds: pauseLength() });
-        }
+        // Force a turn at the hand-off. No online/offline condition: a `W` across a partition is
+        // inert and normalize drops it, and a `P` across one lengthens divergence, which is exactly
+        // what we want to sample.
+        if (prevEditor && prevEditor !== n) for (const t of forcedTurns) ops.push({ ...t });
         ops.push({ cmd: "append", note: pick(rng, letters) });
         prevEditor = n;
         appends++;
@@ -154,6 +191,12 @@ export function generateHistory(params: GenParams): History {
       }
       case "pause":
         ops.push({ cmd: "pause", seconds: pauseLength() });
+        break;
+      // A standalone wait — "the user waited for it to show up" — which the hand-off turn cannot
+      // express: that only fires on a node CHANGE, so `N1AaWAb` (wait for your own sync, then edit
+      // again) was unreachable. Emitted freely; normalize drops it if it turns out to be inert.
+      case "wait":
+        ops.push({ cmd: "wait" });
         break;
     }
   }

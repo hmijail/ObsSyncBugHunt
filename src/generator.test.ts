@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateHistory } from "./generator.js";
-import { serialize, type Cmd, type History } from "./dsl.js";
+import { generateHistory, parseForcedTurns } from "./generator.js";
+import { parse, serialize, type Cmd, type History } from "./dsl.js";
 
 function mulberry32(seed: number): () => number {
   return () => {
@@ -52,7 +52,7 @@ test("generateHistory: edit count bounded, valid ops, serializable", () => {
 
 test("collapse: no two adjacent collapsible ops of the same kind", () => {
   for (let s = 1; s <= 25; s++) {
-    const h = generateHistory({ nodes: 3, ops: [4, 12], turns: "paced", partitionProb: 0.3, pauseProb: 0.2, notes: 2, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 3, ops: [4, 12], forcedTurns: parse("P"), partitionProb: 0.3, pauseProb: 0.2, notes: 2, rng: mulberry32(s) });
     for (let i = 1; i < h.length; i++) {
       // Adjacent appends are only redundant when they target the SAME note (different
       // notes back-to-back are legitimate); the rest of COLLAPSIBLE never repeats adjacently.
@@ -63,28 +63,53 @@ test("collapse: no two adjacent collapsible ops of the same kind", () => {
   }
 });
 
-test("barrier turns: a W before every cross-node edit", () => {
+test("FORCED_TURNS=W: a W before every cross-node edit", () => {
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "barrier", rng: mulberry32(s) });
-    assert.equal(crossNodeUncoordinated(h, "wait"), 0, `barrier should W before cross-node edits: ${serialize(h)}`);
+    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: parse("W"), rng: mulberry32(s) });
+    assert.equal(crossNodeUncoordinated(h, "wait"), 0, `should W before cross-node edits: ${serialize(h)}`);
   }
 });
 
-test("paced turns: a P (not W) before every cross-node edit", () => {
+test("FORCED_TURNS=P60: the hand-off pause takes the length from the spec", () => {
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "paced", rng: mulberry32(s) });
-    assert.ok(!h.some((o) => o.cmd === "wait"), `paced uses no W: ${serialize(h)}`);
-    assert.equal(crossNodeUncoordinated(h, "pause"), 0, `paced should P before cross-node edits: ${serialize(h)}`);
+    // waitProb 0 so the only W that could appear would be a forced one — there are none here.
+    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: parse("P60"), waitProb: 0, pauseProb: 0, rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "wait"), `a P hand-off uses no W: ${serialize(h)}`);
+    assert.equal(crossNodeUncoordinated(h, "pause"), 0, `should P before cross-node edits: ${serialize(h)}`);
+    for (const o of h) if (o.cmd === "pause") assert.equal(o.seconds, 60, `every pause is the forced 60s: ${serialize(h)}`);
   }
 });
 
-test("immediate turns: no coordination at all", () => {
+test("FORCED_TURNS empty: nothing is forced at the hand-off", () => {
   for (let s = 1; s <= 10; s++) {
-    // pauseProb 0 so the ONLY thing that could emit a P is coordination — pauses are otherwise
-    // drawn on their own now, and a P from that draw would say nothing about `turns`.
-    const h = generateHistory({ nodes: 2, ops: [6, 10], turns: "immediate", pauseProb: 0, rng: mulberry32(s) });
-    assert.ok(!h.some((o) => o.cmd === "wait" || o.cmd === "pause"), `immediate inserts no W/P: ${serialize(h)}`);
+    // The other two weights are zeroed so the ONLY thing that could emit a W or P is the hand-off:
+    // waits and pauses are otherwise drawn on their own, and would say nothing about the hand-off.
+    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: [], waitProb: 0, pauseProb: 0, rng: mulberry32(s) });
+    assert.ok(!h.some((o) => o.cmd === "wait" || o.cmd === "pause"), `nothing forced: ${serialize(h)}`);
   }
+});
+
+test("a standalone W is reachable — the hand-off turn alone could never produce one", () => {
+  // `N1AaWAb`: wait for your own sync, then edit again. The forced turn only fires on a node
+  // CHANGE, so with an empty hand-off spec every W here comes from the draw.
+  let withWait = 0;
+  for (let s = 1; s <= 30; s++) {
+    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: [], waitProb: 0.5, rng: mulberry32(s) });
+    if (h.some((o) => o.cmd === "wait")) withWait++;
+  }
+  assert.ok(withWait > 0, "a drawn W should appear even with no forced hand-off");
+});
+
+test("parseForcedTurns: accepts W/P forms, rejects anything that would change the experiment", () => {
+  assert.deepEqual(parseForcedTurns("W"), [{ cmd: "wait" }]);
+  assert.deepEqual(parseForcedTurns("P"), [{ cmd: "pause", seconds: 10 }]);
+  assert.deepEqual(parseForcedTurns("WP30"), [{ cmd: "wait" }, { cmd: "pause", seconds: 30 }]);
+  assert.deepEqual(parseForcedTurns(""), []);
+  // An A would silently inflate the edit count; a D would corrupt the offline tracking that both
+  // the generator and normalize rely on. Neither may be quietly ignored.
+  assert.throws(() => parseForcedTurns("Aa"), /may only contain W and P/);
+  assert.throws(() => parseForcedTurns("D"), /may only contain W and P/);
+  assert.throws(() => parseForcedTurns("banana"), /unexpected/);
 });
 
 test("pauses are on by default, so a default soak can reach a long offline window", () => {

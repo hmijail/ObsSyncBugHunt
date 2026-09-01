@@ -108,7 +108,23 @@ CONTAINER_NODES     := $(filter-out l,$(NODES))
 CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 # Knobs forwarded to the CLI. --nodes/--network always (structural); the rest only
 # when you set them — so make's recipe echo is the exact, copy-pasteable command and
-# shows precisely what you overrode (e.g. `make soak TURNS=paced` -> `… --turns paced`).
+# shows precisely what you overrode (e.g. `make soak OPS=4-4` -> `… --ops 4-4`).
+# FORCED_TURNS holds a DSL substring spliced in at each cross-node hand-off (W, P, P60, WP30) and
+# EMPTY is meaningful: no forced hand-off at all. `$(if ...)` treats empty as unset, which would
+# silently fall back to the default W — the same silent-wrong-experiment failure that strict
+# --forced-turns validation exists to prevent — so presence is tested with `$(origin)` instead.
+ifdef TURNS
+$(error TURNS= is now FORCED_TURNS=, holding a DSL substring rather than a mode name: \
+barrier -> FORCED_TURNS=W, paced -> FORCED_TURNS=P (or P60 for a longer one), \
+immediate -> FORCED_TURNS= (empty). See src/generator.ts's parseForcedTurns)
+endif
+
+ifeq ($(origin FORCED_TURNS),undefined)
+FORCED_TURNS_FLAG :=
+else
+FORCED_TURNS_FLAG := --forced-turns '$(FORCED_TURNS)'
+endif
+
 RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(OBSIDIAN_BIN),--bin $(OBSIDIAN_BIN)) \
   $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
@@ -119,7 +135,8 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(STEPS),--steps $(STEPS)) \
   $(if $(OPS),--ops $(OPS)) \
   $(if $(NOTES),--notes $(NOTES)) \
-  $(if $(TURNS),--turns $(TURNS)) \
+  $(FORCED_TURNS_FLAG) \
+  $(if $(WAIT_PROB),--wait-prob $(WAIT_PROB)) \
   $(if $(PAUSE_PROB),--pause-prob $(PAUSE_PROB)) \
   $(if $(PAUSE_SEC),--pause-sec $(PAUSE_SEC)) \
   $(if $(LONG_PAUSE_PROB),--long-pause-prob $(LONG_PAUSE_PROB)) \
@@ -290,7 +307,7 @@ reconnect-nodes: ## Reconnect all CONTAINER_NODES to the network (fixes a node l
 run: solo-check reconnect-nodes ## Run ONE history: generated, or HISTORY=<dsl> (REPEAT=N; STEPS=K runs only its first K ops)
 	npm run start -- $(RUN_FLAGS)
 
-campaign: solo-check reconnect-nodes ## Run HISTORIES histories and tally the error rate (HISTORIES=N TURNS=... OPS=...)
+campaign: solo-check reconnect-nodes ## Run HISTORIES histories and tally the error rate (HISTORIES=N FORCED_TURNS=... OPS=...)
 	npm run start -- --histories $(or $(HISTORIES),20) $(RUN_FLAGS)
 
 soak: solo-check reconnect-nodes ## Run until stopped (Ctrl-C); DURATION_MIN=N for a fixed span. HISTORY=<dsl> soaks that one history
@@ -303,7 +320,7 @@ RUNS_DIR := $(if $(RUNS_PREFIX),$(RUNS_PREFIX)/runs,runs)
 analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync-time distribution)
 	npm run analyze -- $(RUNS_DIR)
 
-generate-histories: ## Print N generated histories without running them (N=20; honours TURNS/OPS/NOTES/PARTITION_PROB)
+generate-histories: ## Print N generated histories without running them (N=20; honours FORCED_TURNS/OPS/NOTES/PARTITION_PROB)
 	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
 
 # Most of RUN_FLAGS (turns/ops/notes/pause-prob/isolator/...) doesn't apply to an already-concrete

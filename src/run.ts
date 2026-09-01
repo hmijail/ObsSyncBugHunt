@@ -34,8 +34,10 @@
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
-//   --turns          barrier | paced | immediate             (default barrier)
+//   --forced-turns   ops forced at a cross-node hand-off, in DSL: W | P | P60 | WP30
+//                    | empty for none                          (default W)
 //   --pause-prob     draw weight for a pause, vs an edit's 1   (default 0.3)
+//   --wait-prob      draw weight for a standalone W            (default 0.2)
 //   --pause-sec      ordinary pause length                     (default 10)
 //   --long-pause-prob chance an emitted pause is a long one    (default 0.25)
 //   --long-pause-sec  that long length                         (default 100)
@@ -81,7 +83,7 @@ import { ObsidianDriver } from "./driver.js";
 import { SyncToggleIsolator, NetworkIsolator, EnvironmentAssumptionError, type Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
 import { runHistory, type ExecuteOpts } from "./execute.js";
-import { generateHistory, TURN_MODES, type GenParams, type Turns } from "./generator.js";
+import { generateHistory, parseForcedTurns, showForcedTurns, DEFAULT_FORCED_TURNS, type GenParams } from "./generator.js";
 import { parse, serialize, normalize, requiredNodes, type History } from "./dsl.js";
 import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
@@ -153,8 +155,9 @@ const { values } = parseArgs({
     steps: { type: "string" },
     ops: { type: "string" },
     notes: { type: "string" },
-    turns: { type: "string" },
+    "forced-turns": { type: "string" },
     "pause-prob": { type: "string" },
+    "wait-prob": { type: "string" },
     "pause-sec": { type: "string" },
     "long-pause-prob": { type: "string" },
     "long-pause-sec": { type: "string" },
@@ -216,22 +219,27 @@ if (values["local-vault-pin"] && !localRequested) {
 
 const opsRange = (values.ops ?? "6-12").split("-").map(Number);
 const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
-// Rejected rather than silently defaulted. The old code fell back to "barrier" for anything it
-// didn't recognize, so a typo (or a mode renamed out from under a script) quietly ran the MOST
-// conservative pacing — the one least likely to surface a bug — while the rep's own record
-// claimed that was what you asked for.
-const turnsArg = values.turns ?? "barrier";
-if (!(TURN_MODES as readonly string[]).includes(turnsArg)) {
-  console.error(`--turns/TURNS must be one of: ${TURN_MODES.join(" | ")} — got "${turnsArg}".`);
-  process.exit(2);
+// Rejected rather than silently defaulted, the same rigour --turns gained when it stopped falling
+// back to "barrier": a value we cannot honour must not quietly become the most conservative pacing,
+// which is the one least likely to surface a bug, while the rep's record claims otherwise.
+// An EMPTY value is meaningful (no forced hand-off at all) and distinct from the flag being absent,
+// so the check is on presence, not truthiness.
+let forcedTurns = DEFAULT_FORCED_TURNS;
+if (values["forced-turns"] !== undefined) {
+  try {
+    forcedTurns = parseForcedTurns(values["forced-turns"]);
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
 }
-const turns = turnsArg as Turns;
 const genParams: GenParams = {
   nodes: nodesList.length,
   ops,
   notes: Number(values.notes ?? 1),
-  turns,
+  forcedTurns,
   ...(values["pause-prob"] !== undefined ? { pauseProb: Number(values["pause-prob"]) } : {}),
+  ...(values["wait-prob"] !== undefined ? { waitProb: Number(values["wait-prob"]) } : {}),
   ...(values["pause-sec"] !== undefined ? { pauseSec: Number(values["pause-sec"]) } : {}),
   ...(values["long-pause-prob"] !== undefined ? { longPauseProb: Number(values["long-pause-prob"]) } : {}),
   ...(values["long-pause-sec"] !== undefined ? { longPauseSec: Number(values["long-pause-sec"]) } : {}),
@@ -368,7 +376,7 @@ const tsStamp = () => {
 // results, tally) is recoverable. The invocation is the log's first line (written to
 // the file only — make already echoes the same command on the terminal).
 mkdirSync(runsRoot, { recursive: true });
-const slug = historyArg ? "history" : `${turns}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
+const slug = historyArg ? "history" : `ft${showForcedTurns(forcedTurns)}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
 const logPath = path.join(runsRoot, `${tsStamp()}-${slug}.log`);
 appendFileSync(logPath, `npm run start -- ${process.argv.slice(2).join(" ")}\n`);
 // Synchronous append so the tail (rep results, tally) survives process.exit().
