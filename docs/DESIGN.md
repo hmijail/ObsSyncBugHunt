@@ -151,11 +151,19 @@ It cannot. Measured with `npm run probe-sync-versions`:
 | when the counter rises | the same poll in which the content arrives |
 | after a real partition + reconnect | identical: 153-195ms, counter and content flip together |
 
-The counter is a *local* view of server history that moves in lockstep with the content, not ahead of
-it. Even the **writing** node's own total did not count its edit until nine seconds later, at the
-moment the peer received it. So it offers no lead time over simply reading the file, and neither of
-the interesting uses is available: a wait cannot be made to honour it (it says nothing the content
-does not), and a "you gave up while a sync was pending" detector cannot be built on it.
+The counter is a *cached local* view of server history, refreshed when the node syncs — not a live
+reading of the server. Even the **writing** node's own total did not count its edit until nine
+seconds later, at the moment the peer received it.
+
+Note what that does and does not say. The gap was real: for nine seconds n1 held an edit n2 lacked.
+What was invisible was the counter moving. So this is not "Obsidian syncs so promptly that no gap
+opens" — the gap lasted nine seconds — it is "the number only refreshes when the client syncs, so a
+sync in flight looks exactly like idle". The name is part of the confusion: it is neither a version
+*number* nor a *server* reading, but a per-node cached count.
+
+Either way it offers no lead time over simply reading the file, and neither of the interesting uses
+is available: a wait cannot be made to honour it (it says nothing the content does not), and a "you
+gave up while a sync was pending" detector cannot be built on it.
 
 What it does support is what it is already used for: `total < 1` means a note never reached the
 server at all, which is `-NOUPLOAD`. That remains a hidden signal reaching a verdict, deliberately —

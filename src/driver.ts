@@ -408,8 +408,18 @@ export class ObsidianDriver {
   }
 
   /**
-   * Cumulative count of server-side sync versions (`sync:history total`). !ok = positively
-   * absent (no server history). Monotonic and server-side (all nodes agree).
+   * How many versions of this file THIS NODE believes the server holds (`sync:history total`).
+   * !ok = positively absent (no server history).
+   *
+   * "server-side (all nodes agree)" is how this used to be described, and it is misleading. The
+   * number is a CACHED view, refreshed when the node syncs — not a live read of the server.
+   * Measured (docs/DESIGN.md, `npm run probe-sync-versions`): after n1 appended, n1's OWN total
+   * kept reporting the old value for ~9 seconds, and only rose at the moment n2 received the
+   * content. Nodes therefore agree once both have caught up, not at any given instant, and the
+   * count cannot reveal a sync in flight — during those 9s it looked exactly like idle.
+   *
+   * Monotonic per node. Useful for what it can answer: `< 1` means the file never reached the
+   * server at all, which is `-NOUPLOAD`.
    */
   async syncVersionsTotal(name: string): Promise<OpResult<number>> {
     const { value: r, raw } = await this.runRecognized("sync:history", [`file=${name}`, "total"], parseTotal);
