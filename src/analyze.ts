@@ -130,6 +130,11 @@ interface Group {
   // WOULD_FAIL_CHECK's mid-history peek: how often it fired, split by what the rep ACTUALLY ended
   // as. Those two numbers are its precision; `failedUnwarned` is what it missed. Kept per history
   // because a signal's usefulness is a property of the shape being run, not of the harness.
+  // The peek's scorecard. `checkedReps`/`checksRun` are the DENOMINATOR and matter as much as the
+  // rest: a rep the peek never looked at is not evidence that it saw nothing, and with CD_PROB
+  // non-zero the peek skips every moment a node is offline, so a partitioned soak samples far less
+  // than its rep count suggests.
+  checkedReps: number; checksRun: number;
   warnedFailed: number; warnedOk: number; failedUnwarned: number;
   // Reps where the SERVER's version count for a note rose between the moment a node first reported
   // `synced` and the moment that wait finished (the `from`/`to` of a `synced` event). Recorded at
@@ -145,7 +150,7 @@ interface Group {
 const newGroup = (): Group => ({
   reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0,
   unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, envfail: 0,
-  warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
+  checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
 });
 
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
@@ -168,7 +173,7 @@ const stats = (xs: number[]): string => {
   return s ? `min=${s.min} median=${s.median} max=${s.max} span=${s.span}` : "n/a";
 };
 
-function tally(g: Group, r: Results, rep: string, warned = false, versionsGrew = false) {
+function tally(g: Group, r: Results, rep: string, warned = false, versionsGrew = false, checksRun = 0) {
   g.reps++;
   g.conv.push(r.timings?.convergenceSec ?? 0);
   g.minSec ??= r.timings?.minSec;
@@ -179,10 +184,17 @@ function tally(g: Group, r: Results, rep: string, warned = false, versionsGrew =
   for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
 
   if (versionsGrew) g.versionsGrew++;
+  g.checksRun += checksRun;
+  if (checksRun > 0) g.checkedReps++;
   const bad = !r.verdict.ok || !!r.timings?.unsynced;
-  if (warned && bad) g.warnedFailed++;
-  else if (warned) g.warnedOk++;
-  else if (bad) g.failedUnwarned++;
+  // Only reps the peek actually looked at can say anything about it. A failure it never examined is
+  // not a miss; it is an absence of data, and lumping the two together would flatter or damn the
+  // signal depending on how partitioned the soak happened to be.
+  if (checksRun > 0) {
+    if (warned && bad) g.warnedFailed++;
+    else if (warned) g.warnedOk++;
+    else if (bad) g.failedUnwarned++;
+  }
 
   const cells = buildStateCells(r);
   if (cells) {
@@ -266,15 +278,17 @@ export function renderCategoryTable(category: string, byState: Map<string, State
  * tables above.
  */
 export function renderEarlyWarning(rows: [string, Group][]): string {
-  const header = "| history | reps | warned & failed | warned & ended OK | failed with no warning |";
-  const sep = "|---|---|---|---|---|";
+  const header = "| history | reps | reps peeked at | peeks run | warned & failed | warned & ended OK | failed unwarned |";
+  const sep = "|---|---|---|---|---|---|---|";
   const body = rows.map(([str, g]) =>
-    `| ${str} | ${g.reps} | ${g.warnedFailed} | ${g.warnedOk} | ${g.failedUnwarned} |`);
+    `| ${str} | ${g.reps} | ${g.checkedReps} | ${g.checksRun} | ${g.warnedFailed} | ${g.warnedOk} | ${g.failedUnwarned} |`);
   return [
     "# Early warning",
     "",
-    "_WOULD_FAIL_CHECK fired mid-history for these. `warned & ended OK` is its false-positive count:"
-      + " a token can vanish and come back before the settle, so a large one means the signal is noise._",
+    "_The last three columns only count reps the peek actually looked at — `reps peeked at` is the"
+      + " denominator, and it can be far below `reps`, since the peek skips every moment a node is"
+      + " offline. `warned & ended OK` is the false-positive count: a token can vanish and come back"
+      + " before the settle, so a large one means the signal is noise._",
     "",
     header, sep, ...body, "",
   ].join("\n");
@@ -368,6 +382,12 @@ export function main(base: string): void {
       const warned = lines.some((l) => l.includes('"kind":"would-fail"'));
       // Did a new server version land AFTER the node claimed `synced` but before the wait ended?
       // Only `synced`/`unsynced` lines carry from/to, so the parse is limited to those few.
+      // How many times the peek actually ran (not merely how often it fired).
+      let checksRun = 0;
+      for (const l of lines) {
+        if (!l.includes('"kind":"would-fail-check"')) continue;
+        try { if ((JSON.parse(l) as { ran?: boolean }).ran) checksRun++; } catch { /* ignore */ }
+      }
       const versionsGrew = lines.some((l) => {
         if (!l.includes('"kind":"synced"') && !l.includes('"kind":"unsynced"')) return false;
         try {
@@ -377,7 +397,7 @@ export function main(base: string): void {
       });
       let last: Record<string, unknown>;
       try { last = JSON.parse(lines[lines.length - 1]); } catch { skipped++; continue; }
-      if (last.kind === "results") { tally(g, last as unknown as Results, rep, warned, versionsGrew); continue; }
+      if (last.kind === "results") { tally(g, last as unknown as Results, rep, warned, versionsGrew, checksRun); continue; }
       if (last.kind === "obsfail") { tallyThrown(g, "obsfail"); continue; }
       if (last.kind === "unknown") { tallyThrown(g, "unknown"); continue; }
       // Abandoned to an environment failure and retried — a real, explained ending, so not
@@ -402,7 +422,9 @@ export function main(base: string): void {
   if (uninteresting.length > 0) sections.push(renderNoDataLoss(uninteresting));
   // Only histories that actually exercised the check — omitted entirely when it was never on, which
   // is every run to date.
-  const warned = active.filter(([, g]) => g.warnedFailed + g.warnedOk > 0);
+  // Any history the peek RAN on, fired or not — a run of silent checks is exactly the evidence
+  // this table exists to show.
+  const warned = active.filter(([, g]) => g.checksRun > 0);
   if (warned.length > 0) sections.push(renderEarlyWarning(warned));
   const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");

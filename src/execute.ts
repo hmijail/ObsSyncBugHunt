@@ -519,12 +519,30 @@ async function checkWouldFail(
   logger: RunLogger,
   atSec: number,
 ): Promise<void> {
-  if (!opts.wouldFailCheck || offline.size > 0 || touched.size === 0) return;
+  if (!opts.wouldFailCheck) return; // not enabled: nothing to say, not even that it was skipped
+
+  // Every INVOCATION is logged, not only the ones that fire, because the silent ones are the
+  // denominator. Without them an empty result is ambiguous between "peeked repeatedly and saw
+  // nothing" — real evidence there was no early signal — and "never peeked at all", which is no
+  // evidence whatever. analyze cannot judge how well the peek predicts anything without knowing
+  // how many chances it had.
+  if (offline.size > 0) {
+    // Judging mid-partition would flag divergence that is SUPPOSED to exist, so this is skipped by
+    // design. It matters that the skip is visible: with CD_PROB non-zero (now the default) many
+    // pauses sit inside a D...C window, so a partitioned soak checks far less than it looks.
+    logger.log({ kind: "would-fail-check", atSec, ran: false, reason: "a node is offline" });
+    return;
+  }
+  if (touched.size === 0) {
+    logger.log({ kind: "would-fail-check", atSec, ran: false, reason: "nothing appended yet" });
+    return;
+  }
   const notes = [...touched];
   const obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
   const verdict = checkRun(acked, obs);
   const lost = verdict.notes.some((n) => n.lost.length > 0);
   const dupl = verdict.notes.some((n) => n.duplicated.length > 0);
+  logger.log({ kind: "would-fail-check", atSec, ran: true, notes: notes.length, wouldFail: lost || dupl });
   if (!lost && !dupl) return; // OK, or a node-vs-node disagreement — neither is reported here
   const suffix = lost ? "-LOST" : "-DUPL";
   const rec = { atSec, suffix, verdict };

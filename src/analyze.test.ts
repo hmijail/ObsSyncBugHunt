@@ -128,7 +128,7 @@ test("renderGroup: only non-empty categories appear, in ranked order", () => {
   const g = {
     reps: 2, pass: 1, fail: 1, lost: 1, serverDropped: 0, neverRegistered: 1,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [8, 9],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
       ["PASS", new Map<string, StateEntry>([["k1", { cells: { a: "x" }, count: 1, reps: ["r1"] }]])],
       ["LOST", new Map<string, StateEntry>([["k2", { cells: { a: "y" }, count: 1, reps: ["r2"] }]])],
@@ -146,7 +146,7 @@ test("line: only non-zero fields are shown, and convergenceSec reports min/media
   const g = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
   };
   const l = line(g);
   assert.ok(l.includes("reps=3 pass=3"));
@@ -158,7 +158,7 @@ test("line: median (not average) is robust to a single huge transient outlier", 
   const g = {
     reps: 4, pass: 4, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [1, 2, 3, 100],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
   };
   const l = line(g);
   // avg would be 26.5 (dragged way up by the 100); the median stays near the typical values.
@@ -169,7 +169,7 @@ test("isUninteresting: all-PASS reps landing in the same state -> true", () => {
   const g = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
       ["PASS", new Map<string, StateEntry>([["k1", { cells: { a: "x" }, count: 3, reps: ["r1", "r2", "r3"] }]])],
     ]),
@@ -181,7 +181,7 @@ test("isUninteresting: all-PASS but reps land in DIFFERENT states -> false (ther
   const g = {
     reps: 2, pass: 2, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
       ["PASS", new Map<string, StateEntry>([
         ["k1", { cells: { a: "x" }, count: 1, reps: ["r1"] }],
@@ -196,7 +196,7 @@ test("isUninteresting: any real failure -> false, even with a single PASS state 
   const g = {
     reps: 2, pass: 1, fail: 1, lost: 1, serverDropped: 0, neverRegistered: 1,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
       ["PASS", new Map<string, StateEntry>([["k1", { cells: { a: "x" }, count: 1, reps: ["r1"] }]])],
       ["LOST", new Map<string, StateEntry>([["k2", { cells: { a: "y" }, count: 1, reps: ["r2"] }]])],
@@ -205,18 +205,20 @@ test("isUninteresting: any real failure -> false, even with a single PASS state 
   assert.equal(isUninteresting(g), false);
 });
 
-test("renderEarlyWarning: one row per history, with the peek's precision as three counts", () => {
+test("renderEarlyWarning: one row per history, with the peek's denominator beside its outcomes", () => {
   const g = {
     reps: 12, pass: 8, fail: 4, lost: 4, serverDropped: 4, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 3, warnedOk: 5, failedUnwarned: 1, versionsGrew: 0,
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 12, checksRun: 47, warnedFailed: 3, warnedOk: 5, failedUnwarned: 1, versionsGrew: 0,
     categories: new Map(),
   };
   const md = renderEarlyWarning([["histA", g]]);
   assert.ok(md.startsWith("# Early warning"), md);
-  assert.ok(md.includes("| history | reps | warned & failed | warned & ended OK | failed with no warning |"));
-  assert.ok(md.includes("| histA | 12 | 3 | 5 | 1 |"));
-  // The false-positive column is the whole point of the table, so the caption must survive.
+  assert.ok(md.includes("| history | reps | reps peeked at | peeks run | warned & failed | warned & ended OK | failed unwarned |"));
+  assert.ok(md.includes("| histA | 12 | 12 | 47 | 3 | 5 | 1 |"));
+  // Both halves of the caption are load-bearing: the denominator explains what the counts are OF,
+  // and the false-positive column is what decides whether the signal is worth acting on.
+  assert.match(md, /denominator/);
   assert.match(md, /false-positive count/);
 });
 
@@ -224,12 +226,12 @@ test("renderNoDataLoss: one row per history with its rep count and min/median/ma
   const g1 = {
     reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, minSec: 62.3, categories: new Map(),
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, minSec: 62.3, categories: new Map(),
   };
   const g2 = {
     reps: 1, pass: 1, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [] as number[],
-    obsfail: 0, unknown: 0, envfail: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
+    obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
   };
   const md = renderNoDataLoss([["histA", g1], ["histB", g2]]);
   assert.ok(md.startsWith("# No data loss"), md);
