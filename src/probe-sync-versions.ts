@@ -26,7 +26,7 @@ import { engineBin } from "./engine.js";
 import { runProcess } from "./exec.js";
 import { NOTE_DIR } from "./types.js";
 
-const { values } = parseArgs({ options: { nodes: { type: "string" }, bin: { type: "string" } } });
+const { values } = parseArgs({ options: { nodes: { type: "string" }, bin: { type: "string" }, check: { type: "boolean" } } });
 const names = (values.nodes ?? "n1,n2").split(",").map((s) => s.trim()).filter(Boolean);
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 if (names.length < 2) {
@@ -48,18 +48,67 @@ const TOKEN = "(probe-token)";
 
 const engine = engineBin();
 
-async function main(): Promise<void> {
-  console.log(`probe-sync-versions: note=${note} nodes=${names.join(",")}\n`);
-
-  // --- setup: a note both nodes agree on, so we start from a genuinely settled state ----------
-  console.log("0. setup — create the note on n1 and let both nodes settle");
+/** A note BOTH nodes have, so `sync:history` has real server history to look up. Without it every
+ *  query answers "not found" in milliseconds and never reaches the path being measured — which is
+ *  exactly how the first version of `--check` fooled itself. */
+async function settleNote(): Promise<void> {
   await n1.createNote(note, "seed\n");
   for (let i = 0; i < 30; i++) {
-    const a = await readCanonical(n1, note);
-    const b = await readCanonical(n2, note);
-    if (a !== null && b !== null) break;
+    if ((await readCanonical(n1, note)) !== null && (await readCanonical(n2, note)) !== null) return;
     await new Promise((r) => setTimeout(r, 1000));
   }
+}
+
+/**
+ * `--check`: the assertions worth re-running, fast, with an exit code — for check-assumptions.
+ *
+ * Two claims the settle loop is BUILT on, both of them ours (written from observation, not from any
+ * Obsidian documentation) and therefore both liable to expire silently under an upgrade:
+ *
+ *   driver.ts   "`sync:status` BLOCKS until the node is synced" — the entire bounded-probe design
+ *               exists because of this. If it stopped blocking, `syncStateProbe`'s timeout would
+ *               stop meaning "not synced yet" and the settle would be reading noise.
+ *   driver.ts   sync reads "can silently block for a long time", which is why every attempt is
+ *               capped. Measured cause (see docs/DESIGN.md): no network, not merely being behind.
+ *
+ * Deliberately ONE bounded call per claim rather than the full retry sequence: this needs to cost
+ * seconds, not the 75s the exploratory path takes.
+ */
+async function check(): Promise<number> {
+  const CAP_MS = 6000;
+  let bad = 0;
+  await settleNote(); // the blocking path needs a file the server actually knows about
+  const ok = (m: string) => console.log(`      ok   ${m}`);
+  const fail = (m: string) => { console.error(`      FAIL ${m}`); bad++; };
+
+  const settled = await ms(() => n2.syncStateProbe(CAP_MS));
+  if (settled.v === "synced" && settled.ms < 2000) ok(`a synced node answers sync:status in ${settled.ms}ms`);
+  else fail(`expected a prompt "synced" from an idle node, got "${settled.v}" in ${settled.ms}ms`);
+
+  await runProcess(engine, ["network", "disconnect", "obsidian-net", names[1]]);
+  try {
+    const off = await ms(() => n2.syncStateProbe(CAP_MS));
+    if (off.v === "timeout") ok(`an offline node still BLOCKS on sync:status (killed at ${CAP_MS}ms) — the bounded probe still means what the settle assumes`);
+    else fail(`an offline node answered sync:status with "${off.v}" in ${off.ms}ms instead of blocking — syncStateProbe's timeout no longer means "not synced"`);
+
+    const exec2 = new ContainerExecutor(names[1], bin);
+    const raw = await ms(() => exec2.exec(["sync:history", `file=${note}`, "total"], { timeoutMs: CAP_MS }));
+    if (raw.v.killed) ok(`an offline node still blocks on sync:history total (killed at ${CAP_MS}ms) — per-attempt capping still earns its keep`);
+    else ok(`an offline node now ANSWERS sync:history total in ${raw.ms}ms ("${raw.v.stdout.trim().slice(0, 40)}") — not a failure, but the long blocks may be gone`);
+  } finally {
+    await runProcess(engine, ["network", "connect", "--ip", `10.89.0.${100 + Number(names[1].replace(/\D/g, ""))}`, "obsidian-net", names[1]]);
+  }
+  return bad;
+}
+
+async function main(): Promise<void> {
+  if (values.check) {
+    process.exit(await check());
+  }
+  console.log(`probe-sync-versions: note=${note} nodes=${names.join(",")}\n`);
+
+  console.log("0. setup — create the note on n1 and let both nodes settle");
+  await settleNote();
   say(`n1 has it: ${(await readCanonical(n1, note)) !== null}, n2 has it: ${(await readCanonical(n2, note)) !== null}`);
 
   // --- 1. cost on a settled node --------------------------------------------------------------

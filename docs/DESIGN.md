@@ -185,6 +185,21 @@ disconnected node cannot report `synced` — not because "synced" implies caught
 implies *has a network*. Worth knowing before anyone simplifies that gate away on the grounds that
 catching up is fast. It is; being offline is not.
 
+**Do not make the baseline eager.** The temptation is that `from` is only sampled once a node already
+claims `synced`, so the recorded `from`→`to` covers only the tail of a wait; reading it up front would
+make the span cover the whole wait. But that buys no new *information* — the counter never leads the
+content (above), so a wider span records the same events more tidily and reveals nothing extra. And
+it carries an untested risk: everything measured here reconnects at the node's **pinned IP**, so the
+client's existing connection resumes. A node returning on a *different* address — the wifi-to-cellular
+case — would have its old socket die on timeout instead, which is exactly the situation where a
+client might sit on a dead connection. Nobody has measured that, and there is no reason to take the
+risk for tidier bookkeeping.
+
+Also note the blocking is specific to files the client believes have server history: querying
+`sync:history` for a note that does not exist answers "not found" in milliseconds even with no
+network. An offline check that forgets to create its note will quietly measure nothing — which is how
+the first version of `--check` fooled itself.
+
 It also explains the shape of the defences: `RECOGNIZE_CALL_TIMEOUT_MS` turns those 5s hangs into a
 visible retry sequence instead of one silent 40s stall, which is exactly what the retry log above
 shows.

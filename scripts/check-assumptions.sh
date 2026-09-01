@@ -46,7 +46,7 @@ CLI=/opt/obsidian/obsidian-cli
 
 fails=0
 step=0
-say()  { step=$((step + 1)); printf '\n[%d/6] %s\n' "$step" "$1"; }
+say()  { step=$((step + 1)); printf '\n[%d/7] %s\n' "$step" "$1"; }
 ok()   { printf '      ok   %s\n' "$1"; }
 bad()  { printf '      FAIL %s\n' "$1" >&2; fails=$((fails + 1)); }
 note() { printf '      --   %s\n' "$1"; }
@@ -230,6 +230,19 @@ case $? in
   3) bad "check-cli found no running node (did one go away mid-run?) — nothing was verified" ;;
   *) bad "obsidian-cli output drifted — see above; parsers in src/cli-parse.ts need updating" ;;
 esac
+
+# 7. Two claims the settle loop is BUILT on, both of them OURS — written into driver.ts from
+#    observation at some past moment, never from Obsidian documentation, and therefore liable to
+#    expire silently under an upgrade. `syncStateProbe`'s whole design assumes `sync:status` blocks
+#    until a node is synced; if it stopped blocking, a probe timeout would no longer mean "not
+#    synced yet" and every settle would be reading noise. Per-attempt capping likewise assumes sync
+#    reads can hang. Measured, not asserted: see docs/DESIGN.md.
+say "sync:status / sync:history still block the way the settle assumes"
+if npm run --silent probe-sync-versions -- --check; then
+  ok "the bounded-probe design still rests on true behaviour"
+else
+  bad "sync CLI blocking behaviour changed — src/driver.ts's syncStateProbe may be reading noise"
+fi
 
 # The deferred half of step 3: does the Obsidian actually running in a node self-report the version
 # its image is tagged with? An image that drifted from its tag would mislabel every run's results.
