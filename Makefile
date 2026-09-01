@@ -136,6 +136,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(OPS),--ops $(OPS)) \
   $(if $(NOTES),--notes $(NOTES)) \
   $(FORCED_TURNS_FLAG) \
+  $(if $(PREFIX),--prefix '$(PREFIX)') \
   $(if $(WAIT_PROB),--wait-prob $(WAIT_PROB)) \
   $(if $(PAUSE_PROB),--pause-prob $(PAUSE_PROB)) \
   $(if $(PAUSE_SEC),--pause-sec $(PAUSE_SEC)) \

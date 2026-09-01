@@ -212,6 +212,39 @@ It also explains the shape of the defences: `RECOGNIZE_CALL_TIMEOUT_MS` turns th
 visible retry sequence instead of one silent 40s stall, which is exactly what the retry log above
 shows.
 
+## Creating a note and editing one are not the same operation
+
+Measured over 10 runs of create-then-edit-three-times, timing each write until BOTH nodes showed it:
+
+| | min | median | max | n |
+|---|---|---|---|---|
+| create | 0.8s | **1.0s** | 1.6s | 10 |
+| every edit | 9.3s | **10.0s** | 10.7s | 30 |
+
+A factor of ten, with no overlap: the slowest create is six times faster than the fastest edit. And
+the edit figure barely moves — 30 samples inside a 1.4s band around 10.0s. Network latency or server
+load would spread; a tight clamp just under a round number looks like a fixed internal cycle rather
+than a transfer.
+
+Two things follow.
+
+**A `W` systematically loses the race.** A mid-history `W` returns at its 4-5s floor (see above),
+while the edit it is nominally waiting for lands at ~10s. So a barrier hand-off does not *sometimes*
+race the sync — it is beaten by roughly five seconds, every time. That is the mechanism behind mild
+turn-taking histories like `N1AaWN2AaW…` losing data so readily.
+
+**Every history's first edit is special.** Without a fixed opening, a generated history spends its
+first append in the fast create path and the rest in the slow edit path — two regimes in one
+experiment. `PREFIX=N1AaWN2PW` exists for this: it creates and settles a note on both nodes before
+the generated part starts, so what follows is uniformly the edit case. Prefix appends deliberately do
+not count toward `OPS`, which is the size of the experiment, not of its setup.
+
+A prediction worth testing, and cheap: `FORCED_TURNS=P12W` should collapse the failure rate of those
+histories, because the pause outlasts the ~10s propagation before the `W` even looks. Note the right
+way to test it is the forced turn, NOT raising `W_SETTLE_SEC` — the latter changes what every `W`
+means while the recorded string still says `W`, silently reclassifying stored histories, whereas
+`P12W` puts the change in the artifact where a reader can see it.
+
 ## The local node (`L`): a grammar token, not a parallel code path
 
 Adding a real Obsidian instance running directly on the host as a harness participant could have

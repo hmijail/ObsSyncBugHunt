@@ -70,6 +70,51 @@ test("FORCED_TURNS=W: a W before every cross-node edit", () => {
   }
 });
 
+test("PREFIX opens every history, and its appends do NOT count toward OPS", () => {
+  // OPS is the size of the experiment; the prefix is setup, so the two ADD. The count is not exact
+  // per-run because adjacent same-note appends still collapse (documented) — more notes only makes
+  // that rarer, never impossible. So assert the bound that always holds, plus the fact that only an
+  // ADDITIVE prefix could ever reach it: if prefix appends were counted toward OPS, 3 would be the
+  // ceiling and 4 unreachable.
+  let sawFull = 0;
+  for (let s = 1; s <= 25; s++) {
+    const h = generateHistory({
+      nodes: 2, ops: [3, 3], notes: 4, prefix: parse("N1AaWN2PW"),
+      waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s),
+    });
+    assert.match(serialize(h), /^N1AaW/, `prefix should open the history: ${serialize(h)}`);
+    const appends = h.filter((o) => o.cmd === "append").length;
+    assert.ok(appends <= 4, `never more than prefix(1) + OPS(3): ${serialize(h)}`);
+    if (appends === 4) sawFull++;
+  }
+  assert.ok(sawFull > 0, "some run should reach 4 appends, which only an additive prefix allows");
+});
+
+test("PREFIX: a node the prefix disconnects is still reconnected at the end", () => {
+  // The generator replays the prefix's effect on its offline set, so it knows to heal what the
+  // prefix broke — otherwise the history would end mid-partition and only execute.ts's implicit
+  // reconnect would save it, leaving the STRING not self-contained.
+  for (let s = 1; s <= 15; s++) {
+    const h = generateHistory({
+      nodes: 2, ops: [2, 2], notes: 2, prefix: parse("N1AaWN2D"),
+      waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s),
+    });
+    assert.equal(h[h.length - 1].cmd, "connect", `should end reconnected: ${serialize(h)}`);
+  }
+});
+
+test("PREFIX: the first generated append still gets its forced hand-off turn", () => {
+  // prevEditor is seeded from the prefix's last append (n1 here), so an immediately-following
+  // generated append on n2 is a cross-node hand-off like any other.
+  for (let s = 1; s <= 15; s++) {
+    const h = generateHistory({
+      nodes: 2, ops: [4, 4], notes: 4, prefix: parse("N1Aa"), forcedTurns: parse("W"),
+      waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s),
+    });
+    assert.equal(crossNodeUncoordinated(h, "wait"), 0, `every hand-off coordinated: ${serialize(h)}`);
+  }
+});
+
 test("FORCED_TURNS is emitted on the node that just edited, not the one about to", () => {
   // `N1AaWN2Aa`, never `N1AaN2WAa`. Not cosmetic: `W` only ever means "the ACTIVE node's client
   // reports synced", not that anything actually arrived anywhere. On the old node that is the

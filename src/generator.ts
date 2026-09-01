@@ -69,6 +69,7 @@ export interface GenParams {
   nodes: number; // node count (>=1) — numbered nodes only, the local instance is layered on top
   ops: [number, number]; // inclusive range for the number of EDITS (counts `A` only)
   notes?: number; // distinct notes (default 1 = max contention)
+  prefix?: History; // fixed ops every history opens with — setup, not part of the `ops` count
   forcedTurns?: History; // ops spliced in at a cross-node hand-off (default: a single W)
   waitProb?: number; // draw weight for a standalone `W`, relative to an append's 1 (default 0.2)
   pauseProb?: number; // draw weight for `P`, relative to an append's weight of 1 (default 0.3)
@@ -138,13 +139,30 @@ export function generateHistory(params: GenParams): History {
     return "append"; // unreachable except for float drift; an append always has weight
   };
 
-  const ops: History = [];
+  // A fixed opening, e.g. PREFIX=N1AaWN2PW: get a note created and settled on both nodes BEFORE the
+  // generated part starts. Creation and modification are not the same operation to Sync — a new
+  // note reaches the other node in ~1s, an edit to an existing one in ~10s (measured; see
+  // docs/DESIGN.md) — so without a prefix every history spends its first edit in a regime the rest
+  // of it never revisits. Prefix appends deliberately do NOT count toward `ops`: that is the size
+  // of the experiment, and this is setup.
+  const ops: History = (params.prefix ?? []).map((o) => ({ ...o }));
   let curNode: number | "local" = 0;
   let prevEditor: number | "local" = 0;
   let appends = 0;
   // Numbered nodes only. The local instance is structurally absent from this set, which is what
   // keeps it unselectable as a D/C target — see pickNumbered.
   const offline = new Set<number>();
+
+  // Replay the prefix's effect on the cursor, the last editor and who is offline, so the generated
+  // part continues from where it actually left off — otherwise the first generated append could
+  // miss its forced hand-off turn, or a node the prefix disconnected would never be reconnected.
+  for (const op of ops) {
+    if (op.cmd === "node") { curNode = op.node!; }
+    else if (op.cmd === "local") { curNode = "local"; }
+    else if (op.cmd === "append") { prevEditor = curNode; }
+    else if (op.cmd === "disconnect" && curNode !== "local") offline.add(curNode);
+    else if (op.cmd === "connect" && curNode !== "local") offline.delete(curNode);
+  }
 
   // No dedup here: `dropRedundantNodes` in normalize already removes a selector nothing uses.
   const setNode = (n: number | "local") => {

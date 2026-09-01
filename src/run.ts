@@ -34,6 +34,8 @@
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
 //   --notes          distinct notes per history              (default 1)
+//   --prefix         fixed opening ops, in DSL (e.g. N1AaWN2PW) — setup, not counted
+//                    toward --ops                              (default none)
 //   --forced-turns   ops forced at a cross-node hand-off, in DSL: W | P | P60 | WP30
 //                    | empty for none                          (default W)
 //   --pause-prob     draw weight for a pause, vs an edit's 1   (default 0.3)
@@ -156,6 +158,7 @@ const { values } = parseArgs({
     ops: { type: "string" },
     notes: { type: "string" },
     "forced-turns": { type: "string" },
+    prefix: { type: "string" },
     "pause-prob": { type: "string" },
     "wait-prob": { type: "string" },
     "pause-sec": { type: "string" },
@@ -224,6 +227,18 @@ const ops: [number, number] = [opsRange[0], opsRange[1] ?? opsRange[0]];
 // which is the one least likely to surface a bug, while the rep's record claims otherwise.
 // An EMPTY value is meaningful (no forced hand-off at all) and distinct from the flag being absent,
 // so the check is on presence, not truthiness.
+// A prefix is an ordinary history fragment, so anything the DSL accepts is allowed — normalize
+// still rejects what cannot be honoured (a D/C on the local node).
+let prefix: GenParams["prefix"];
+if (values.prefix) {
+  try {
+    prefix = parse(values.prefix);
+  } catch (e) {
+    console.error(`--prefix/PREFIX is not a valid history: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(2);
+  }
+}
+
 let forcedTurns = DEFAULT_FORCED_TURNS;
 if (values["forced-turns"] !== undefined) {
   try {
@@ -238,6 +253,7 @@ const genParams: GenParams = {
   ops,
   notes: Number(values.notes ?? 1),
   forcedTurns,
+  ...(prefix ? { prefix } : {}),
   ...(values["pause-prob"] !== undefined ? { pauseProb: Number(values["pause-prob"]) } : {}),
   ...(values["wait-prob"] !== undefined ? { waitProb: Number(values["wait-prob"]) } : {}),
   ...(values["pause-sec"] !== undefined ? { pauseSec: Number(values["pause-sec"]) } : {}),
