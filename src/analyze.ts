@@ -127,6 +127,10 @@ interface Group {
   // would inflate the denominator every rate here is measured against. Surfaced only so a
   // history's line says how rough the environment was while it ran.
   envfail: number;
+  // WOULD_FAIL_CHECK's mid-history peek: how often it fired, split by what the rep ACTUALLY ended
+  // as. Those two numbers are its precision; `failedUnwarned` is what it missed. Kept per history
+  // because a signal's usefulness is a property of the shape being run, not of the harness.
+  warnedFailed: number; warnedOk: number; failedUnwarned: number;
   // The shortest a rep of this history could honestly take (trace.ts's durationFloorSec), read
   // off any rep — it is a property of the history, identical for every rep of it. Absent for reps
   // recorded before the floor existed.
@@ -135,7 +139,8 @@ interface Group {
 }
 const newGroup = (): Group => ({
   reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0,
-  unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, envfail: 0, categories: new Map(),
+  unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, envfail: 0,
+  warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, categories: new Map(),
 });
 
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
@@ -158,7 +163,7 @@ const stats = (xs: number[]): string => {
   return s ? `min=${s.min} median=${s.median} max=${s.max} span=${s.span}` : "n/a";
 };
 
-function tally(g: Group, r: Results, rep: string) {
+function tally(g: Group, r: Results, rep: string, warned = false) {
   g.reps++;
   g.conv.push(r.timings?.convergenceSec ?? 0);
   g.minSec ??= r.timings?.minSec;
@@ -168,6 +173,11 @@ function tally(g: Group, r: Results, rep: string) {
   g.lost += lost;
   for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
 
+  const bad = !r.verdict.ok || !!r.timings?.unsynced;
+  if (warned && bad) g.warnedFailed++;
+  else if (warned) g.warnedOk++;
+  else if (bad) g.failedUnwarned++;
+
   const cells = buildStateCells(r);
   if (cells) {
     const category = classify(r);
@@ -175,7 +185,7 @@ function tally(g: Group, r: Results, rep: string) {
     const byState = g.categories.get(category) ?? new Map<string, StateEntry>();
     const entry = byState.get(key) ?? { cells, count: 0, reps: [] };
     entry.count++;
-    entry.reps.push(rep);
+    entry.reps.push(warned ? `${rep}*` : rep);
     byState.set(key, entry);
     g.categories.set(category, byState);
   }
@@ -231,6 +241,36 @@ export function renderCategoryTable(category: string, byState: Map<string, State
   const headerRow = `| ${headers.join(" | ")} |`;
   const sepRow = `|${headers.map(() => "---").join("|")}|`;
   return [`## ${category}`, "", headerRow, sepRow, ...rows, ""].join("\n");
+}
+
+/**
+ * WOULD_FAIL_CHECK's scorecard, one row per history that ever fired it.
+ *
+ * The peek runs the real oracle mid-history, after every `W` and `P`, whenever no node is offline.
+ * The open question is whether it DISCRIMINATES — whether a warning predicts the final verdict well
+ * enough to act on, e.g. by stopping a rep early. These three columns are that question in the form
+ * that matters: how often it was right, how often it would have killed a rep that went on to pass,
+ * and how often a failure gave no warning at all. A token can vanish mid-history and come back
+ * before the settle, so a high `warned & ended OK` means the signal is noise, not a finding.
+ *
+ * It needs its own table because there is nowhere else to put it: a rep that ended OK despite a
+ * warning has no row anywhere — clean histories render short and never list their reps. Reps that
+ * DID fail after a warning are additionally marked with `*` beside their name in the category
+ * tables above.
+ */
+export function renderEarlyWarning(rows: [string, Group][]): string {
+  const header = "| history | reps | warned & failed | warned & ended OK | failed with no warning |";
+  const sep = "|---|---|---|---|---|";
+  const body = rows.map(([str, g]) =>
+    `| ${str} | ${g.reps} | ${g.warnedFailed} | ${g.warnedOk} | ${g.failedUnwarned} |`);
+  return [
+    "# Early warning",
+    "",
+    "_WOULD_FAIL_CHECK fired mid-history for these. `warned & ended OK` is its false-positive count:"
+      + " a token can vanish and come back before the settle, so a large one means the signal is noise._",
+    "",
+    header, sep, ...body, "",
+  ].join("\n");
 }
 
 /** A clean history in its chronological place: heading and one-line stats, nothing else. Every rep
@@ -316,9 +356,12 @@ export function main(base: string): void {
       // path's last logger.log call, or the inconsistency path's — nothing is ever logged after it), so
       // the last line alone carries the verdict; no need to scan the whole file.
       const lines = readFileSync(path.join(strDir, repFile), "utf8").split("\n").filter(Boolean);
+      // The file is already fully in memory, so finding WOULD_FAIL_CHECK's mid-history peek costs a
+      // substring scan, not extra IO — and no JSON.parse, since only its presence matters.
+      const warned = lines.some((l) => l.includes('"kind":"would-fail"'));
       let last: Record<string, unknown>;
       try { last = JSON.parse(lines[lines.length - 1]); } catch { skipped++; continue; }
-      if (last.kind === "results") { tally(g, last as unknown as Results, rep); continue; }
+      if (last.kind === "results") { tally(g, last as unknown as Results, rep, warned); continue; }
       if (last.kind === "obsfail") { tallyThrown(g, "obsfail"); continue; }
       if (last.kind === "unknown") { tallyThrown(g, "unknown"); continue; }
       // Abandoned to an environment failure and retried — a real, explained ending, so not
@@ -341,6 +384,10 @@ export function main(base: string): void {
   // summarised together in the trailing table.
   const sections = active.map(([str, g]) => (isUninteresting(g) ? renderBrief(str, g) : renderGroup(str, g)));
   if (uninteresting.length > 0) sections.push(renderNoDataLoss(uninteresting));
+  // Only histories that actually exercised the check — omitted entirely when it was never on, which
+  // is every run to date.
+  const warned = active.filter(([, g]) => g.warnedFailed + g.warnedOk > 0);
+  if (warned.length > 0) sections.push(renderEarlyWarning(warned));
   const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");
   writeFileSync(outPath, md + "\n");
