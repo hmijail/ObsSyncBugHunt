@@ -18,7 +18,8 @@
     "repro": "tsx src/repro.ts",
     "test": "node --import tsx --test src/**/*.test.ts",
     "test:watch": "node --import tsx --test --watch src/**/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "probe-sync-versions": "tsx src/probe-sync-versions.ts"
   },
   "devDependencies": {
     "@types/node": "^22",

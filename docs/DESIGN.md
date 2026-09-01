@@ -135,6 +135,46 @@ but lowering only `wSettleSec` gets you to 3s, not 0, since the floor then domin
 buys speed by trusting a single sample, which is the one thing this codebase consistently refuses to
 do. Worth knowing the lever exists; not worth pulling by default.
 
+## The server version counter cannot see a pending sync
+
+`sync:history file=<n> total` gives a server-side count of versions for a note. It is tempting as a
+signal the *user* does not have: if it rose while a node still lacked the content, the harness could
+tell that a sync was in flight — catching the case of a user who waited, gave up, and edited anyway.
+
+It cannot. Measured with `npm run probe-sync-versions`:
+
+| | |
+|---|---|
+| cost on a settled node | ~170ms |
+| n1 appends, then reads its OWN total | still the old value, for ~9s |
+| n2's total while its content lacks the token | unchanged, every poll |
+| when the counter rises | the same poll in which the content arrives |
+| after a real partition + reconnect | identical: 153-195ms, counter and content flip together |
+
+The counter is a *local* view of server history that moves in lockstep with the content, not ahead of
+it. Even the **writing** node's own total did not count its edit until nine seconds later, at the
+moment the peer received it. So it offers no lead time over simply reading the file, and neither of
+the interesting uses is available: a wait cannot be made to honour it (it says nothing the content
+does not), and a "you gave up while a sync was pending" detector cannot be built on it.
+
+What it does support is what it is already used for: `total < 1` means a note never reached the
+server at all, which is `-NOUPLOAD`. That remains a hidden signal reaching a verdict, deliberately —
+it catches a note living on exactly one device, a durability failure the user cannot see.
+
+### Two claims in the code that this did not reproduce
+
+`execute.ts` justifies reading the baseline lazily because `sync:history total` "blocks until the
+queried node has caught up", and `driver.ts` bounds each attempt because such reads "can themselves
+silently block for a long time". Neither reproduced here: **every** call returned in 150-195ms,
+including the first one on a just-reconnected node with a pending version — the exact scenario the
+comment describes.
+
+That is not a refutation. The backlog here was one version after a three-second partition, while the
+comment cites ~70s stalls, so the conditions plausibly differ. But it does mean the lazy-baseline
+gymnastics in `waitForSynced` rest on an unverified premise, and the probe exists to re-check it
+cheaply — after an Obsidian upgrade, or before anyone simplifies that code on the assumption the
+blocking is real.
+
 ## The local node (`L`): a grammar token, not a parallel code path
 
 Adding a real Obsidian instance running directly on the host as a harness participant could have

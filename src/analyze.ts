@@ -131,6 +131,11 @@ interface Group {
   // as. Those two numbers are its precision; `failedUnwarned` is what it missed. Kept per history
   // because a signal's usefulness is a property of the shape being run, not of the harness.
   warnedFailed: number; warnedOk: number; failedUnwarned: number;
+  // Reps where the SERVER's version count for a note rose between the moment a node first reported
+  // `synced` and the moment that wait finished (the `from`/`to` of a `synced` event). Recorded at
+  // every W and settle since forever, and never once looked at. Worth surfacing because of what it
+  // implies: the client said "synced" and then more arrived, i.e. the claim was premature.
+  versionsGrew: number;
   // The shortest a rep of this history could honestly take (trace.ts's durationFloorSec), read
   // off any rep — it is a property of the history, identical for every rep of it. Absent for reps
   // recorded before the floor existed.
@@ -140,7 +145,7 @@ interface Group {
 const newGroup = (): Group => ({
   reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0,
   unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, envfail: 0,
-  warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, categories: new Map(),
+  warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
 });
 
 const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
@@ -163,7 +168,7 @@ const stats = (xs: number[]): string => {
   return s ? `min=${s.min} median=${s.median} max=${s.max} span=${s.span}` : "n/a";
 };
 
-function tally(g: Group, r: Results, rep: string, warned = false) {
+function tally(g: Group, r: Results, rep: string, warned = false, versionsGrew = false) {
   g.reps++;
   g.conv.push(r.timings?.convergenceSec ?? 0);
   g.minSec ??= r.timings?.minSec;
@@ -173,6 +178,7 @@ function tally(g: Group, r: Results, rep: string, warned = false) {
   g.lost += lost;
   for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
 
+  if (versionsGrew) g.versionsGrew++;
   const bad = !r.verdict.ok || !!r.timings?.unsynced;
   if (warned && bad) g.warnedFailed++;
   else if (warned) g.warnedOk++;
@@ -215,6 +221,7 @@ export const line = (g: Group) => {
   if (g.obsfail) parts.push(`obsfail=${g.obsfail}`);
   if (g.unknown) parts.push(`unknown=${g.unknown}`);
   if (g.envfail) parts.push(`envfail=${g.envfail}(retried)`);
+  if (g.versionsGrew) parts.push(`versionsgrew=${g.versionsGrew}`);
   if (g.lost) parts.push(`lost=${g.lost}(dropped=${g.serverDropped},unreg=${g.neverRegistered})`);
   if (g.duplReps) parts.push(`dupl=${g.duplReps}`);
   if (g.diffReps) parts.push(`diff=${g.diffReps}`);
@@ -359,9 +366,18 @@ export function main(base: string): void {
       // The file is already fully in memory, so finding WOULD_FAIL_CHECK's mid-history peek costs a
       // substring scan, not extra IO — and no JSON.parse, since only its presence matters.
       const warned = lines.some((l) => l.includes('"kind":"would-fail"'));
+      // Did a new server version land AFTER the node claimed `synced` but before the wait ended?
+      // Only `synced`/`unsynced` lines carry from/to, so the parse is limited to those few.
+      const versionsGrew = lines.some((l) => {
+        if (!l.includes('"kind":"synced"') && !l.includes('"kind":"unsynced"')) return false;
+        try {
+          const e = JSON.parse(l) as { from?: number; to?: number };
+          return typeof e.from === "number" && typeof e.to === "number" && e.to > e.from;
+        } catch { return false; }
+      });
       let last: Record<string, unknown>;
       try { last = JSON.parse(lines[lines.length - 1]); } catch { skipped++; continue; }
-      if (last.kind === "results") { tally(g, last as unknown as Results, rep, warned); continue; }
+      if (last.kind === "results") { tally(g, last as unknown as Results, rep, warned, versionsGrew); continue; }
       if (last.kind === "obsfail") { tallyThrown(g, "obsfail"); continue; }
       if (last.kind === "unknown") { tallyThrown(g, "unknown"); continue; }
       // Abandoned to an environment failure and retried — a real, explained ending, so not
