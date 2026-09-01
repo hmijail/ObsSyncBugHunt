@@ -43,7 +43,7 @@
 //   --pause-sec      ordinary pause length                     (default 10)
 //   --long-pause-prob chance an emitted pause is a long one    (default 0.25)
 //   --long-pause-sec  that long length                         (default 100)
-//   --partition-prob chance per edit of a network partition   (default 0; needs 2+ total
+//   --cd-prob        draw weight for a D and for a C, vs an edit's 1  (default 0.4; needs 2+ total
 //                    participants — numbered nodes + local instance if "l" is in --nodes)
 //   --repeat         reps per history                         (default 10)
 //   --histories      number of histories to run (<=0 = until killed) (default 1)
@@ -73,7 +73,7 @@
 //
 // Mirrors all stdout to a timestamped log under runs/ (invocation as its first line).
 //
-//   npm run start -- --turns paced --partition-prob 0.4
+//   npm run start -- --forced-turns P --cd-prob 0.4
 
 import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync } from "node:fs";
 import assert from "node:assert/strict";
@@ -164,7 +164,7 @@ const { values } = parseArgs({
     "pause-sec": { type: "string" },
     "long-pause-prob": { type: "string" },
     "long-pause-sec": { type: "string" },
-    "partition-prob": { type: "string" },
+    "cd-prob": { type: "string" },
     generate: { type: "string" },
     "poll-sec": { type: "string" },
     "min-floor-sec": { type: "string" },
@@ -262,7 +262,7 @@ const genParams: GenParams = {
   ...(values["pause-sec"] !== undefined ? { pauseSec: Number(values["pause-sec"]) } : {}),
   ...(values["long-pause-prob"] !== undefined ? { longPauseProb: Number(values["long-pause-prob"]) } : {}),
   ...(values["long-pause-sec"] !== undefined ? { longPauseSec: Number(values["long-pause-sec"]) } : {}),
-  ...(values["partition-prob"] !== undefined ? { partitionProb: Number(values["partition-prob"]) } : {}),
+  ...(values["cd-prob"] !== undefined ? { cdProb: Number(values["cd-prob"]) } : {}),
   localEnabled: localRequested,
 };
 
@@ -397,7 +397,7 @@ const tsStamp = () => {
 // results, tally) is recoverable. The invocation is the log's first line (written to
 // the file only — make already echoes the same command on the terminal).
 mkdirSync(runsRoot, { recursive: true });
-const slug = historyArg ? "history" : `ft${showForcedTurns(forcedTurns)}-ops${ops.join("-")}-rep${repeat}` + (genParams.partitionProb ? `-part${genParams.partitionProb}` : "");
+const slug = historyArg ? "history" : `ft${showForcedTurns(forcedTurns)}-ops${ops.join("-")}-rep${repeat}` + (genParams.cdProb ? `-part${genParams.cdProb}` : "");
 const logPath = path.join(runsRoot, `${tsStamp()}-${slug}.log`);
 appendFileSync(logPath, `npm run start -- ${process.argv.slice(2).join(" ")}\n`);
 // Synchronous append so the tail (rep results, tally) survives process.exit().

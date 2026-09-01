@@ -113,6 +113,10 @@ CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 # EMPTY is meaningful: no forced hand-off at all. `$(if ...)` treats empty as unset, which would
 # silently fall back to the default W — the same silent-wrong-experiment failure that strict
 # --forced-turns validation exists to prevent — so presence is tested with `$(origin)` instead.
+ifdef PARTITION_PROB
+$(error PARTITION_PROB= is now CD_PROB= — it is the draw weight for a D and for a C alike)
+endif
+
 ifdef RUNS_PREFIX
 $(error RUNS_PREFIX= is now RUNS_DIR=, and its meaning changed: it is the directory itself, \
 not a parent with "runs" appended. RUNS_PREFIX=/tmp/x becomes RUNS_DIR=/tmp/x/runs)
@@ -147,7 +151,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(PAUSE_SEC),--pause-sec $(PAUSE_SEC)) \
   $(if $(LONG_PAUSE_PROB),--long-pause-prob $(LONG_PAUSE_PROB)) \
   $(if $(LONG_PAUSE_SEC),--long-pause-sec $(LONG_PAUSE_SEC)) \
-  $(if $(PARTITION_PROB),--partition-prob $(PARTITION_PROB)) \
+  $(if $(CD_PROB),--cd-prob $(CD_PROB)) \
   $(if $(REPEAT),--repeat $(REPEAT)) \
   $(if $(DURATION_MIN),--duration-min $(DURATION_MIN)) \
   $(if $(SKIP_HOST_CHECK),--skip-host-check) \
@@ -327,7 +331,7 @@ RUNS_DIR ?= runs
 analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync-time distribution)
 	npm run analyze -- $(RUNS_DIR)
 
-generate-histories: ## Print N generated histories without running them (N=20; honours FORCED_TURNS/OPS/NOTES/PARTITION_PROB)
+generate-histories: ## Print N generated histories without running them (N=20; honours FORCED_TURNS/OPS/NOTES/CD_PROB)
 	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
 
 # Most of RUN_FLAGS (turns/ops/notes/pause-prob/isolator/...) doesn't apply to an already-concrete

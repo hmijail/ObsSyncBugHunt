@@ -52,7 +52,7 @@ test("generateHistory: edit count bounded, valid ops, serializable", () => {
 
 test("collapse: no two adjacent collapsible ops of the same kind", () => {
   for (let s = 1; s <= 25; s++) {
-    const h = generateHistory({ nodes: 3, ops: [4, 12], forcedTurns: parse("P"), partitionProb: 0.3, pauseProb: 0.2, notes: 2, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 3, ops: [4, 12], forcedTurns: parse("P"), cdProb: 0.3, pauseProb: 0.2, notes: 2, rng: mulberry32(s) });
     for (let i = 1; i < h.length; i++) {
       // Adjacent appends are only redundant when they target the SAME note (different
       // notes back-to-back are legitimate); the rest of COLLAPSIBLE never repeats adjacently.
@@ -65,7 +65,7 @@ test("collapse: no two adjacent collapsible ops of the same kind", () => {
 
 test("FORCED_TURNS=W: a W before every cross-node edit", () => {
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: parse("W"), partitionProb: 0, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 2, ops: [6, 10], forcedTurns: parse("W"), cdProb: 0, rng: mulberry32(s) });
     assert.equal(crossNodeUncoordinated(h, "wait"), 0, `should W before cross-node edits: ${serialize(h)}`);
   }
 });
@@ -80,7 +80,7 @@ test("PREFIX opens every history, and its appends do NOT count toward OPS", () =
   for (let s = 1; s <= 25; s++) {
     const h = generateHistory({
       nodes: 2, ops: [3, 3], notes: 4, prefix: parse("N1AaWN2PW"),
-      waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s),
+      waitProb: 0, pauseProb: 0, cdProb: 0, rng: mulberry32(s),
     });
     assert.match(serialize(h), /^N1AaW/, `prefix should open the history: ${serialize(h)}`);
     const appends = h.filter((o) => o.cmd === "append").length;
@@ -97,7 +97,7 @@ test("PREFIX: a node the prefix disconnects is still reconnected at the end", ()
   for (let s = 1; s <= 15; s++) {
     const h = generateHistory({
       nodes: 2, ops: [2, 2], notes: 2, prefix: parse("N1AaWN2D"),
-      waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s),
+      waitProb: 0, pauseProb: 0, cdProb: 0, rng: mulberry32(s),
     });
     assert.equal(h[h.length - 1].cmd, "connect", `should end reconnected: ${serialize(h)}`);
   }
@@ -109,7 +109,7 @@ test("PREFIX: the first generated append still gets its forced hand-off turn", (
   for (let s = 1; s <= 15; s++) {
     const h = generateHistory({
       nodes: 2, ops: [4, 4], notes: 4, prefix: parse("N1Aa"), forcedTurns: parse("W"),
-      waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s),
+      waitProb: 0, pauseProb: 0, cdProb: 0, rng: mulberry32(s),
     });
     assert.equal(crossNodeUncoordinated(h, "wait"), 0, `every hand-off coordinated: ${serialize(h)}`);
   }
@@ -121,7 +121,7 @@ test("FORCED_TURNS is emitted on the node that just edited, not the one about to
   // glance at the sync indicator a user really takes before switching devices; on the new node it
   // would be n2 reporting synced while possibly unaware n1's edit exists at all.
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 2, ops: [4, 8], forcedTurns: parse("W"), waitProb: 0, pauseProb: 0, partitionProb: 0, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 2, ops: [4, 8], forcedTurns: parse("W"), waitProb: 0, pauseProb: 0, cdProb: 0, rng: mulberry32(s) });
     for (let i = 0; i < h.length; i++) {
       if (h[i].cmd !== "wait") continue;
       // The op right after a forced W is the selector moving to the NEW node; the W therefore ran
@@ -188,7 +188,7 @@ test("pauses are on by default, so a default soak can reach a long offline windo
 test("partitions: D/C balanced, healed by the end, and can overlap (all-offline)", () => {
   let sawConcurrent = false;
   for (let s = 1; s <= 30; s++) {
-    const h = generateHistory({ nodes: 3, ops: [6, 12], partitionProb: 0.6, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 3, ops: [6, 12], cdProb: 0.6, rng: mulberry32(s) });
     const cmds = h.map((o) => o.cmd);
     assert.equal(cmds.filter((c) => c === "disconnect").length, cmds.filter((c) => c === "connect").length, `D/C balanced: ${serialize(h)}`);
     const lastD = cmds.lastIndexOf("disconnect");
@@ -206,7 +206,7 @@ test("localEnabled: the local instance is picked as an edit target but is NEVER 
   // as an uncaught exception here.
   let sawLocal = false;
   for (let s = 1; s <= 40; s++) {
-    const h = generateHistory({ nodes: 3, ops: [6, 14], partitionProb: 0.6, localEnabled: true, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 3, ops: [6, 14], cdProb: 0.6, localEnabled: true, rng: mulberry32(s) });
     if (h.some((o) => o.cmd === "local")) sawLocal = true;
   }
   assert.ok(sawLocal, "expected at least one generated history to select the local instance as an edit target");
@@ -214,12 +214,12 @@ test("localEnabled: the local instance is picked as an edit target but is NEVER 
 
 test("partitions: a single numbered node + the local instance still partitions (it counts as a second participant)", () => {
   // Regression guard: partitioning used to gate on nodeCount>1 alone, so a single numbered node
-  // (nodes: 1) with localEnabled never partitioned at all, regardless of partitionProb — even
+  // (nodes: 1) with localEnabled never partitioned at all, regardless of cdProb — even
   // though the local instance staying online while that one node disconnects is exactly the
   // interesting case (matches --nodes n1,l in practice).
   let sawPartition = false;
   for (let s = 1; s <= 30; s++) {
-    const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, localEnabled: true, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 1, ops: [4, 8], cdProb: 1, localEnabled: true, rng: mulberry32(s) });
     if (h.some((o) => o.cmd === "disconnect")) sawPartition = true;
   }
   assert.ok(sawPartition, "expected at least one partition with nodes:1 + localEnabled:true");
@@ -232,7 +232,7 @@ test("partitions: a single numbered node DOES partition — editing offline then
   // needs a second participant.
   let seen = 0;
   for (let s = 1; s <= 20; s++) {
-    const h = generateHistory({ nodes: 1, ops: [4, 8], partitionProb: 1, rng: mulberry32(s) });
+    const h = generateHistory({ nodes: 1, ops: [4, 8], cdProb: 1, rng: mulberry32(s) });
     if (h.some((o) => o.cmd === "disconnect")) seen++;
   }
   assert.ok(seen > 0, "a single node should be able to partition");
