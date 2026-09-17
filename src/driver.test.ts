@@ -229,8 +229,27 @@ test("vaultNameProbe: a killed reply → 'timeout' in exactly one attempt", asyn
 test("vaultNameProbe: an unrecognized (empty) reply → 'unrecognized' in exactly one attempt", async () => {
   const exec = new CountingExecutor({ stdout: "" });
   const d = new ObsidianDriver(exec);
-  assert.deepEqual(await d.vaultNameProbe(50), { status: "unrecognized" });
+  // `raw` comes back too, and an EMPTY string is a real answer to carry: "it said nothing" and
+  // "it said something we cannot parse" are different faults, and the log has to keep them apart.
+  assert.deepEqual(await d.vaultNameProbe(50), { status: "unrecognized", raw: "" });
   assert.equal(exec.execCalls, 1);
+});
+
+test("every unrecognized snapshot reply carries the bytes that were not recognized", async () => {
+  // "Could not parse it" is unactionable without the it. By the time anyone reads the log the call
+  // is long gone, so the recognizer can only be taught from what was captured here.
+  const GARBAGE = "Error: Sync is in error state. Check sync settings.";
+  const d = new ObsidianDriver(new CountingExecutor({ stdout: GARBAGE }), "/vault");
+  const got = [
+    await d.snapshotVersionsTotal("bughunt/x", 50),
+    await d.snapshotRead("bughunt/x", 50),
+    await d.snapshotReadByPath("bughunt/x.md", 50),
+    await d.vaultNameProbe(50),
+  ];
+  for (const r of got) {
+    assert.equal(r.status, "unrecognized");
+    assert.equal((r as { raw?: string }).raw, GARBAGE);
+  }
 });
 
 test("vaultNameProbe: a plain vault name is recognized in one attempt", async () => {
@@ -308,4 +327,46 @@ test("pinnedVault: sync:* commands never carry vault=, even when pinnedVault is 
   d.pinnedVault = "Throwaway";
   await d.syncStatus();
   assert.ok(!exec.lastExecArgv?.some((a) => a.startsWith("vault=")), `expected no vault= in argv: ${exec.lastExecArgv}`);
+});
+
+test("sampleNotes: a note that reads present but is missing from the listing is flagged, not trusted", () => {
+  // The same cross-check the oracle-grade read makes (gatherObservation): when a listing omits a
+  // note we just read, the two readings disagree — both arrived and parsed, and they cannot both be
+  // right — and taking the listing at face value has fabricated a false "loss" before now
+  // (docs/cli-trust.md). The sampler has both halves in one batch, so the check is free; unlike the
+  // oracle path it must never throw, so it reports and the lane draws `!`.
+  //
+  // Pinned here as the CONTRACT rather than exercised through a stub executor: `inconsistent` must
+  // be true exactly when the note read present and the usable listing lacks it.
+  const cases = [
+    { present: true, listingUsable: true, listed: [], expect: true },
+    { present: true, listingUsable: true, listed: ["bughunt/a.md"], expect: false },
+    { present: false, listingUsable: true, listed: [], expect: false }, // absent notes are not listed
+    { present: true, listingUsable: false, listed: [], expect: false }, // unreadable listing decides nothing
+  ];
+  for (const c of cases) {
+    const inconsistent = c.present && c.listingUsable && !c.listed.includes("bughunt/a.md");
+    assert.equal(inconsistent, c.expect, JSON.stringify(c));
+  }
+});
+
+test("conflictsOf / listingContradictsRead: one implementation, both read paths", () => {
+  // These two predicates were duplicated in gatherObservation (oracle-grade) and sampleNotes
+  // (bounded look). The paths differ in TRUST POLICY — how hard they try, and whether a
+  // contradiction throws — but the interpretation is the same, so a fix here reaches both.
+  const files = [
+    "bughunt/a.md",
+    "bughunt/a (Conflicted copy n2 202606211146).md",
+    "bughunt/ab.md",                                    // a different note, not a conflict of `a`
+    "bughunt/ab (Conflicted copy n1 202606211200).md",  // nor is its conflict copy
+  ];
+  assert.deepEqual(ObsidianDriver.conflictsOf(files, "bughunt/a"),
+    ["bughunt/a (Conflicted copy n2 202606211146).md"]);
+
+  const contradicts = ObsidianDriver.listingContradictsRead;
+  assert.equal(contradicts(true, true, [], "bughunt/a"), true, "read present, listing lacks it");
+  assert.equal(contradicts(true, true, files, "bughunt/a"), false);
+  assert.equal(contradicts(false, true, [], "bughunt/a"), false, "an absent note is not listed");
+  // An unreadable listing has NO OPINION. Treating it as a contradiction would invent evidence.
+  assert.equal(contradicts(true, false, [], "bughunt/a"), false);
 });

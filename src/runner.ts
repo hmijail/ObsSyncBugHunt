@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { formatToken, type NodeId } from "./types.js";
-import { ObsidianDriver, isConflictFile } from "./driver.js";
+import { ObsidianDriver } from "./driver.js";
 import { CliInconsistencyError } from "./inconsistency.js";
 import type { Isolator } from "./isolate.js";
 import { RunLogger } from "./history.js";
@@ -103,25 +103,24 @@ async function waitForQuiescence(
 }
 
 export async function gatherObservation(d: ObsidianDriver, note: string): Promise<NodeObservation> {
-  const canonical = await readCanonical(d, note);
-  const files = (await d.listFiles()).value ?? [];
+  // Read and listing in ONE round trip, retried together until both parse. The round trip is the
+  // whole cost of a CLI call here (an empty container exec measures the same as a `read`, see
+  // docs/DESIGN.md), and this runs on every settle poll of every rep — the default path, not just
+  // the instrumented modes.
+  const { canonical, files } = await d.readWithListing(note);
   // Anchor (positive identification of the listing): if the note reads as PRESENT, the
   // folder listing MUST contain it. A listing that omits a note we just read is self-
   // inconsistent and can fabricate a false "loss" (see docs/cli-trust.md's founding incident) —
   // don't trust such a listing; flag it as an inconsistency instead.
-  if (canonical !== null && !files.includes(`${note}.md`)) {
+  if (ObsidianDriver.listingContradictsRead(canonical !== null, true, files, note)) {
     throw new CliInconsistencyError("cli-listing-inconsistent", {
       node: d.node, note, listedCount: files.length,
       detail: "note read as present but absent from `files` listing — listing untrustworthy",
     });
   }
-  const conflicts: ConflictFile[] = [];
-  for (const f of files) {
-    if (isConflictFile(f) && f.startsWith(`${note} (Conflicted copy`)) {
-      const c = await d.readByPath(f);
-      conflicts.push({ file: f, content: c.ok ? (c.value ?? "") : "" });
-    }
-  }
+  const mine = ObsidianDriver.conflictsOf(files, note);
+  const bodies = await d.readPathsRecognized(mine); // one more round trip, and only when there are any
+  const conflicts: ConflictFile[] = mine.map((file, i) => ({ file, content: bodies[i] }));
   return { node: d.node, note, canonical, conflicts };
 }
 

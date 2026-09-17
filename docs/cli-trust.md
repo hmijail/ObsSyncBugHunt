@@ -83,6 +83,57 @@ answer on its own; it must be confirmed by an independent source:
   created" bug; an on-disk-but-CLI-omits mismatch is the 2026-06-26 dropout. Either → `-OBSFAIL`. Skipped
   when no `vaultPath` is configured (local/dev). `vaultPath` defaults to `/root/vaults/TestVault`
   (override `--vault-path`).
+- **Filesystem second-source for CONTENT (implemented 2026-09-08).** The listing check above settles
+  which files EXIST; this settles what is IN them. `ObsidianDriver.readFileFs` `cat`s a vault-relative
+  path, and at the **settled verdict** `crossCheckContent` (execute.ts) compares disk against the
+  observation the oracle is about to judge — every note's canonical body and every conflict copy's
+  body, on every node. A mismatch → `cli-fs-content-disagreement` → `-OBSFAIL`.
+
+  Why it was needed: `lost` — the finding this whole harness exists to produce — meant "obsidian-cli's
+  `read` did not show the token, in the note or any conflict copy, on any node". One witness. A `read`
+  that omitted a token the file actually contained would have been reported as data loss, and nothing
+  would have contradicted it. The listing check had refused to take the CLI's word about which files
+  exist since the beginning; this stops taking its word about their contents.
+
+  Trailing newlines are normalised away before comparing (`read` returns the note without its final
+  newline, `cat` returns the file); comparing raw makes the check fire on every note, which is the
+  fastest route to it being switched off. Absent-on-both-sides is left to the listing check rather
+  than re-reported here. Skipped when no `vaultPath` is configured. Costs about one round trip per
+  file (`cat` and `read` measure the same — see docs/DESIGN.md); both cross-checks log a
+  `cross-check` line with what they compared and their `ms`, agreeing or not, so the current cost is
+  readable off any rep's log.
+
+## An "unrecognized" reply must be logged WITH the reply
+
+Recognizing output positively means there is a third outcome besides yes and no: the CLI said
+something this harness does not parse. Recording only that fact is useless — teaching a recognizer
+needs the exact bytes, and by the time anyone reads a log the call is long gone.
+
+**This was a real blind spot, not a hypothetical one.** `runs/` accumulated **421** `versStatus:
+"unrecognized"` sample entries that recorded the word and nothing else. The throwing path had always
+been fine (`CliUnrecognizedOutput` carries the `ExecResult`, and `describeInconsistency` writes its
+`stdout` into the rep's record); the gap was exactly the BOUNDED sampler, which must never throw and
+was therefore dropping its evidence on the floor.
+
+Every non-throwing path now returns the bytes alongside the status: `snapshotVersionsTotal`,
+`snapshotRead`, `snapshotReadByPath`, `snapshotFiles`, `vaultNameProbe`, and the version read folded
+into `editAndConfirm`. They surface on `sample` events as `versRaw` / `fileRaw`.
+
+- **Not truncated.** A reply worth reporting is worth reporting whole; it is the one artefact that
+  can teach the parser.
+- **An empty reply reports `raw: ""`**, not a missing field. "It said nothing" and "it said something
+  unparseable" are different faults and the log has to keep them apart.
+- **`cli-batch-unrecognized-retry` names WHICH command failed** and what it said. "One of these five
+  did not parse" is not actionable. A batch that could not be split at all has no per-command
+  outputs, so it reports the whole reply instead.
+
+**Open, and the point of collecting this.** The replies that *were* being captured are all things
+this project already documents: `Error: Sync is in error state. Check sync settings.` and
+`Error: Failed to retrieve sync history: Cannot read properties of null (…)` — phases 3 and 2 of the
+offline behaviour in docs/DESIGN.md. If those turn out to be the bulk of the unrecognized replies,
+they are not unparseable at all: they are a **known refusal** being filed as a mystery, and the
+recognizers should return it as a positive "the client refused" answer. That is now decidable from
+any soak's own log, which it was not before.
 
 ## Flagged-inconsistency conditions are per-rep outcomes (not a soak-killer)
 A correctness-assumption violation is **not fatal** — it's just another possible result of a rep, so a

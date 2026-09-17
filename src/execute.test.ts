@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ObsidianDriver } from "./driver.js";
-import { crossCheckFs, waitForSynced, runHistory } from "./execute.js";
+import { crossCheckFs, crossCheckContent, waitForSynced, runHistory } from "./execute.js";
 import { CliInconsistencyError } from "./inconsistency.js";
 import { sameConflictSet } from "./oracle.js";
 import { parse } from "./dsl.js";
@@ -47,6 +47,75 @@ test("crossCheckFs: CLI reports a file the FS lacks → flagged inconsistency (p
 test("crossCheckFs: FS has a file the CLI omits → flagged inconsistency (the 2026-06-26 dropout)", async () => {
   const d = driver("", "a.md\nb.md"); // CLI listing empty, disk non-empty
   await assert.rejects(() => crossCheckFs([d], "bughunt"), CliInconsistencyError);
+});
+
+// --- the CONTENT second source: `cat` must agree with obsidian-cli's `read` ------------------
+// Stub whose CLI view and DISK view can be made to differ, so the check has something to catch.
+class TwoViewExecutor implements Executor {
+  constructor(readonly id: string, private readonly cliBody: string, private readonly diskBody: string | null) {}
+  async exec(args: string[]): Promise<ExecResult> {
+    const r = (stdout: string): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
+    return r(args[0] === "read" ? this.cliBody : "");
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    const missing = this.diskBody === null;
+    return { argv, code: missing ? 1 : 0, stdout: missing ? "" : this.diskBody!, stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+const obs = (node: string, canonical: string | null, conflicts: { file: string; content: string }[] = []) =>
+  ({ node, note: "bughunt/x", canonical, conflicts });
+
+test("crossCheckContent: disk and CLI agree → no inconsistency", async () => {
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "(n1-1-a)", "(n1-1-a)"), "/vault");
+  await crossCheckContent([d], [obs("n1", "(n1-1-a)")]);
+});
+
+test("crossCheckContent: a trailing newline is formatting, not a disagreement", async () => {
+  // `read` returns the note without its final newline, `cat` returns the file. Comparing raw would
+  // make this check fire on literally every note, which is the fastest way to get it turned off.
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "(n1-1-a)", "(n1-1-a)\n"), "/vault");
+  await crossCheckContent([d], [obs("n1", "(n1-1-a)")]);
+});
+
+test("crossCheckContent: the CLI hiding a token that IS on disk is caught", async () => {
+  // The failure this exists for: every `lost` verdict is obsidian-cli's word alone, so a `read`
+  // that omits a token the file actually contains would be reported as data loss.
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "(n1-1-a)", "(n1-1-a)\n(n2-2-a)"), "/vault");
+  await assert.rejects(() => crossCheckContent([d], [obs("n1", "(n1-1-a)")]), CliInconsistencyError);
+});
+
+test("crossCheckContent: a conflict copy's body is checked too, not just the note", async () => {
+  // A token "preserved in a conflict file" is the difference between onlyInConflict and lost, so
+  // that body carries as much weight as the canonical one.
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "(n1-1-a)", "(n1-1-a)"), "/vault");
+  await assert.rejects(
+    () => crossCheckContent([d], [obs("n1", "(n1-1-a)", [{ file: "bughunt/x (Conflicted copy n2 202609071550).md", content: "(n2-2-a)" }])]),
+    CliInconsistencyError,
+    "the conflict body read as (n2-2-a) but disk says (n1-1-a)",
+  );
+});
+
+test("crossCheckContent: absent on both sides is the listing check's business, not this one", async () => {
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "", null), "/vault");
+  await crossCheckContent([d], [obs("n1", null)]);
+});
+
+test("crossCheckContent: reports what it compared and what it cost, even when it agrees", async () => {
+  // A check that reads two sources and says nothing unless it is unhappy leaves both its cost and
+  // the fact that it ran at all invisible — and then a claim about its cost cannot be re-checked.
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "(n1-1-a)", "(n1-1-a)"), "/vault");
+  const events: Record<string, unknown>[] = [];
+  await crossCheckContent([d], [obs("n1", "(n1-1-a)")], stubLogger(events));
+  const line = events.find((e) => e.kind === "cross-check");
+  assert.ok(line, "the check logged a line despite finding nothing wrong");
+  assert.equal(line.what, "content");
+  assert.equal(line.files, 1);
+  assert.equal(typeof line.ms, "number");
+});
+
+test("crossCheckContent: no vault path configured → skipped (no throw)", async () => {
+  const d = new ObsidianDriver(new TwoViewExecutor("n1", "(n1-1-a)", "something else"));
+  await crossCheckContent([d], [obs("n1", "(n1-1-a)")]);
 });
 
 test("crossCheckFs: no vault path configured → skipped (no throw)", async () => {
@@ -167,7 +236,11 @@ class SharedVaultExecutor implements Executor {
   private syncStatusCalls = 0;
   private vaultNameCalls = 0;
   constructor(readonly id: string, private readonly vault: Map<string, string>, private readonly syncStatus: (string | "killed") | (string | "killed")[] = "synced", private readonly startSynced = true, private readonly vaultName: (string | "killed") | (string | "killed")[] = "TestVault") {}
+  /** Every command this node was asked to run, in order — so a test can assert on what the write
+   *  path did NOT send, which is the only way to catch a round trip creeping back in. */
+  readonly seen: string[][] = [];
   async exec(args: string[]): Promise<ExecResult> {
+    this.seen.push(args);
     const r = (stdout: string, killed = false): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed });
     const params = Object.fromEntries(args.slice(1).map((a) => {
       const i = a.indexOf("=");
@@ -183,7 +256,13 @@ class SharedVaultExecutor implements Executor {
         const word = seq[Math.min(i, seq.length - 1)];
         return word === "killed" ? r("", true) : r(`status: ${word}`);
       }
-      case "sync:history": return this.vault.has(params.file) ? r("1") : notFound(params.file);
+      // One server version per line of content. It used to answer a constant "1", which made every
+      // edit after a note's first look like an upload that never left — the token-aware `W` waits
+      // for this counter to move past its pre-write value, so a constant hangs it forever.
+      case "sync:history":
+        return this.vault.has(params.file)
+          ? r(String((this.vault.get(params.file) ?? "").split("\n").filter(Boolean).length))
+          : notFound(params.file);
       case "files": return r([...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
       case "read": return this.vault.has(params.file) ? r(this.vault.get(params.file)!) : notFound(params.file);
       case "create": {
@@ -192,6 +271,11 @@ class SharedVaultExecutor implements Executor {
         return r(`Created: ${file}`);
       }
       case "append": {
+        // Appending to a note this node does not have is an ERROR, not a silent create. Measured
+        // against obsidian-cli 1.13.7 on 2026-09-06: `Error: File "..." not found.` The stub used to
+        // create it, which quietly made the create path untestable — the executor never returned the
+        // reply the real one does, so nothing ever took the branch that handles it.
+        if (!this.vault.has(params.file)) return notFound(params.file);
         const prev = this.vault.get(params.file) ?? "";
         this.vault.set(params.file, prev ? `${prev}\n${params.content}` : params.content);
         return r(`Appended to: ${params.file}`);
@@ -211,6 +295,151 @@ class SharedVaultExecutor implements Executor {
   }
 }
 
+test("append: a note's first write CREATES it, later writes append, and neither duplicates", async () => {
+  // The write path tries `append` first and falls back to `create` only when the CLI positively
+  // reports the note missing. Deliberately that order: `create` on an existing note neither fails
+  // nor overwrites — the real CLI silently makes a numbered sibling (`<note> 1.md`), a file the
+  // oracle never accounted for. Guessing wrong toward `append` costs a round trip and nothing else.
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const events: Record<string, unknown>[] = [];
+  await runHistory([n1], new NoopIsolator(), stubLogger(events), parse("AaP1Aa"), {
+    noteName: (l) => `bughunt/${l}`,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1, hostCheck: false,
+  });
+  const appended = events.filter((e) => e.kind === "appended");
+  assert.equal(appended.length, 2);
+  assert.equal(appended[0].created, true, "the first write had to create the note");
+  assert.equal(appended[1].created, false, "the second appended to the note that now exists");
+  // Both tokens survive, each exactly once: an append retried over a create would double one.
+  const body = vault.get("bughunt/a") ?? "";
+  for (const e of appended) {
+    assert.equal(body.split(e.token as string).length - 1, 1, `${e.token as string} appears exactly once`);
+  }
+});
+
+test("a note's genesis write goes straight to create — no doomed append, no baseline read", async () => {
+  // The write path normally probes with `append` and creates only on a positive "not found". At a
+  // note's GENESIS that probe is not a probe: nothing has written the note anywhere, so the reply is
+  // already known. Both round trips it would cost land between the two appends of a history like
+  // `N1AaN2Aa`, which is exactly where the harness must not be.
+  const vault = new Map<string, string>();
+  const ex = new SharedVaultExecutor("n1", vault);
+  const events: Record<string, unknown>[] = [];
+  await runHistory([new ObsidianDriver(ex)], new NoopIsolator(), stubLogger(events), parse("Aa"), {
+    noteName: (l) => `bughunt/${l}`,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1, hostCheck: false,
+  });
+  const upTo = ex.seen.findIndex((a) => a[0] === "create");
+  assert.ok(upTo >= 0, "the note was created");
+  const before = ex.seen.slice(0, upTo).map((a) => a[0]);
+  assert.ok(!before.includes("append"), `no append was attempted before the create, got ${before.join(",")}`);
+  assert.ok(!before.includes("sync:history"), `no counter was read before the create, got ${before.join(",")}`);
+  // The baseline is still RECORDED, just derived rather than measured — the timeline's `vers` lane
+  // has to start at the note's genesis, which is the whole reason these samples are logged.
+  const genesis = events.filter((e) => e.kind === "sample" && e.baseline === true);
+  assert.equal(genesis.length, 1);
+  assert.equal(genesis[0].inferred, true);
+  assert.equal(genesis[0].versStatus, "absent", "no node can hold server history for a note nothing has written");
+});
+
+test("a node's counter baseline is refreshed by its OWN append and by nobody else's", async () => {
+  // A baseline is "the counter before the write THIS node is waiting to see confirmed", not "the
+  // counter lately". Re-reading it when a different node appends could only replace a correct
+  // pre-write value with one that may already count the write — and it used to cost ~230ms sitting
+  // between two appends that were supposed to race.
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const events: Record<string, unknown>[] = [];
+  // `P1` only because the duration floor charges 0.1s per append and an instant stub cannot pay it;
+  // two appends by the same node is the shape being tested.
+  await runHistory([n1, n2], new NoopIsolator(), stubLogger(events), parse("AaP1Aa"), {
+    noteName: (l) => `bughunt/${l}`,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1, hostCheck: false,
+  });
+  // One group per append, in order: genesis names every node at once, then the writer names only
+  // itself. An `n2` in third place would mean a node re-read a baseline it already held — the
+  // ~230ms that used to sit between two appends meant to race.
+  const baselines = events.filter((e) => e.kind === "sample" && e.baseline === true);
+  assert.equal(events.filter((e) => e.kind === "appended").length, 2);
+  assert.deepEqual(
+    baselines.map((e) => `${e.node as string}${e.inferred === true ? "*" : ""}`),
+    ["n1*", "n2*", "n1"],
+    "genesis infers both nodes; n1's second append reads only n1's own counter",
+  );
+});
+
+test("a look that did not answer does not make the next one report a change", async () => {
+  // The 08T171228 shape: `M` marks scattered through a partition, always right after an `x`. A
+  // timed-out sample used to CLEAR the remembered content, so the next successful read compared
+  // against nothing and reported a change that never happened — 15 of that rep's 16 `changed`
+  // marks were this. `CounterLane` had the rule already ("a non-answer does not disturb the
+  // remembered value"); the file lane did not.
+  const vault = new Map<string, string>();
+  // `syncStatus` sequence drives the settle: killed probes make the sampler's own calls time out.
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault, ["killed", "killed", "synced"]));
+  const events: Record<string, unknown>[] = [];
+  await runHistory([n1], new NoopIsolator(), stubLogger(events), parse("AaP1"), {
+    noteName: (l) => `bughunt/${l}`, sampling: "everything",
+    pollSec: 0.05, minFloorSec: 0, capSec: 5, finalSettleSec: 0.3, probeSec: 1, hostCheck: false,
+  });
+  const looks = events.filter((e) => e.kind === "sample" && e.fileStatus !== undefined);
+  // Walk the samples in order: a `changed` may never sit immediately after a non-answer.
+  let prev: string | undefined;
+  for (const e of looks) {
+    if (prev !== undefined && prev !== "present" && prev !== "absent") {
+      assert.notEqual(e.changed, true, `a change was reported straight after a "${prev}" look`);
+    }
+    prev = e.fileStatus as string;
+  }
+  // And a look that could not answer must not claim the token is missing either.
+  for (const e of looks) {
+    if (e.fileStatus !== "present" && e.fileStatus !== "absent") {
+      assert.equal(e.lost, null, "an unanswered look reports `lost: null`, not a verdict");
+    }
+  }
+});
+
+test("a pause is sampled throughout under `everything`, and is not shortened by it", async () => {
+  // The pause used to be one uninterrupted sleep, so the most informative stretch of a D...P...C
+  // rep — where propagation actually happens — was the one stretch nothing watched.
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const n2 = new ObsidianDriver(new SharedVaultExecutor("n2", vault));
+  const events: Record<string, unknown>[] = [];
+  const t0 = Date.now();
+  await runHistory([n1, n2], new NoopIsolator(), stubLogger(events), parse("AaP1"), {
+    noteName: (l) => `bughunt/${l}`, sampling: "everything",
+    pollSec: 0.05, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1, hostCheck: false,
+  });
+  const elapsed = Date.now() - t0;
+  // Bracketed by the pause's own events, so the final settle's samples cannot be mistaken for these.
+  const at = (kind: string) => events.findIndex((e) => e.kind === kind);
+  const during = events.slice(at("pausing"), at("pause-snapshot"))
+    .filter((e) => e.kind === "sample" && e.fileStatus !== undefined);
+  assert.ok(during.length >= 2, `the pause was sampled more than once, got ${during.length}`);
+  assert.ok(during.some((e) => e.node === "n1") && during.some((e) => e.node === "n2"),
+    "every node is sampled, not just the one holding the cursor");
+  // The pause must never come out SHORTER than asked — that would change the experiment and is
+  // exactly what a sampling loop bounded on round COUNT rather than wall clock would do.
+  assert.ok(elapsed >= 1000, `the P1 pause still lasted at least its second, took ${elapsed}ms`);
+});
+
+test("a pause is not sampled in strategic mode", async () => {
+  const vault = new Map<string, string>();
+  const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
+  const events: Record<string, unknown>[] = [];
+  await runHistory([n1], new NoopIsolator(), stubLogger(events), parse("AaP1"), {
+    noteName: (l) => `bughunt/${l}`,
+    pollSec: 0.05, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1, hostCheck: false,
+  });
+  const at = (kind: string) => events.findIndex((e) => e.kind === kind);
+  const during = events.slice(at("pausing"), at("pause-snapshot"))
+    .filter((e) => e.kind === "sample");
+  assert.deepEqual(during, [], "the default mode leaves the pause alone");
+});
+
 test("W only waits on the active node's own driver, not every online driver (final settle still waits on all of them)", async () => {
   const vault = new Map<string, string>();
   const n1 = new ObsidianDriver(new SharedVaultExecutor("n1", vault));
@@ -220,7 +449,7 @@ test("W only waits on the active node's own driver, not every online driver (fin
 
   await runHistory([n1, n2], new NoopIsolator(), logger, parse("AaW"), {
     noteName: (l) => `bughunt/${l}`,
-    pollSec: 0.01, minFloorSec: 0, capSec: 5, wSettleSec: 0.02, finalSettleSec: 0.02, probeSec: 1,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1,
     hostCheck: false,
   });
 
@@ -244,7 +473,7 @@ test("a local-instance-backed third driver: W still scopes to 1, the final settl
 
   await runHistory([n1, n2, local], new NoopIsolator(), logger, parse("AaWLAaW"), {
     noteName: (l) => `bughunt/${l}`,
-    pollSec: 0.01, minFloorSec: 0, capSec: 5, wSettleSec: 0.02, finalSettleSec: 0.02, probeSec: 1,
+    pollSec: 0.01, minFloorSec: 0, capSec: 5, finalSettleSec: 0.02, probeSec: 1,
     hostCheck: false, localNode: 3,
   });
 
@@ -269,7 +498,7 @@ test("driverOf resolves N<d> by container name, not array position (the NODES=l,
   // that crashed a live soak). It must now resolve to the container actually named "n2".
   await runHistory([n2, local], new NoopIsolator(), logger, parse("N2AaLAa"), {
     noteName: (l) => `bughunt/${l}`, localNode: 2, hostCheck: false,
-    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+    pollSec: 0.01, minFloorSec: 0, finalSettleSec: 0.02,
   });
   const appended = events.filter((e) => e.kind === "appended");
   assert.equal(appended.length, 2);
@@ -298,7 +527,7 @@ test("driverOf is order-independent: N1/N2 resolve correctly even when drivers a
   const logger = stubLogger(events);
   await runHistory([n2, n1], new NoopIsolator(), logger, parse("N1AaN2Aa"), {
     noteName: (l) => `bughunt/${l}`, hostCheck: false,
-    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+    pollSec: 0.01, minFloorSec: 0, finalSettleSec: 0.02,
   });
   const appended = events.filter((e) => e.kind === "appended");
   assert.equal(appended.length, 2);
@@ -314,7 +543,7 @@ test("opts.snapshot: false skips the whole pause-snapshot mechanism — no event
   const logger = stubLogger(events);
   await runHistory([n1], new NoopIsolator(), logger, parse("AaP1"), {
     noteName: (l) => `bughunt/${l}`, hostCheck: false, snapshot: false,
-    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+    pollSec: 0.01, minFloorSec: 0, finalSettleSec: 0.02,
   });
   assert.equal(events.filter((e) => e.kind === "pause-snapshot").length, 0);
 });
@@ -326,7 +555,7 @@ test("pause-snapshot is logged by default (opts.snapshot unset)", async () => {
   const logger = stubLogger(events);
   await runHistory([n1], new NoopIsolator(), logger, parse("AaP1"), {
     noteName: (l) => `bughunt/${l}`, hostCheck: false,
-    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+    pollSec: 0.01, minFloorSec: 0, finalSettleSec: 0.02,
   });
   assert.equal(events.filter((e) => e.kind === "pause-snapshot").length, 1);
 });
@@ -377,7 +606,7 @@ test("assertLocalSyncOn: an inconclusive probe (syncing / timed-out / unreadable
     const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, ["synced", value, "synced"], true));
     const noLog = stubLogger();
     await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
-      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+      noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
     }); // resolves without throwing for every one of these states
   }
 });
@@ -395,7 +624,7 @@ test("assertLocalSyncOn: an off-state that recovers within the grace window does
   const result = await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1,
     localSyncGraceMs: 1, localSyncGraceAttempts: 2, // keep the grace window itself fast
-    capSec: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    capSec: 1, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
   }); // must resolve, not throw — this is exactly the bug: it used to throw off the first "error" read
   assert.equal(result.timings.hostOutage, true, "a rep that needed grace retries should flag its timings as unreliable");
 });
@@ -419,8 +648,7 @@ test("assertLocalVaultUnchanged: the captured name still matching the driver's o
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "Throwaway"));
   const noLog = stubLogger();
   await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
-    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
-    wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway", finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
   }); // must resolve, not throw
 });
 
@@ -433,7 +661,7 @@ test("assertLocalVaultUnchanged: a changed vault name is waited out, not aborted
   const logger = stubLogger(events);
   const result = await runHistory([local], new NoopIsolator(), logger, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
     noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
-    vaultRecheckMs: 1, wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    vaultRecheckMs: 1, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
   }); // must resolve, not throw — the whole point of this round's change
   assert.equal(result.timings.vaultDrift, true);
   assert.equal(events.filter((e) => e.kind === "local-vault-changed").length, 1);
@@ -447,8 +675,7 @@ test("assertLocalVaultUnchanged: no captured baseline (localVaultName unset) mea
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "WhateverIsActive"));
   const noLog = stubLogger();
   await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
-    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false,
-    wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
   }); // no localVaultName in opts → never checked, never throws regardless of the driver's report
 });
 
@@ -457,99 +684,8 @@ test("assertLocalVaultUnchanged: an inconclusive probe (killed) is tolerated, no
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "synced", true, "killed"));
   const noLog = stubLogger();
   await runHistory([local], new NoopIsolator(), noLog, [{ cmd: "local" }, { cmd: "append", note: "a" }], {
-    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway",
-    wSettleSec: 0.02, finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
+    noteName: (l) => `bughunt/${l}`, localNode: 1, hostCheck: false, localVaultName: "Throwaway", finalSettleSec: 0.02, pollSec: 0.01, minFloorSec: 0,
   }); // a killed vault-name probe must never itself manufacture a failure
-});
-
-// --- opt-in would-fail snapshot judgment (P and W) --------------------------------------
-// A single-driver in-memory vault whose content "vanishes" (files/read start reporting
-// not-found) after `vanishAtMs` — simulates an acked token going missing, observable at a LATER
-// P/W snapshot. A single driver trivially "converges" with itself, so the final settle always
-// completes normally regardless (no hang risk from Fix 1/2's unbounded/convergence-gated wait).
-class VanishingExecutor implements Executor {
-  id = "n1";
-  private vault = new Map<string, string>();
-  private start = Date.now();
-  constructor(private readonly vanishAtMs: number) {}
-  private elapsed() { return Date.now() - this.start; }
-  private gone() { return this.elapsed() >= this.vanishAtMs; }
-  async exec(args: string[]): Promise<ExecResult> {
-    const r = (stdout: string): ExecResult => ({ argv: args, code: 0, stdout, stderr: "", startedAt: "", durationMs: 0, killed: false });
-    const params = Object.fromEntries(args.slice(1).map((a) => {
-      const i = a.indexOf("=");
-      return i < 0 ? [a, ""] : [a.slice(0, i), a.slice(i + 1)];
-    }));
-    const notFound = (file: string) => r(`Error: File "${file}" not found.`);
-    switch (args[0]) {
-      case "sync:status": return r("status: synced");
-      case "sync:history": return !this.gone() && this.vault.has(params.file) ? r("1") : notFound(params.file);
-      case "files": return r(this.gone() ? "" : [...this.vault.keys()].map((k) => `${k}.md`).join("\n"));
-      case "read": return !this.gone() && this.vault.has(params.file) ? r(this.vault.get(params.file)!) : notFound(params.file);
-      case "create": {
-        const file = params.path ? params.path.replace(/\.md$/, "") : params.name;
-        this.vault.set(file, params.content ?? "");
-        return r(`Created: ${file}`);
-      }
-      case "append": {
-        const prev = this.vault.get(params.file) ?? "";
-        this.vault.set(params.file, prev ? `${prev}\n${params.content}` : params.content);
-        return r(`Appended to: ${params.file}`);
-      }
-      case "open": return r(`Opened: ${params.file}`);
-      default: return r("");
-    }
-  }
-  async shell(argv: string[]): Promise<ExecResult> {
-    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
-  }
-}
-
-test("checkWouldFail: a P snapshot reports would-fail (LOST) when enabled, and writes WOULDFAIL.log", async () => {
-  const tmpRunsDir = mkdtempSync(path.join(os.tmpdir(), "jepsen-wouldfail-"));
-  try {
-    const d = new ObsidianDriver(new VanishingExecutor(30));
-    const events: Record<string, unknown>[] = [];
-    const logger = stubLogger(events);
-    await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }], {
-      noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
-      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
-    });
-    const wf = events.filter((e) => e.kind === "would-fail");
-    assert.equal(wf.length, 1);
-    assert.equal(wf[0].suffix, "-LOST");
-  } finally {
-    rmSync(tmpRunsDir, { recursive: true, force: true });
-  }
-});
-
-test("checkWouldFail: a W also reports would-fail (LOST) when enabled", async () => {
-  const tmpRunsDir = mkdtempSync(path.join(os.tmpdir(), "jepsen-wouldfail-"));
-  try {
-    const d = new ObsidianDriver(new VanishingExecutor(30));
-    const events: Record<string, unknown>[] = [];
-    const logger = stubLogger(events);
-    await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }, { cmd: "wait" }], {
-      noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
-      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
-    });
-    const wf = events.filter((e) => e.kind === "would-fail");
-    assert.ok(wf.length >= 1);
-    assert.equal(wf[0].suffix, "-LOST");
-  } finally {
-    rmSync(tmpRunsDir, { recursive: true, force: true });
-  }
-});
-
-test("checkWouldFail: off by default — no would-fail event even for the exact same vanishing content", async () => {
-  const d = new ObsidianDriver(new VanishingExecutor(30));
-  const events: Record<string, unknown>[] = [];
-  const logger = stubLogger(events);
-  await runHistory([d], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.1 }], {
-    noteName: (l) => `bughunt/${l}`, // wouldFailCheck not set — defaults off
-    pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
-  });
-  assert.equal(events.filter((e) => e.kind === "would-fail").length, 0);
 });
 
 test("checkWouldFail: a stable node-vs-node DISAGREEMENT (SYNCBAD-shaped) is never reported, even when enabled", async () => {
@@ -577,8 +713,8 @@ test("checkWouldFail: a stable node-vs-node DISAGREEMENT (SYNCBAD-shaped) is nev
       { cmd: "node", node: 2 }, { cmd: "append", note: "a" },
       { cmd: "pause", seconds: 0.02 }, // fires well before agreeAtMs — still disagreeing here
     ], {
-      noteName: (l) => `bughunt/${l}`, wouldFailCheck: true, runsDir: tmpRunsDir,
-      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02, hostCheck: false,
+      noteName: (l) => `bughunt/${l}`, runsDir: tmpRunsDir,
+      pollSec: 0.01, minFloorSec: 0, finalSettleSec: 0.02, hostCheck: false,
     });
     assert.equal(events.filter((e) => e.kind === "would-fail").length, 0);
   } finally {
@@ -628,6 +764,11 @@ class LostForensicExecutor implements Executor {
         return r(`Created: ${file}`);
       }
       case "append": {
+        // Appending to a note this node does not have is an ERROR, not a silent create. Measured
+        // against obsidian-cli 1.13.7 on 2026-09-06: `Error: File "..." not found.` The stub used to
+        // create it, which quietly made the create path untestable — the executor never returned the
+        // reply the real one does, so nothing ever took the branch that handles it.
+        if (!this.vault.has(params.file)) return notFound(params.file);
         const prev = this.vault.get(params.file) ?? "";
         this.vault.set(params.file, prev ? `${prev}\n${params.content}` : params.content);
         return r(`Appended to: ${params.file}`);
@@ -650,13 +791,13 @@ test("lostForensics: writer is attributed from AckedEdit, and conflictFileFound 
     // already gone (mirrors the checkWouldFail/VanishingExecutor tests' own timing pattern).
     const result = await runHistory([n1], new NoopIsolator(), logger, [{ cmd: "append", note: "a" }, { cmd: "pause", seconds: 0.05 }], {
       noteName: (l) => `bughunt/${l}`, hostCheck: false,
-      pollSec: 0.01, minFloorSec: 0, wSettleSec: 0.02, finalSettleSec: 0.02,
+      pollSec: 0.01, minFloorSec: 0, finalSettleSec: 0.02,
     });
     assert.equal(result.verdict.notes[0].lost.length, 1, "the token really did vanish — a genuine LOST");
     assert.equal(result.forensics.length, 1);
     const f = result.forensics[0];
     assert.equal(f.writer, "n1", "attributed from acked, not guessed");
-    assert.equal(f.serverRecoverable, true, "the server-side history still has it — this isn't testing that path");
+    assert.equal(f.inServer, true, "the server-side history still has it — this isn't testing that path");
     assert.equal(f.conflictFileFound, conflictContent !== null, `conflictContent=${conflictContent}`);
   }
 });

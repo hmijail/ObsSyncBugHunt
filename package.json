@@ -19,7 +19,10 @@
     "test": "node --import tsx --test src/**/*.test.ts",
     "test:watch": "node --import tsx --test --watch src/**/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "probe-sync-versions": "tsx src/probe-sync-versions.ts"
+    "probe-sync-versions": "tsx src/probe-sync-versions.ts",
+    "probe-propagation": "tsx src/probe-propagation.ts",
+    "corpus": "tsx src/corpus.ts",
+    "timeline-rep": "tsx src/timeline-rep.ts"
   },
   "devDependencies": {
     "@types/node": "^22",

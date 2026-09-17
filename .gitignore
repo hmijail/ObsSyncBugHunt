@@ -14,3 +14,9 @@ secrets/
 # Personal editor settings
 .vscode/
 *.code-workspace
+
+# Queued README edits (the README is hand-written; these are notes toward it)
+README_pending.md
+
+# check-assumptions step 10 keeps its rep logs here when a rep fails
+check-assumptions-runs/

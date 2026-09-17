@@ -113,19 +113,25 @@ CONTAINER_NODES_CSV := $(shell echo $(CONTAINER_NODES) | tr ' ' ',')
 # EMPTY is meaningful: no forced hand-off at all. `$(if ...)` treats empty as unset, which would
 # silently fall back to the default W — the same silent-wrong-experiment failure that strict
 # --forced-turns validation exists to prevent — so presence is tested with `$(origin)` instead.
-ifdef PARTITION_PROB
-$(error PARTITION_PROB= is now CD_PROB= — it is the draw weight for a D and for a C alike)
-endif
-
-ifdef RUNS_PREFIX
-$(error RUNS_PREFIX= is now RUNS_DIR=, and its meaning changed: it is the directory itself, \
-not a parent with "runs" appended. RUNS_PREFIX=/tmp/x becomes RUNS_DIR=/tmp/x/runs)
-endif
-
-ifdef TURNS
-$(error TURNS= is now FORCED_TURNS=, holding a DSL substring rather than a mode name: \
-barrier -> FORCED_TURNS=W, paced -> FORCED_TURNS=P (or P60 for a longer one), \
-immediate -> FORCED_TURNS= (empty). See src/generator.ts's parseForcedTurns)
+# Reject unknown command-line variables. `make soak REPAET=5` is otherwise accepted in silence:
+# make happily defines an unused REPAET, the recipe expands with no --repeat at all, and the run
+# uses the default 10 while you believe it used 5. That is the silent-wrong-experiment failure this
+# project keeps tripping over, and it is the ONE thing a make front-end has to do that make does
+# not do for free (the npm layer below is already strict — parseArgs rejects unknown --flags).
+#
+# The accepted set is scraped from this Makefile rather than hand-listed, so it cannot drift: a
+# variable the Makefile actually expands somewhere is, by definition, a knob. Renamed variables
+# need no special case — an old name is simply not referenced any more, so it lands here as unknown.
+# Comment lines are stripped before scraping: a name that appears only in prose (this comment used
+# to contain an example, which the scrape then accepted as real) is documentation, not a knob.
+# Only `command line` origin is checked: environment variables are a deliberate, supported way to
+# set these (see the README), and screening the whole environment would be nothing but noise.
+KNOWN_VARS := $(shell sed 's/^[[:space:]]*\#.*//' $(MAKEFILE_LIST) | grep -ohE '\$$[({][A-Z][A-Z0-9_]*[)}]' | tr -d '$$(){}' | sort -u)
+GIVEN_VARS := $(foreach v,$(.VARIABLES),$(if $(filter command line,$(origin $(v))),$(v)))
+UNKNOWN_VARS := $(filter-out $(KNOWN_VARS),$(GIVEN_VARS))
+ifneq ($(UNKNOWN_VARS),)
+$(error unknown variable(s) on the command line: $(UNKNOWN_VARS). \
+`make help` lists the targets; the README table lists every knob)
 endif
 
 ifeq ($(origin FORCED_TURNS),undefined)
@@ -158,19 +164,21 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(POLL_SEC),--poll-sec $(POLL_SEC)) \
   $(if $(MIN_FLOOR_SEC),--min-floor-sec $(MIN_FLOOR_SEC)) \
   $(if $(CAP_SEC),--cap-sec $(CAP_SEC)) \
-  $(if $(W_SETTLE_SEC),--w-settle-sec $(W_SETTLE_SEC)) \
   $(if $(FINAL_SETTLE_SEC),--final-settle-sec $(FINAL_SETTLE_SEC)) \
   $(if $(PROBE_SEC),--probe-sec $(PROBE_SEC)) \
   $(if $(RECONNECT_BUDGET_MS),--reconnect-budget-ms $(RECONNECT_BUDGET_MS)) \
   $(if $(RUNS_DIR),--runs-dir $(RUNS_DIR)) \
   $(if $(SKIP_SNAPSHOT),--skip-snapshot) \
-  $(if $(WOULD_FAIL_CHECK),--would-fail-check)
+  $(if $(LOSS_GRACE_SEC),--loss-grace-sec $(LOSS_GRACE_SEC)) \
+  $(if $(SAMPLING),--sampling $(SAMPLING)) \
+  $(if $(OPEN_NOTES),--open-notes) \
+  $(if $(DISPLAY),--display $(DISPLAY))
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test check smoke check-local \
         build-image net secrets-dir clean-secrets login capture-login node1 containers-up solo-check reconnect-nodes run campaign soak analyze generate-histories repro \
         clean-runs clean-notes clean-data clean-images trial containers-down ps logs health \
-        list-images obsidian-latest obsidian-upgrade check-net check-assumptions
+        list-images obsidian-latest obsidian-upgrade check-net check-assumptions corpus probe-propagation timeline-rep bench-cli
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*## .*$$' $(MAKEFILE_LIST) \
@@ -328,8 +336,25 @@ soak: solo-check reconnect-nodes ## Run until stopped (Ctrl-C); DURATION_MIN=N f
 # with wherever `make run`/`soak` (via --runs-prefix) put it.
 RUNS_DIR ?= runs
 
-analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync-time distribution)
+analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync latency, corpus overview)
 	npm run analyze -- $(RUNS_DIR)
+
+# `make analyze` already writes these same sections into runs/analysis.md — this target just prints
+# them on their own, for when that is all you want to look at.
+corpus: ## Print just the cross-history sections of the analysis (loss rate by hand-off shape; is the generator still finding new behaviour)
+	npm run corpus -- $(RUNS_DIR)
+
+bench-cli: ## Time obsidian-cli calls vs an empty exec and vs the FS (BENCH_NODE/BENCH_N/BENCH_GAP/BENCH_INTERLEAVED/BENCH_BIN_MS; BENCH_SHOW=1 prints the commands)
+	@$(if $(BENCH_N),BENCH_N=$(BENCH_N)) $(if $(BENCH_SHOW),BENCH_SHOW=$(BENCH_SHOW)) \
+	 $(if $(BENCH_GAP),BENCH_GAP=$(BENCH_GAP)) $(if $(BENCH_INTERLEAVED),BENCH_INTERLEAVED=$(BENCH_INTERLEAVED)) \
+	 $(if $(BENCH_BIN_MS),BENCH_BIN_MS=$(BENCH_BIN_MS)) bash scripts/bench-cli.sh $(BENCH_NODE)
+
+timeline-rep: ## Redraw one rep's timeline from its log (REP=runs/<history>/<rep>.jsonl)
+	@test -n "$(REP)" || (echo "usage: make timeline-rep REP=runs/<history>/<rep>.jsonl" && exit 2)
+	@npm run --silent timeline-rep -- $(REP)
+
+probe-propagation: ## Measure where a change's time goes, n1 -> n2 (needs nodes up; HISTORY= to probe a different pattern)
+	npm run probe-propagation -- $(if $(REPEAT),--repeat $(REPEAT)) $(if $(HISTORY),--history '$(HISTORY)') $(if $(NO_SLEEP),--no-sleep)
 
 generate-histories: ## Print N generated histories without running them (N=20; honours FORCED_TURNS/OPS/NOTES/CD_PROB)
 	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)

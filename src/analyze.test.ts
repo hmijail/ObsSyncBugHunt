@@ -126,7 +126,7 @@ test("renderCategoryTable: column set is the union of all entries' cells; missin
 
 test("renderGroup: only non-empty categories appear, in ranked order", () => {
   const g = {
-    reps: 2, pass: 1, fail: 1, lost: 1, serverDropped: 0, neverRegistered: 1,
+    reps: 2, pass: 1, fail: 1, lost: 1, inServer: 0, notInServer: 1, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [8, 9],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
@@ -144,7 +144,7 @@ test("renderGroup: only non-empty categories appear, in ranked order", () => {
 
 test("line: only non-zero fields are shown, and convergenceSec reports min/median/max/span", () => {
   const g = {
-    reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    reps: 3, pass: 3, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
   };
@@ -156,7 +156,7 @@ test("line: only non-zero fields are shown, and convergenceSec reports min/media
 
 test("line: median (not average) is robust to a single huge transient outlier", () => {
   const g = {
-    reps: 4, pass: 4, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    reps: 4, pass: 4, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [1, 2, 3, 100],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
   };
@@ -167,7 +167,7 @@ test("line: median (not average) is robust to a single huge transient outlier", 
 
 test("isUninteresting: all-PASS reps landing in the same state -> true", () => {
   const g = {
-    reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    reps: 3, pass: 3, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
@@ -179,7 +179,7 @@ test("isUninteresting: all-PASS reps landing in the same state -> true", () => {
 
 test("isUninteresting: all-PASS but reps land in DIFFERENT states -> false (there's variety to show)", () => {
   const g = {
-    reps: 2, pass: 2, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    reps: 2, pass: 2, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
@@ -194,7 +194,7 @@ test("isUninteresting: all-PASS but reps land in DIFFERENT states -> false (ther
 
 test("isUninteresting: any real failure -> false, even with a single PASS state otherwise", () => {
   const g = {
-    reps: 2, pass: 1, fail: 1, lost: 1, serverDropped: 0, neverRegistered: 1,
+    reps: 2, pass: 1, fail: 1, lost: 1, inServer: 0, notInServer: 1, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0,
     categories: new Map([
@@ -207,7 +207,7 @@ test("isUninteresting: any real failure -> false, even with a single PASS state 
 
 test("renderEarlyWarning: one row per history, with the peek's denominator beside its outcomes", () => {
   const g = {
-    reps: 12, pass: 8, fail: 4, lost: 4, serverDropped: 4, neverRegistered: 0,
+    reps: 12, pass: 8, fail: 4, lost: 4, inServer: 4, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 12, checksRun: 47, warnedFailed: 3, warnedOk: 5, failedUnwarned: 1, versionsGrew: 0,
     categories: new Map(),
@@ -224,12 +224,12 @@ test("renderEarlyWarning: one row per history, with the peek's denominator besid
 
 test("renderNoDataLoss: one row per history with its rep count and min/median/max/span", () => {
   const g1 = {
-    reps: 3, pass: 3, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    reps: 3, pass: 3, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [5, 8, 11],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, minSec: 62.3, categories: new Map(),
   };
   const g2 = {
-    reps: 1, pass: 1, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0,
+    reps: 1, pass: 1, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0,
     duplReps: 0, diffReps: 0, unsyncedReps: 0, timeouts: 0, conv: [] as number[],
     obsfail: 0, unknown: 0, envfail: 0, checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
   };

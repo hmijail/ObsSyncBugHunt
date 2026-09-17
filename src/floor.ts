@@ -17,10 +17,6 @@
 
 import { DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
 
-/** A `W` blocks until its node reports `synced`, and only then after a quiescent window. Observed
- *  around 5s; 2s leaves wide margin while still being worth something. Capped by the CONFIGURED
- *  window below, because a run told to settle for 0.02s cannot be held to 2s. */
-const W_NOMINAL_SEC = 2;
 /** One obsidian-cli or engine round-trip (`D`, `C`, `A`). Observed 0.2-0.4s. */
 const OP_MIN_SEC = 0.1;
 
@@ -29,15 +25,17 @@ const OP_MIN_SEC = 0.1;
  * would not have run (a `W` on an offline node, a `W` before any append, a leading pause), so there
  * is nothing here to get wrong. Node selectors cost nothing: they move a cursor.
  *
- * `wSettleSec` is the run's configured mid-history quiet window (execute.ts's default is 4s); it
- * only ever lowers the per-`W` term, never raises it.
+ * A `W` contributes NOTHING, and is the only acting op that does not. It used to be charged a
+ * nominal 2s on the reasoning that it blocked for a quiescent window; it has no quiet window any
+ * more — it waits for tokens, and with nothing outstanding it returns on its first poll and can
+ * legitimately take no measurable time at all. Charging even one round-trip for it would be
+ * charging for a property of the environment rather than of the history, and would turn `N1AaWW`
+ * into a floor violation on any fast driver. A floor is a lower bound, not an expectation.
  */
-export function durationFloorSec(h: History, wSettleSec = 4): number {
-  const wSec = Math.min(W_NOMINAL_SEC, wSettleSec);
+export function historyDurationExpectedMinSec(h: History): number {
   let sec = 0;
   for (const op of h) {
     if (op.cmd === "pause") sec += op.seconds ?? DEFAULT_PAUSE_SEC;
-    else if (op.cmd === "wait") sec += wSec;
     else if (op.cmd === "disconnect" || op.cmd === "connect" || op.cmd === "append") sec += OP_MIN_SEC;
   }
   return Number(sec.toFixed(3)); // 0.1 + 0.2 must not become 0.30000000000000004 in a log line

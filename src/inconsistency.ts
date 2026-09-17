@@ -28,7 +28,12 @@ export type InconsistencyCategory = "obsfail" | "unknown";
 
 /** Reasons that mean "a client misreported its own vault" → a real finding (`-OBSFAIL`).
  *  Everything else (permanently-unresponsive, and every unparseable output) is `-UNKNOWN`. */
-const OBSFAIL_REASONS = new Set(["cli-fs-disagreement", "cli-listing-inconsistent"]);
+const OBSFAIL_REASONS = new Set([
+  "cli-fs-disagreement", "cli-listing-inconsistent",
+  // The CLI and the disk disagree about a note's CONTENT — the same class of fault as the
+  // listing disagreement above, one level down.
+  "cli-fs-content-disagreement",
+]);
 
 export function categoryOf(err: unknown): InconsistencyCategory {
   if (err instanceof CliInconsistencyError && OBSFAIL_REASONS.has(err.reason)) return "obsfail";

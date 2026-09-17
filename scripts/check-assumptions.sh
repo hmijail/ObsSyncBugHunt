@@ -9,13 +9,15 @@
 # update — the moments when exactly this kind of thing has silently moved underneath you.
 #
 # NOT a fast pre-flight, and deliberately not wired into `make run`/`containers-up`. It is meant
-# to be run rarely and to be thorough; most of its wall-clock is check-net's real 10s outages.
+# to be run rarely and to be thorough; most of its wall-clock is real waiting — check-net's 10s
+# outages, step 9's full partition/heal round trip, and step 10's three real reps of the harness.
 #
 # WHAT IT DOES *NOT* COVER, on purpose: anything the runtime already checks per-run. Node
 # reachability, every node `synced`, nodes agreeing on note count (run.ts's preflight), and the
 # local vault not drifting mid-run are all DYNAMIC — they have to be true now, per run, and are
 # verified there. Duplicating them here would rot. What lives here is the slow-changing stuff,
-# plus one case (step 6) that the runtime only ever discovers reactively, mid-soak.
+# plus one case (step 6) that the runtime only ever discovers reactively, mid-soak, and one
+# (steps 9 and 10) the runtime cannot discover at all because their failure mode is a passing run.
 #
 # Usage: scripts/check-assumptions.sh
 #        make check-assumptions            [ROUNDS=n] [NODES=n1,n2]
@@ -46,7 +48,7 @@ CLI=/opt/obsidian/obsidian-cli
 
 fails=0
 step=0
-say()  { step=$((step + 1)); printf '\n[%d/7] %s\n' "$step" "$1"; }
+say()  { step=$((step + 1)); printf '\n[%d/11] %s\n' "$step" "$1"; }
 ok()   { printf '      ok   %s\n' "$1"; }
 bad()  { printf '      FAIL %s\n' "$1" >&2; fails=$((fails + 1)); }
 note() { printf '      --   %s\n' "$1"; }
@@ -242,6 +244,331 @@ if npm run --silent probe-sync-versions -- --check; then
   ok "the bounded-probe design still rests on true behaviour"
 else
   bad "sync CLI blocking behaviour changed — src/driver.ts's syncStateProbe may be reading noise"
+fi
+
+# 8. The write path's two load-bearing CLI behaviours. execute.ts appends FIRST and only creates
+#    when the CLI positively says the note is missing, which rests on both of these being true:
+#
+#      - append to a missing note ERRORS ("not found"). If a future CLI made it auto-create instead,
+#        the fallback would never fire, every creation would be logged `created: false`, and the
+#        create-create conflict-genesis signal would quietly become worthless. Nothing would fail.
+#      - create on an EXISTING note does not overwrite and does not error — it makes a numbered
+#        sibling ("<note> 1.md"). That is why the order is append-then-create and not the reverse;
+#        if this ever became an overwrite, guessing wrong would destroy data rather than litter.
+#
+#    Both measured against obsidian-cli 1.13.7 on 2026-09-06. Neither is documented by Obsidian, so
+#    an upgrade can change either without warning — exactly the silent-wrong-experiment shape this
+#    script exists to catch.
+say "the write path's create-vs-append CLI behaviour is unchanged"
+probe="bughunt/check-assumptions-write-$$"
+cli() { "$CONTAINER_ENGINE" exec "$live" "$CLI" "$@" 2>&1; }
+cli delete "file=$probe" >/dev/null 2>&1 || true
+cli delete "file=$probe 1" >/dev/null 2>&1 || true
+if cli append "file=$probe" "content=(x)" | grep -q 'not found'; then
+  ok "append to a missing note still errors, so the create fallback still fires"
+else
+  bad "append to a missing note NO LONGER errors — execute.ts would log every creation as created:false"
+fi
+cli create "path=$probe.md" "content=(original)" >/dev/null 2>&1 || true
+cli create "path=$probe.md" "content=(second)" >/dev/null 2>&1 || true
+if [ "$(cli read "file=$probe" | tr -d '\r\n')" = "(original)" ]; then
+  ok "create on an existing note still leaves the original intact"
+else
+  bad "create on an existing note now CHANGES it — append-then-create is no longer the safe order"
+fi
+cli delete "file=$probe" >/dev/null 2>&1 || true
+cli delete "file=$probe 1" >/dev/null 2>&1 || true
+
+# 9. Conflict files are still what a real divergence produces — i.e. every node is still in
+#    Sync's "create conflict file" mode.
+#
+#    That mode is set BY HAND, per node, through VNC (README's setup step). Nothing in the harness
+#    reads it back, and a node brought up without it does not fail: Obsidian merges the divergent
+#    copies instead. No tokens are lost, so the oracle — which deliberately gates on tokens, with
+#    `conflictMeta` informational (oracle.ts) — returns ok. The soak stays green while testing
+#    something other than what its history strings describe, and `conflictFileFound` in every
+#    lost-token forensic quietly becomes meaningless. Exactly the silent-wrong-experiment shape.
+#
+#    A setting that cannot be read has to be provoked instead. In the project's own DSL what this
+#    performs is exactly:
+#
+#        N1AaN2WDN1AaN2AaC
+#
+#    n1 creates note a; n2 waits until it has it; n2 goes offline; each side appends its own token
+#    to the same note; n2 comes back. (Verified to normalize to itself, so that string is literally
+#    the shape run here — reproduce it by hand with `make run HISTORY=N1AaN2WDN1AaN2AaC`.)
+#
+#    It is re-implemented in shell rather than shelled out to `make run` ON PURPOSE: using the
+#    harness to check the apparatus the harness rests on is circular — a broken apparatus would
+#    break the checker in the same breath, and the whole point of this script is to be the thing
+#    that still tells the truth when the runtime has started lying. It also asserts on something
+#    the oracle deliberately does NOT judge: conflict-file GENESIS, not token loss.
+#
+#    THE EVIDENCE RUNS ONE WAY ONLY, and the check is built around that. A conflict file cannot
+#    appear in merge mode, so seeing one is conclusive and ends the check. Not seeing one is weak:
+#    it is equally consistent with merge mode and with Obsidian dropping an edit outright — and a
+#    dropped edit is the bug this project exists to find, i.e. the apparatus working, not failing.
+#    So only the MERGE SIGNATURE (both tokens in one note, no conflict file) is treated as a
+#    failure. Absence of both is reported as INCONCLUSIVE and does not fail the run: a soak
+#    aborting because Sync lost data would be precisely backwards.
+#
+#    Hence up to 3 attempts, stopping at the first conflict file. Measured 20/20 conflict files on
+#    the first attempt, 3-4s per attempt, the file appearing ~1s after the heal — so the retries are
+#    nearly free, and the caps below are large multiples of observed timings rather than padding.
+#    Note that 20/20 says loss is RARE here, not impossible: this provocation's divergence window is
+#    only as wide as two back-to-back appends, far tighter than a real `D...C` history, and it will
+#    widen on a slower or busier machine. That is exactly why absence must not fail.
+say "a real divergence still produces a conflict file, not a merge"
+cg_live=""
+for n in $(echo "$NODES" | tr ',' ' '); do
+  "$CONTAINER_ENGINE" exec "$n" true >/dev/null 2>&1 && cg_live="$cg_live $n"
+done
+set -- $cg_live
+if [ "$#" -lt 2 ]; then
+  note "SKIPPED — needs two live nodes, found $#; a PASS below does NOT cover conflict-file mode"
+else
+  cgA=$1; cgB=$2
+  cli_on() { _n=$1; shift; "$CONTAINER_ENGINE" exec "$_n" "$CLI" "$@" 2>&1; }
+  # Mirrors nodeIp() in src/isolate.ts. A reconnect MUST restore the same address or the partition
+  # stops being a link blip and becomes a network reset — see docs/DESIGN.md, "Network identity".
+  cg_ip() { case "${1#n}" in ""|*[!0-9]*) echo "" ;; *) echo "10.89.0.$((100 + ${1#n}))" ;; esac; }
+  cg_reachable() { "$CONTAINER_ENGINE" exec "$1" timeout 2 bash -c 'echo > /dev/tcp/8.8.8.8/53' >/dev/null 2>&1; }
+  cg_wait_reach() { # node want(0|1) capSeconds — same probe isolate.ts's waitReach uses
+    _n=$1; _want=$2; _cap=$3; _i=0
+    while [ "$_i" -lt "$_cap" ]; do
+      if cg_reachable "$_n"; then _got=1; else _got=0; fi
+      [ "$_got" = "$_want" ] && return 0
+      _i=$((_i + 1)); sleep 1
+    done
+    return 1
+  }
+  cg_conflicts() { cli_on "$1" files "folder=bughunt" 2>/dev/null | grep -F "$cgbase (Conflicted copy" || true; }
+  # The node must not be left partitioned if this script dies mid-check: that would break every
+  # later run on this machine, and the failure would look like Sync's fault, not ours.
+  cg_restore() { [ -n "$(cg_ip "$cgB")" ] && "$CONTAINER_ENGINE" network connect --ip "$(cg_ip "$cgB")" "$NET" "$cgB" >/dev/null 2>&1 || true; }
+
+  # One provocation. Echoes exactly one word, plus detail: CONFLICT | MERGED | NEITHER | ERR.
+  # Timings are set from measurement, not padding: the base note reaches the peer in ~1-2s and the
+  # conflict file appears ~1s after the heal (20/20 observed), so these caps are large multiples of
+  # the real thing, not guesses.
+  # NOTE: called via `$(cg_attempt)`, i.e. in a command-substitution SUBSHELL, so anything it
+  # assigns is invisible to the caller. `cgnote`/`cgbase` are therefore set by the LOOP below, not
+  # here — set here, cleanup silently matched nothing and left files behind every run.
+  cg_attempt() {
+    cli_on "$cgA" delete "file=$cgnote" >/dev/null 2>&1 || true
+    cli_on "$cgA" create "path=$cgnote.md" "content=(base)" >/dev/null 2>&1 || true
+    # The note must EXIST on B before the partition. Append to a missing note errors (step 8), so
+    # without this both sides would take the create-create path — a different genesis entirely.
+    _i=0
+    while [ "$_i" -lt 30 ]; do
+      case "$(cli_on "$cgB" read "file=$cgnote")" in *"(base)"*) break ;; esac
+      _i=$((_i + 1)); sleep 1
+    done
+    [ "$_i" -ge 30 ] && { echo "ERR the probe note never reached $cgB in 30s"; return; }
+
+    "$CONTAINER_ENGINE" network disconnect "$NET" "$cgB" >/dev/null 2>&1 || true
+    cg_wait_reach "$cgB" 0 30 || { cg_restore; echo "ERR $cgB stayed reachable after 'network disconnect'"; return; }
+    cli_on "$cgA" append "file=$cgnote" "content=(from-$cgA)" >/dev/null 2>&1 || true
+    cli_on "$cgB" append "file=$cgnote" "content=(from-$cgB)" >/dev/null 2>&1 || true
+    cg_restore
+    cg_wait_reach "$cgB" 1 30 || { echo "ERR $cgB did not become reachable again after reconnect"; return; }
+
+    _i=0
+    while [ "$_i" -lt 45 ]; do
+      _f="$(cg_conflicts "$cgA")$(cg_conflicts "$cgB")"
+      [ -n "$_f" ] && { echo "CONFLICT $(cg_conflicts "$cgA" | head -1)"; return; }
+      _i=$((_i + 1)); sleep 1
+    done
+    _seen=$(cli_on "$cgA" read "file=$cgnote" | tr -d '\r' | tr '\n' ' ')
+    case "$_seen" in
+      *"(from-$cgA)"*) case "$_seen" in *"(from-$cgB)"*) echo "MERGED $_seen"; return ;; esac ;;
+    esac
+    echo "NEITHER $_seen"
+  }
+
+  cg_tidy() {
+    { cg_conflicts "$cgA"; cg_conflicts "$cgB"; } | sort -u | while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      f=${f#bughunt/}
+      cli_on "$cgA" delete "file=bughunt/${f%.md}" >/dev/null 2>&1 || true
+    done
+    cli_on "$cgA" delete "file=$cgnote" >/dev/null 2>&1 || true
+  }
+
+  cgnote=""; cgbase="check-assumptions-conflict-$$"
+  trap 'cg_restore' EXIT INT TERM
+  if [ -z "$(cg_ip "$cgB")" ]; then
+    bad "cannot derive a pinned IP for $cgB — refusing to partition a node we cannot reconnect"
+  else
+    cg_seen_merge=""; cg_seen_conflict=""; cg_last=""; cg_try=1
+    while [ "$cg_try" -le 3 ]; do
+      cgnote="bughunt/check-assumptions-conflict-$$-$cg_try"
+      cgbase="check-assumptions-conflict-$$-$cg_try"
+      cg_res=$(cg_attempt)
+      cg_tidy
+      cg_last="$cg_res"
+      case "$cg_res" in
+        CONFLICT*) cg_seen_conflict=1; break ;;
+        MERGED*)   cg_seen_merge=1; break ;;
+      esac
+      cg_try=$((cg_try + 1))
+    done
+    if [ -n "$cg_seen_conflict" ]; then
+      ok "divergence produced a conflict file (attempt $cg_try/3): ${cg_last#CONFLICT }"
+    elif [ -n "$cg_seen_merge" ]; then
+      bad "both edits MERGED into one note and no conflict file appeared"
+      note "a node is NOT in \"create conflict file\" mode. Runs will still pass — a merge loses no"
+      note "tokens — but conflictFileFound is meaningless and every history is testing a different"
+      note "experiment than it describes."
+      note "Fix: VNC into each node, set Sync's conflict handling to create conflict files."
+      note "saw: ${cg_last#MERGED }"
+    else
+      note "INCONCLUSIVE after 3 attempts — no conflict file, but no merge signature either."
+      note "last: $cg_last"
+      note "This is NOT reported as a failure. The absence of a conflict file is weak evidence: it"
+      note "is equally consistent with merge mode and with Obsidian dropping an edit outright, and"
+      note "the latter is the bug this project hunts — a finding for the harness, not an apparatus"
+      note "fault. Only the merge signature above is conclusive, and it did not appear."
+      note "Follow up with:  make run HISTORY=N1AaN2WDN1AaN2AaC"
+    fi
+  fi
+  trap - EXIT INT TERM
+  cg_restore
+fi
+
+# 10. `N1AaN2Aa` still produces a conflict file, with no partition to force it.
+#
+#    Step 9 forces a divergence and asks whether Sync still conflicts it. This asks the other half:
+#    does the canonical race still race? `N1AaN2Aa` is two appends to a note that does not exist
+#    yet, back to back on two nodes. It diverges only while both writes land before either node's
+#    note reaches the other, so anything the harness does between the two appends can suppress it —
+#    a pre-write `sync:history` read did exactly that on 2026-09-07, and nothing failed.
+#
+#    The ASSERTION is the conflict file. `created` on the two appends is the discriminator that says
+#    which failure this is, not the assertion itself: across 53 reps in runs/, `created: [true,
+#    true]` has produced a conflict file, a clean merge, and a lost token.
+#
+#    The gap between the appends is reported, never asserted on: below ~370ms it has conflicted
+#    33 times out of 34, above ~390ms never, and near the boundary it is a distribution.
+say "N1AaN2Aa still produces a conflict file (no partition, timing only)"
+# Whether the checks above passed, read before this step adds to the count. Only used to say so in
+# the loss message — a reader deciding whether to trust this result wants to know.
+pre10_fails=$fails
+race_dir="./check-assumptions-runs/step10-$(date -u +%Y%m%dT%H%M%SZ)"
+rm -rf "$race_dir"
+# Not runs/: corpus.ts parses a run directory as `<ts>-<history>` and analyze.ts groups by the
+# directory name, so a telltale name there would enter the corpus tables as a bogus history.
+#
+# The exit status is ignored on purpose. `npm run start` exits non-zero on any FAIL verdict,
+# including a rep that found a real loss, which is the case this step most wants to read rather
+# than dismiss. Whether the run happened is decided by whether it left rep logs.
+#
+# `cd` because this script runs from any directory but `npm run` does not.
+(cd "$here/.." && npm run --silent start -- --history N1AaN2Aa --repeat 3 \
+   --runs-dir "$here/../${race_dir#./}" --display off) >/dev/null 2>&1 || true
+race_dir="$here/../${race_dir#./}"
+if [ -z "$(find "$race_dir" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+  bad "N1AaN2Aa produced no rep logs at all — the harness itself is broken, not just slow"
+else
+  race_out=$(python3 - "$race_dir" <<'PY'
+import json, sys, pathlib
+bad = 0
+for f in sorted(pathlib.Path(sys.argv[1]).glob("*/*.jsonl")):
+    ev = [json.loads(l) for l in f.open()]
+    ap = [e for e in ev if e.get("kind") == "appended"]
+    res = [e for e in ev if e.get("kind") == "results"]
+    if len(ap) != 2 or not res:
+        print("REP %s: %d appends, %d verdicts — expected 2 and 1" % (f.stem, len(ap), len(res)))
+        bad += 1; continue
+    gap = round((ap[1]["t"] - ap[0]["t"]) * 1000)
+    created = [e["created"] for e in ap]
+    v = res[0]["verdict"]["notes"][0]
+    if v.get("conflictFiles", 0) >= 1:
+        print("ok  %s: gap=%dms conflict file" % (f.stem, gap))
+    elif not all(created):
+        print("SLOW %s: gap=%dms created=%s — n1's note reached n2 first, so n2 appended to it"
+              " instead of creating its own. No divergence, so nothing to conflict." % (f.stem, gap, created))
+        bad += 1
+    elif v.get("lost"):
+        print("LOSS %s: gap=%dms both nodes created, no conflict file, and %s is in neither the note"
+              " nor any conflict copy on either node" % (f.stem, gap, ", ".join(v["lost"])))
+        bad += 1
+    else:
+        print("MERGE %s: gap=%dms both nodes created and the two edits MERGED into one note with no"
+              " conflict file — see step 9" % (f.stem, gap))
+        bad += 1
+sys.exit(1 if bad else 0)
+PY
+  )
+  race_rc=$?
+  echo "$race_out" | while IFS= read -r l; do note "$l"; done
+  if [ "$race_rc" -eq 0 ]; then
+    ok "3/3 reps diverged and conflicted"
+    rm -rf "$race_dir"
+  else
+    bad "N1AaN2Aa did not produce a conflict file in every rep"
+    note "rep logs kept: $race_dir"
+    case "$race_out" in
+      *"SLOW "*)
+        note "SLOW: something is taking longer between the two appends. Either the harness gained"
+        note "  work there — anything reading the CLI on the write path has to ride in the write"
+        note "  batch or not happen — or the round trip itself got slower, which is not ours to fix."
+        note "  The gaps above say which: the write path is two round trips on the second node."
+        note "    make bench-cli              what one exec costs now, against an empty one"
+        note "    make probe-propagation      what a create's trip costs now"
+        note "    make repro HISTORY=N1AaN2Aa && sh runs/repro-*.sh" ;;
+    esac
+    case "$race_out" in
+      *"LOSS "*)
+        note "LOSS: this may be an actual bug in Obsidian rather than an apparatus fault. Worth"
+        note "  running down:"
+        note "    make repro HISTORY=N1AaN2Aa && sh runs/repro-*.sh   standalone reproduction"
+        note "    make soak HISTORY=N1AaN2Aa                          establish a rate"
+        note "    make analyze"
+        if [ "$pre10_fails" -eq 0 ]; then
+          note "  Checks 1-9 passed."
+        else
+          note "  NOTE: $pre10_fails earlier check(s) failed — fix those before reading this as a finding."
+        fi ;;
+    esac
+    case "$race_out" in
+      *"MERGE "*)
+        note "MERGE: two independent creates became one note with both tokens. Step 9 is the check"
+        note "  for Sync's conflict-file mode; if it passed, this is unexplained and worth a look." ;;
+    esac
+  fi
+  # Leave the vault as we found it. Driven off the LISTING rather than the log's conflict-file
+  # events, which are not a complete inventory. Deleted on one node; the deletion propagates.
+  race_notes=$(python3 - "$race_dir" <<'PY'
+import json, sys, pathlib
+out = set()
+for p in pathlib.Path(sys.argv[1]).glob("*/*.jsonl"):
+    for line in p.open():
+        e = json.loads(line)
+        if e.get("kind") == "appended" and e.get("fullname"): out.add(e["fullname"])
+print("\n".join(sorted(out)))
+PY
+  )
+  for rn in $race_notes; do
+    "$CONTAINER_ENGINE" exec "$live" "$CLI" files folder=bughunt 2>/dev/null \
+      | grep -F "$rn" | while IFS= read -r f; do
+        f=$(printf '%s' "$f" | tr -d '\r')
+        [ -n "$f" ] || continue
+        "$CONTAINER_ENGINE" exec "$live" "$CLI" delete "file=${f%.md}" >/dev/null 2>&1 || true
+      done
+  done
+fi
+
+# 11. Advisory: how fast a change actually reaches the other node. NOT a showstopper check — these
+#    numbers can move without anything being broken — but they shape how every timing result here
+#    is read, and how patient a `W<n>` has to be, so a silent shift is exactly the kind of thing
+#    that leaves old conclusions standing on a floor that moved. It prints its own verdict; the exit
+#    code is reserved for a change that never arrived at all, which is breakage rather than drift.
+say "sync propagation is still as fast as recorded (advisory)"
+if npm run --silent probe-propagation; then
+  :
+else
+  bad "a change never arrived at the peer at all — that is not drift, something is broken"
 fi
 
 # The deferred half of step 3: does the Obsidian actually running in a node self-report the version

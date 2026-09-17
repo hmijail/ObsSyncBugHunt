@@ -9,8 +9,6 @@
 // as a severity witness.
 
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync } from "node:fs";
-import path from "node:path";
 import { formatToken, NOTE_DIR, type NodeId } from "./types.js";
 import { isConflictFile, type ObsidianDriver } from "./driver.js";
 import { CliInconsistencyError } from "./inconsistency.js";
@@ -26,7 +24,9 @@ import {
   type RunVerdict,
 } from "./oracle.js";
 import { serialize, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
-import { durationFloorSec } from "./floor.js";
+import { FileLane } from "./timeline.js";
+import { historyDurationExpectedMinSec } from "./floor.js";
+import { ArrivalTracker } from "./arrivals.js";
 
 export interface ExecuteOpts {
   noteName: (letter: string) => string; // DSL note letter -> concrete vault note name (per-rep)
@@ -44,7 +44,6 @@ export interface ExecuteOpts {
   // unchanged for this window, AND every node agrees on it. A stable DISAGREEMENT does not
   // finish here — see waitForSynced's own doc comment for why. The window absorbs a
   // just-lagging conflict file; keep it short since `synced` already means "Sync is idle".
-  wSettleSec?: number; // mid-history W: quiescent-for window (default 4)
   finalSettleSec?: number; // final settle: quiescent-for window (default 15)
   // Per-call cap on the settle's `sync:status` probe (default 5). `sync:status` blocks until
   // synced, so this bounds it into a pollable "synced yet?" — a timeout means "still syncing".
@@ -59,7 +58,7 @@ export interface ExecuteOpts {
   // Whether the "pause" case's whole snapshot mechanism runs at all (see the "pause" case) — a
   // real bounded CLI call per driver per touched note, purely diagnostic. Default ON;
   // --skip-snapshot turns it fully off, in case it's suspected of perturbing timings/results
-  // (same methodological caution as checkWouldFail's own opt-in design).
+  // (the same methodological caution that used to govern the retired would-fail peek).
   snapshot?: boolean;
   // Recorded into the `history` event only — neither changes execution here. A rep's
   // outcome can depend on which of these governed it (confirmed: the isolator choice alone
@@ -90,19 +89,37 @@ export interface ExecuteOpts {
   // Overridable so tests don't wait the real ~15s worst case — see assertLocalSyncOn.
   localSyncGraceMs?: number;
   localSyncGraceAttempts?: number;
-  // Opt-in early-warning check (default OFF — see checkWouldFail's own doc comment for why this
-  // must stay opt-in): during a P or W with every relevant driver online, run the real oracle
-  // judgment against a fresh observation right now, logging a `would-fail` event (+ durable
-  // WOULDFAIL.log under `runsDir`) if it comes back LOST or DUPL.
-  wouldFailCheck?: boolean;
-  runsDir?: string; // where WOULDFAIL.log lives when wouldFailCheck is on (default "runs")
+  // Once `W` has seen the server version counter move but the tokens are still not on this node's
+  // disk, how long to let Sync fix it before the history is abandoned as a loss. This is NOT
+  // patience with a slow sync — case A, where nothing has moved at all, is unbounded. It is the
+  // grace given to a discrepancy that is already visible.
+  lossGraceSec?: number;
+  // How much to look at while waiting.
+  //
+  // `strategic` (default) samples only what a wait needs to decide, which is the right default: the
+  // instrument must not perturb Sync. Its cost is that most lanes of a reconstructed timeline are
+  // blank, and that arrivals come back overwhelmingly left-censored (1076 of 1081 in the corpus —
+  // the first look at a receiver lands a median of 11.2s after the append, against a ~5s delivery).
+  //
+  // `everything` samples every node × every touched note on every poll, probe-style, so the
+  // timeline is dense and arrivals are actually resolved. It DOES perturb what it measures; it is
+  // for answering a question, not for soaking. `everything-no-sleep` additionally drops the poll
+  // delay and samples as fast as the calls return.
+  sampling?: "strategic" | "everything" | "everything-no-sleep";
+  // Foreground the note on the editing node before each edit, so a watching human sees the GUI
+  // follow whichever node is writing. OFF by default: it is a round trip per edit spent purely on
+  // presentation, and it is not free of consequence — opening a note is something a real user does,
+  // and whether Sync treats an open note differently is an open question this harness has not
+  // settled. Turn it on to watch, not to measure.
+  openNotes?: boolean;
+  runsDir?: string;
 }
 
 export interface LostForensic {
   note: string;
   token: string;
   writer: NodeId; // the node whose edit was lost (from AckedEdit)
-  serverRecoverable: boolean; // present in server history despite being gone from the vault
+  inServer: boolean; // present in server history despite being gone from the vault
   serverVersions: number[];
   // Did the writer's own device leave behind ANY conflict file for this note? Per the confirmed
   // model (see lostForensics's doc comment), a lost token can never itself appear inside a
@@ -291,8 +308,15 @@ export async function waitForSynced(
   opts: ExecuteOpts,
   logger: RunLogger,
   context: Record<string, unknown> = {},
+  // Optional: fed the observation this loop already makes, so a token's arrival on another node is
+  // dated at the moment it is seen. Never consulted — it only records (see src/arrivals.ts).
+  arrivals?: ArrivalTracker,
+  sampleAll?: () => Promise<void>,
+  // Optional: fed the same observation, to log it as a `sample`. Set only when `sampleAll` is not,
+  // so exactly one of the two writes a node's file lane in any given poll.
+  noteObserved?: (o: NodeObservation, ms: number) => void,
 ): Promise<{ seconds: number; unsynced: boolean; observations: NodeObservation[]; hostOutage: boolean }> {
-  const pollMs = (opts.pollSec ?? 1) * 1000;
+  const pollMs = opts.sampling === "everything-no-sleep" ? 0 : (opts.pollSec ?? 1) * 1000;
   const floorMs = (opts.minFloorSec ?? 3) * 1000;
   const settleMs = settleSec * 1000;
   const capMs = (opts.capSec ?? 120) * 1000;
@@ -314,6 +338,9 @@ export async function waitForSynced(
   let obs: NodeObservation[] = []; // last SYNCED snapshot; the verdict reuses it
   let hostOutage = false;
   for (;;) {
+    // Fired, not awaited — same reasoning as in waitOnNode: overlap the sampler with this poll's
+    // own reads instead of paying for both in series.
+    const sampling = sampleAll?.().catch(() => {});
     // 1. Bounded sync-state probe FIRST. We must NOT read content from a still-syncing node:
     //    the read blocks (~70s) AND returns mid-flux content, which fabricated a divergence. The
     //    probe is bounded (≤ probeMs), so a not-yet-synced node reads "timeout" instead of
@@ -332,10 +359,17 @@ export async function waitForSynced(
       if (baseline === null) baseline = await readTotals(drivers, notes); // synced now → fast
       obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
       assert.equal(obs.length, drivers.length * notes.length, "settle samples every (node, note)");
+      // Free: `obs` is already in hand, so dating an arrival costs no read and perturbs no timing.
+      arrivals?.observe(obs, logger);
+      // One `Promise.all` gathers every (node, note), so they share its wall time — the same
+      // convention as the sampler's round.
+      const thisGatherMs = Date.now() - tGather;
+      if (noteObserved) for (const o of obs) noteObserved(o, thisGatherMs);
       const sig = signature(notes, obs);
       if (sig !== lastSig) { lastSig = sig; lastChange = Date.now(); sigChanged = true; }
       gatherWallMs = Date.now() - tGather;
     }
+    await sampling;
 
     const now = Date.now();
     const quietMs = everySynced ? now - lastChange : 0;
@@ -350,7 +384,9 @@ export async function waitForSynced(
     // node reading "timeout" is genuine sync latency (the probe keeps getting killed at the cap
     // because the node genuinely isn't synced yet); a large gatherMs means a content read blocked.
     logger.log({
-      kind: "settle-poll", elapsedSec: Math.round(elapsed / 1000), states, everySynced, sigChanged,
+      // `nodes` parallels `states`: without it a reconstruction has a row of sync states and no way
+      // to say whose they are. The mid-history wait logs a single `wait` node for the same reason.
+      kind: "settle-poll", elapsedSec: Math.round(elapsed / 1000), nodes: drivers.map((dd) => dd.node), states, everySynced, sigChanged,
       quietSec: Math.round(quietMs / 1000), probeMs: probeWallMs, gatherMs: gatherWallMs, ...context,
     });
 
@@ -398,7 +434,7 @@ export async function waitForSynced(
       // transiently drop a conflict file and fabricate a "loss".
       return { seconds, unsynced, observations: obs, hostOutage };
     }
-    await sleep(pollMs);
+    if (pollMs > 0) await sleep(pollMs);
   }
 }
 
@@ -410,11 +446,15 @@ export async function waitForSynced(
  * a flagged inconsistency. Skipped when the driver has no vault path (local/dev). Run only once settled, so a
  * mid-sync difference can't fire.
  */
-export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): Promise<void> {
+export async function crossCheckFs(drivers: ObsidianDriver[], folder: string, logger?: RunLogger): Promise<void> {
   for (const d of drivers) {
+    const t0 = Date.now();
     const fs = await d.listDirFs(folder);
     if (!fs.ok && fs.reason === "unavailable") continue; // no FS path configured for THIS driver → skip it, not the rest
     const cli = new Set((await d.listFiles(folder)).value ?? []);
+    // Logged even when it agrees. A check that reads two sources and says nothing unless it is
+    // unhappy leaves its own cost — and the fact that it ran at all — invisible.
+    logger?.log({ kind: "cross-check", what: "listing", node: d.node, folder, files: cli.size, ms: Date.now() - t0 });
     const onDisk = new Set((fs.ok ? fs.entries : []).map((e) => `${folder}/${e}`));
     const cliReportedButNotOnDisk = [...cli].filter((x) => !onDisk.has(x));
     const onDiskButNotReported = [...onDisk].filter((x) => !cli.has(x));
@@ -428,17 +468,74 @@ export async function crossCheckFs(drivers: ObsidianDriver[], folder: string): P
   }
 }
 
+/**
+ * The same idea as `crossCheckFs`, for CONTENT rather than existence.
+ *
+ * Every loss verdict rests on obsidian-cli's `read`: `lost` means the token was in no note and no
+ * conflict copy on any node, as reported by Obsidian. That was a single witness. `crossCheckFs`
+ * already refuses to take the CLI's word about which files EXIST — this refuses to take its word
+ * about what is IN them, using the second source the harness already had but only pointed at
+ * listings.
+ *
+ * A disagreement is an apparatus fault, not a rep outcome: if the two sources cannot agree on the
+ * bytes, neither the loss nor its absence means anything, so it throws and the rep ends -OBSFAIL
+ * rather than reporting a verdict built on a reading that is in dispute.
+ *
+ * Run at the SETTLED verdict only, on the observation the verdict is actually computed from, so a
+ * mid-sync difference cannot fire — the same discipline as the listing check.
+ */
+export async function crossCheckContent(
+  drivers: ObsidianDriver[], observations: NodeObservation[], logger?: RunLogger,
+): Promise<void> {
+  const byNode = new Map(drivers.map((d) => [d.node, d]));
+  // Obsidian's `read` hands back the note without its trailing newline; `cat` hands back the file.
+  // That difference is formatting, not content, and comparing raw would fire on every note.
+  const norm = (s: string): string => s.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+  for (const o of observations) {
+    const d = byNode.get(o.node);
+    if (!d) continue;
+    const pairs: { path: string; cli: string | null }[] = [
+      { path: `${o.note}.md`, cli: o.canonical },
+      ...o.conflicts.map((c) => ({ path: c.file, cli: c.content })),
+    ];
+    const t0 = Date.now();
+    let compared = 0;
+    for (const { path, cli } of pairs) {
+      const disk = await d.readFileFs(path);
+      if (!disk.ok && disk.reason === "unavailable") return; // no vault path on this driver → skip
+      // The note reading absent while the file is on disk (or the reverse) is the listing check's
+      // business, and it has already run; here that combination only means there is nothing to
+      // compare, so it is not re-reported as a content fault.
+      if (cli === null || !disk.ok) continue;
+      compared++;
+      if (norm(disk.content) === norm(cli)) continue;
+      throw new CliInconsistencyError("cli-fs-content-disagreement", {
+        node: o.node, file: path,
+        cliLength: cli.length, fsLength: disk.content.length,
+        cli: cli.slice(0, 200), fs: disk.content.slice(0, 200),
+      });
+    }
+    logger?.log({ kind: "cross-check", what: "content", node: o.node, note: o.note, files: compared, ms: Date.now() - t0 });
+  }
+}
+
 /** Severity witness: which "lost" tokens are still recoverable from server history, who wrote
  *  them, and whether the writer left behind the conflict file it should have.
  *
- *  Model (per Obsidian's own docs, and independently verified against 140 real conflict files
- *  captured by this harness, 2026-07-09, 140/140 matching, 0 exceptions): the device holding a
- *  locally-differing, not-yet-synced edit is the one that "detects" the conflict when an incoming
- *  remote update supersedes it — it keeps the remote content as the new canonical note and stashes
- *  its OWN prior content into `(Conflicted copy <device> <ts>)`. Since a device's own stashed
- *  content only grows via its own sequential local appends, the LAST token inside a conflict file
- *  is always attributable to the device named in its title (see docs/DESIGN.md). A lost token can
- *  therefore never appear inside ANY conflict file (that would make it "onlyInConflict", not
+ *  Model (per Obsidian's own docs): the device holding a locally-differing, not-yet-synced edit is
+ *  the one that "detects" the conflict when an incoming remote update supersedes it — it keeps the
+ *  remote content as the new canonical note, stashes its OWN prior content into
+ *  `(Conflicted copy <device> <ts>)`, and names that file after itself. One device does all three,
+ *  which is what makes a conflict file attributable to the device in its title. That is the whole
+ *  premise used here.
+ *
+ *  A stronger claim also holds — the LAST token inside a conflict file is the titled device's —
+ *  because every node runs Sync's "create conflict file" mode, so there is no merge step that could
+ *  interleave a remote token after this device's own appends (see docs/DESIGN.md). Nothing here
+ *  uses it: this function works at the level of FILENAMES only and never reads conflict content.
+ *  Note it is a property of that CONFIGURATION, not of Obsidian — under the merge setting it fails.
+ *
+ *  A lost token can never appear inside ANY conflict file (that would make it "onlyInConflict", not
  *  "lost" — see oracle.ts's checkNote) — so `conflictFileFound` checks whether the writer's device
  *  produced A conflict file for this note at all, not whether it contains this specific token. */
 async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict, acked: AckedEdit[]): Promise<LostForensic[]> {
@@ -459,7 +556,7 @@ async function lostForensics(driver: ObsidianDriver, verdict: RunVerdict, acked:
       assert(entry !== undefined, `lost token ${token} for note ${nv.note} has no matching AckedEdit — oracle.ts's checkNote only ever lists tokens that came from acked in the first place`);
       out.push({
         note: nv.note, token, writer: entry.node,
-        serverRecoverable: versions.length > 0, serverVersions: versions,
+        inServer: versions.length > 0, serverVersions: versions,
         conflictFileFound: conflictDevices.has(entry.node),
       });
     }
@@ -492,66 +589,203 @@ async function waitNodesSynced(drivers: ObsidianDriver[], probeMs: number, logge
   }
 }
 
-/** Opt-in early-warning check (ExecuteOpts.wouldFailCheck, default OFF). Called from both `P` and
- *  `W` when every driver touching `notes` is online: runs the REAL oracle judgment against a
- *  fresh observation right now, using the exact same paranoid gatherObservation() the final
- *  settle uses (not the lighter pause-snapshot reads) — so this is genuinely "what would the
- *  verdict be if we judged RIGHT NOW", not an approximation. Logs a `would-fail` event (+ durable
- *  `<runsDir>/WOULDFAIL.log`, same append-one-JSON-line-per-hit shape as
- *  inconsistency.ts's recordInconsistency) for LOST/DUPL only — a divergence is deliberately never
- *  reported here: per waitForSynced's own convergence requirement, a stable disagreement is
- *  presumed a still-pending real sync, not a verdict an incomplete mid-history snapshot should
- *  ever assert.
+
+/** How far the filesystem may lag its own server version counter before that is worth reporting.
  *
- *  P and W are equally reliable (or unreliable) as a mid-history snapshot — neither is more
- *  "trustworthy", they're both just an early look at a possibly-still-converging state. The
- *  reason this is opt-in at all: every call here is a REAL extra CLI call (the same paranoid,
- *  retrying reads the final judgment uses), and this project's whole premise is treating
- *  Obsidian as a black box we must not accidentally influence — extra polling conceivably could
- *  perturb Sync's own timing. Default off; a user who wants it can compare pass rates/timings
- *  with it on vs. off. */
-async function checkWouldFail(
-  drivers: ObsidianDriver[],
-  offline: Set<number>,
-  touched: Set<string>,
-  acked: AckedEdit[],
+ *  PROVISIONAL, and deliberately crude: an ordinary delivery trails by ~1.4s (measured on a clean
+ *  `N1AaN2W`, 2026-09-05), and downloads resolve around 5s in the corpus, so 10s is roughly twice
+ *  the normal worst case. It is a noise floor, not a finding — the honest number needs a real
+ *  download distribution, which is what the `everything` sampling mode exists to produce. Revisit
+ *  it once that has run; do not treat it as measured. */
+const FS_TRAIL_NOTABLE_SEC = 10;
+
+/** Consecutive unreadable `sync:history` replies before a wait gives up on counter corroboration.
+ *  Three, because the call is bounded and a single blocked read during an active sync is ordinary —
+ *  it is a persistent inability to read the counter that matters, not one busy moment. */
+const COUNTER_UNREADABLE_GIVE_UP = 3;
+
+/** Per-call cap for the `everything` sampler — NOT `probeSec`.
+ *
+ *  A sampling round issues its calls together and is only as fast as its slowest one, so the cap is
+ *  the round's floor whenever any node cannot answer. With `probeSec` (5s) a single disconnected
+ *  node made every round take five seconds — in `everything-no-sleep`, whose entire purpose is
+ *  density. The settle's 5s cap is right for the settle, which must not mistake a slow reply for a
+ *  stall; it is exactly wrong for a sampler, which would rather record "could not see" and move on.
+ *
+ *  500ms, matching probe-propagation's own `CALL_CAP_MS`: 4 concurrent execs measured 169ms median
+ *  and 189ms p90 against these containers. The cost is that a genuinely slow-but-healthy call is
+ *  recorded as blocked — the same ambiguity the probe already accepts, and the lane says `x`
+ *  either way. */
+const SAMPLE_CAP_MS = 500;
+
+/**
+ * `W` — wait until this node genuinely holds what it should, or decide it never will.
+ *
+ * Two conditions, both on this one node (a user knows what their own client shows, and the harness
+ * additionally knows which tokens were introduced elsewhere, which is legitimate because it is the
+ * same person sitting at every node):
+ *
+ *   1. the expected tokens are on its filesystem, and
+ *   2. Obsidian here reports `synced`.
+ *
+ * `synced` alone is not a barrier and never was. It is a LOCAL claim — a node that has lost the
+ * network may not have noticed — and measurement says it is optimistic: 324 of 606 sender-side waits
+ * in the corpus read `synced` on their first poll, with a hole in the upload histogram at 1s that no
+ * real latency distribution would produce. So the claim is corroborated by the server version
+ * counter, which is the one signal measured never to move early.
+ *
+ * NOTHING OUTSTANDING RETURNS AT ONCE. The counter corroborates a pending change; it is not a
+ * condition in its own right. With no token missing and the node synced, `W` is done and no counter
+ * is read — which is what makes `N1AaWN2WW` terminate instead of waiting on a movement that nothing
+ * will ever cause. A redundant `W` is a no-op, but not a silent one: condition 2 is still checked.
+ *
+ * The two ways this can drag on are different in kind and must not be conflated:
+ *
+ *   CASE A — the counter has not moved, so the filesystem cannot have either. Nothing is happening;
+ *     perhaps the network is down. A bare `W` waits INDEFINITELY here (as every wait in this harness
+ *     always has — capSec is not a give-up, it only triggers the host-outage check). `W<n>` gives up
+ *     after n seconds and carries on, which is the point of the op: the user who assumes they simply
+ *     missed the sync and edits anyway. That is the experiment working, not a failure, and no
+ *     verdict attaches — the tokens may land a second later and the rep end clean.
+ *
+ *   CASE B — the counter HAS moved and the tokens are still not on disk. The server demonstrably
+ *     has the data. This is the loss signature the corpus already shows (720 of 733 lost notes end
+ *     at total == ackedCount, zero conflict files). Here we stop simulating a user and give Sync
+ *     `lossGraceSec` to fix it, still polling. Fixed in time: the near-miss is recorded rather than
+ *     swallowed. Not fixed: the history is abandoned and the rep goes straight to its verdict.
+ */
+async function waitOnNode(
+  d: ObsidianDriver,
+  note: string,
+  expected: string[],
+  /** `undefined` = never read (blocked call), so there is no corroboration to be had and `W` falls
+   *  back to tokens plus `synced`. `null` = the server genuinely had no history for the note yet, so
+   *  any later reading counts as movement. */
+  baseline: number | null | undefined,
+  /** Does THIS node have a write of its own whose push is still unconfirmed? When it does, the
+   *  counter moving is a condition, not merely a diagnosis — it is the only trustworthy evidence the
+   *  push left. When it does not, the counter is used solely to tell case A from case B. */
+  uploadPending: boolean,
+  patienceSec: number | undefined,
   opts: ExecuteOpts,
   logger: RunLogger,
-  atSec: number,
-): Promise<void> {
-  if (!opts.wouldFailCheck) return; // not enabled: nothing to say, not even that it was skipped
+  arrivals?: ArrivalTracker,
+  sampleAll?: () => Promise<void>,
+  // Optional: fed the same observation, to log it as a `sample`. Set only when `sampleAll` is not,
+  // so exactly one of the two writes a node's file lane in any given poll.
+  noteObserved?: (o: NodeObservation, ms: number) => void,
+): Promise<{ hostOutage: boolean; earlyLoss: boolean; uploadConfirmed: boolean }> {
+  const pollMs = opts.sampling === "everything-no-sleep" ? 0 : (opts.pollSec ?? 1) * 1000;
+  const probeMs = (opts.probeSec ?? 5) * 1000;
+  const capMs = (opts.capSec ?? 120) * 1000;
+  const graceMs = (opts.lossGraceSec ?? 60) * 1000;
+  let started = Date.now();
+  let hostOutage = false;
+  let checkedHost = false;
+  let movedAt: number | null = null; // when the counter was first seen past its baseline
+  let unreadable = 0; // consecutive counter reads that came back as anything but a number
+  let uncorroborated = false; // gave up on the counter: it cannot be read at all
+  let sawMissing = false; // we observed the tokens genuinely absent at least once
+  let missing = expected;
 
-  // Every INVOCATION is logged, not only the ones that fire, because the silent ones are the
-  // denominator. Without them an empty result is ambiguous between "peeked repeatedly and saw
-  // nothing" — real evidence there was no early signal — and "never peeked at all", which is no
-  // evidence whatever. analyze cannot judge how well the peek predicts anything without knowing
-  // how many chances it had.
-  if (offline.size > 0) {
-    // Judging mid-partition would flag divergence that is SUPPOSED to exist, so this is skipped by
-    // design. It matters that the skip is visible: with CD_PROB non-zero (now the default) many
-    // pauses sit inside a D...C window, so a partitioned soak checks far less than it looks.
-    logger.log({ kind: "would-fail-check", atSec, ran: false, reason: "a node is offline" });
-    return;
+  for (;;) {
+    // Every node, not just this one — the point of the `everything` modes. Started at the TOP of
+    // the body, so a wait satisfied on its very first pass still samples: with this at the bottom,
+    // every short wait returned before sampling anything and the timeline's `vers` lanes simply
+    // began wherever the first SLOW wait happened to be.
+    //
+    // Fired but NOT awaited here: the sampler's reads and this poll's own reads are independent, so
+    // a round costs max(sampler, poll) rather than their sum. Awaiting first made every wait's first
+    // decision wait out a full sampling round — up to the sampler's cap — before it even probed.
+    // Rejections are swallowed: a lost round of diagnostics must never fail a rep.
+    const sampling = sampleAll?.().catch(() => {});
+    const tProbe = Date.now();
+    const state = await syncState(d, probeMs);
+    const probeWallMs = Date.now() - tProbe;
+    const synced = state === "synced";
+    if (synced) {
+      // Only read content from a SYNCED node: the read blocks on one that is still syncing, and
+      // returns mid-flux content, which has fabricated a divergence before now.
+      const tGather = Date.now();
+      const o = await gatherObservation(d, note);
+      const gatherWallMs = Date.now() - tGather;
+      const texts = [o.canonical ?? "", ...o.conflicts.map((c) => c.content)];
+      missing = expected.filter((t) => !texts.some((x) => x.includes(t)));
+      if (missing.length > 0) sawMissing = true;
+      arrivals?.observe([o], logger); // free: the content is already in hand
+      noteObserved?.(o, gatherWallMs);
+    }
+    await sampling; // both halves of the round are done; nothing dangles past this point
+
+    // Read AFTER the content, and on every poll until it moves. After, because "the tokens are here
+    // and the counter still has not moved" is only evidence of that ordering if the counter was the
+    // later of the two reads. Every poll, because the poll on which the tokens land is exactly the
+    // one whose counter reading decides which weirdness (if any) this was.
+    if (baseline !== undefined && movedAt === null && !uncorroborated) {
+      const r = await d.snapshotVersionsTotal(note, probeMs);
+      if (r.status === "ok") {
+        unreadable = 0;
+        if (baseline === null || (r.total ?? 0) > baseline) movedAt = Date.now();
+      } else if (++unreadable >= COUNTER_UNREADABLE_GIVE_UP) {
+        // A counter we cannot read is not a counter that has not moved. Waiting on corroboration
+        // that will never arrive would hang the whole rep on a CLI fault, so say plainly that this
+        // wait is uncorroborated and fall back to tokens plus `synced` — weaker, and logged as such,
+        // rather than silently stuck.
+        uncorroborated = true;
+        logger.log({ kind: "wait-uncorroborated", node: d.node, note, reads: unreadable, lastStatus: r.status });
+      }
+    }
+
+    // One line per poll, so a wait's time-spend stays visible after the fact — and so the timeline
+    // reconstruction has something to draw this node's `sync` lane from. `missing` is null when the
+    // node was not synced, because content is deliberately not read from a syncing node: we do not
+    // know what is on its disk, which is not the same as knowing it is complete.
+    logger.log({
+      kind: "settle-poll", elapsedSec: Math.round((Date.now() - started) / 1000),
+      states: [state], everySynced: synced, wait: d.node, note,
+      missing: synced ? missing.length : null, counterMoved: movedAt !== null, probeMs: probeWallMs,
+    });
+
+    if (synced && missing.length === 0 && (!uploadPending || movedAt !== null || uncorroborated)) {
+      if (movedAt === null && baseline !== undefined && sawMissing && !uncorroborated) {
+        // The tokens reached the disk without this node's counter ever being seen past its
+        // baseline. The counter is supposed to be the conservative signal — never early — so the
+        // filesystem overtaking it is the interesting direction, not the boring one.
+        logger.log({ kind: "weirdness", what: "fs-led-counter", node: d.node, note });
+      } else if (movedAt !== null) {
+        // Case B resolved itself. Only report a NOTABLE lag: every ordinary delivery trails its
+        // counter a little — the counter moves when the server commits, the file lands when this
+        // node has pulled it — so logging each one would file a weirdness per rep and bury the
+        // section in its own noise. Measured on a clean `N1AaN2W`: 1.4s.
+        const bySec = (Date.now() - movedAt) / 1000;
+        if (bySec >= FS_TRAIL_NOTABLE_SEC) {
+          logger.log({
+            kind: "weirdness", what: "fs-trailed-counter", node: d.node, note,
+            bySec: Number(bySec.toFixed(3)),
+          });
+        }
+      }
+      return { hostOutage, earlyLoss: false, uploadConfirmed: movedAt !== null };
+    }
+
+    if (movedAt !== null && missing.length > 0 && Date.now() - movedAt >= graceMs) {
+      logger.log({ kind: "loss-detected", node: d.node, note, missing, graceSec: graceMs / 1000 });
+      return { hostOutage, earlyLoss: true, uploadConfirmed: true };
+    }
+    if (patienceSec !== undefined && Date.now() - started >= patienceSec * 1000) {
+      logger.log({
+        kind: "wait-handoff", node: d.node, note, patience: patienceSec, missing, syncedAtHandoff: synced,
+      });
+      return { hostOutage, earlyLoss: false, uploadConfirmed: movedAt !== null };
+    }
+    // Tell a Sync stall apart from the host's own internet being down; an outage restarts the
+    // window rather than counting against it.
+    if (!checkedHost && Date.now() - started > capMs) {
+      checkedHost = true;
+      if (await waitForHostReconnect(logger, { node: d.node, note })) { hostOutage = true; started = Date.now(); }
+    }
+    if (pollMs > 0) await sleep(pollMs);
   }
-  if (touched.size === 0) {
-    logger.log({ kind: "would-fail-check", atSec, ran: false, reason: "nothing appended yet" });
-    return;
-  }
-  const notes = [...touched];
-  const obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
-  const verdict = checkRun(acked, obs);
-  const lost = verdict.notes.some((n) => n.lost.length > 0);
-  const dupl = verdict.notes.some((n) => n.duplicated.length > 0);
-  logger.log({ kind: "would-fail-check", atSec, ran: true, notes: notes.length, wouldFail: lost || dupl });
-  if (!lost && !dupl) return; // OK, or a node-vs-node disagreement — neither is reported here
-  const suffix = lost ? "-LOST" : "-DUPL";
-  const rec = { atSec, suffix, verdict };
-  logger.log({ kind: "would-fail", ...rec });
-  try {
-    const runsDir = opts.runsDir ?? "runs";
-    mkdirSync(runsDir, { recursive: true });
-    appendFileSync(path.join(runsDir, "WOULDFAIL.log"), JSON.stringify(rec) + "\n");
-  } catch { /* even if we can't persist, the caller still has the logged event */ }
 }
 
 
@@ -602,9 +836,12 @@ export async function runHistory(
     // not the full topology it ran against).
     nodes: drivers.map((d) => d.node),
     isolator: opts.isolator, obsidianVersion: opts.obsidianVersion, localObsidianVersion: opts.localObsidianVersion,
+    // Which sampling regime ran. The `everything` modes perturb what they measure, so a reader (and
+    // `analyze`) must be able to tell those reps apart from strategic ones rather than pooling them.
+    sampling: opts.sampling ?? "strategic",
     containerEngine: opts.containerEngine,
     localVaultName: opts.localVaultName,
-    wSettleSec: opts.wSettleSec ?? 4, finalSettleSec: opts.finalSettleSec ?? 15,
+    lossGraceSec: opts.lossGraceSec ?? 60, finalSettleSec: opts.finalSettleSec ?? 15,
     pollSec: opts.pollSec ?? 1, minFloorSec: opts.minFloorSec ?? 3,
     capSec: opts.capSec ?? 120, probeSec: opts.probeSec ?? 5,
   });
@@ -646,6 +883,8 @@ export async function runHistory(
   // (the upfront local-Sync check below, waitNodesSynced's baseline poll, pause snapshots) — same
   // knob and rationale as the settle's own probe: never block on a not-yet-synced node.
   const probeMs = (opts.probeSec ?? 5) * 1000;
+  // Same cadence the waits poll at, so a pause samples at the rate the rest of the rep does.
+  const pollMs = opts.sampling === "everything-no-sleep" ? 0 : (opts.pollSec ?? 1) * 1000;
 
   // Check the local instance's Sync health ONCE per rep, unconditionally — not gated on whether
   // THIS rep's history happens to select "local" as an edit target. It's a live, continuously-
@@ -673,12 +912,168 @@ export async function runHistory(
   const noteLetters = new Map<string, string>(); // concrete note name -> its logical DSL letter
   const acked: AckedEdit[] = [];
   let seq = 0;
+  // Per (node, note), that node's server version counter as of just BEFORE the most recent write to
+  // the note — the reference `W` compares against to decide whether anything has moved.
+  //
+  // Read on EVERY node, and read BEFORE the write is issued: no arrival is possible in that gap
+  // because the change does not exist yet, so whichever node later runs a `W` holds a baseline that
+  // is provably pre-change. A `W` on the receiving node has no local write to hang a baseline off,
+  // and would otherwise have to read one after the fact and race the very delivery it is waiting for.
+  //
+  // Refreshed at a node's OWN append, and only there. Not once per rep — the throttle can batch two
+  // edits into a single version, so a baseline from two of this node's appends ago could be
+  // satisfied by an upload carrying neither of the tokens this `W` cares about. And not at anyone
+  // else's append either, which is the correction: a baseline is not "the counter lately", it is
+  // "the counter as it stood before the write this node is waiting to see confirmed". Re-reading it
+  // when a DIFFERENT node appends can only replace a correct pre-write value with one that may
+  // already count the write — and it used to cost ~230ms on the node whose value was already right,
+  // sitting squarely between two appends that were supposed to race each other.
+  //
+  // Reading it costs nothing extra when the node is the one writing: it rides at the head of that
+  // node's own write batch (`editAndConfirm`'s `versionsMs`), one `sh -c` ahead of the append, so no
+  // interval exists between the two at all. A node that has never held a baseline for the note gets
+  // a standalone read, which is the cheap case by construction — it has no history for the note, and
+  // `sync:history` answers "not found" in milliseconds even with no network (docs/DESIGN.md).
+  //
+  // A missing key means "we could not read it" (the call was blocked) — distinct from a recorded
+  // `null`, which means the server genuinely had no history for the note yet, so any later reading
+  // counts as movement. With no baseline there is no corroboration, and `W` falls back to tokens
+  // plus `synced` rather than inventing a comparison.
+  const baselines = new Map<string, number | null>();
+  const baseKey = (node: NodeId, note: string): string => `${node}\u0000${note}`;
+  /** Record one node's baseline and log it as a sample, whether it was read or inferred.
+   *  `undefined` means the call never produced an answer, which is the "no baseline" case above. */
+  const recordBaseline = (
+    node: NodeId,
+    note: string,
+    r: { status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string } | undefined,
+    inferred = false,
+    /** What reading it cost. 0 for an inferred one — nothing was called. */
+    ms = 0,
+  ): void => {
+    const key = baseKey(node, note);
+    if (r?.status === "ok") baselines.set(key, r.total ?? 0);
+    else if (r?.status === "absent") baselines.set(key, null);
+    else baselines.delete(key); // unreadable: no baseline, no corroboration
+    logger.log({
+      kind: "sample", node, note, baseline: true, ms,
+      vers: r?.status === "ok" ? (r.total ?? null) : null,
+      versStatus: r?.status ?? "unrecognized",
+      ...(r?.raw !== undefined ? { versRaw: r.raw } : {}),
+      // Marks a value nobody measured: at a note's genesis the answer is known in advance, and
+      // spending an exec to confirm it would widen the very gap the history exists to close.
+      ...(inferred ? { inferred: true } : {}),
+    });
+  };
+  /** Notes some node has already TRIED to write, by vault name. Attempted, not landed: an
+   *  unconfirmed write may still have created the file, and treating the note as untouched
+   *  afterwards would let a later `create` make a numbered sibling the oracle never accounted for. */
+  const noteEverWritten = new Set<string>();
+  // (node, note) pairs where THIS node has written and its push has not yet been corroborated by
+  // its counter moving. Only the author's own key is added, which is what keeps the counter
+  // condition off a node that merely receives: a pure receiver has no push to confirm, so requiring
+  // its counter to move would hang `N1DAaN2W` forever on a token trapped behind a partition.
+  const uploadPending = new Set<string>();
+  // One `FileLane` per (node, note) — the shared watcher in timeline.ts, so the harness and the
+  // propagation probe cannot end up meaning different things by `m` or `c`. It owns the memory of
+  // the last look, including the rule that a look which did not answer disturbs nothing.
+  const fileLanes = new Map<string, FileLane>();
+  const laneFor = (node: NodeId, note: string): FileLane => {
+    const key = baseKey(node, note);
+    const l = fileLanes.get(key) ?? new FileLane();
+    fileLanes.set(key, l);
+    return l;
+  };
+  /** The file-lane half of a `sample` event, from one look at one note on one node. */
+  const fileFacts = (
+    node: NodeId, note: string, fileStatus: string, content: string, conflicts: string[],
+  ): Record<string, unknown> => laneFor(node, note).look({
+    fileStatus, content, conflicts,
+    tokens: acked.filter((a) => a.note === note).map((a) => a.token),
+  }) as unknown as Record<string, unknown>;
+
+  // What the waits and the settle already read, logged as a `sample` so the file lane draws in
+  // STRATEGIC runs too. Nothing extra is measured — `gatherObservation` has already run and the
+  // content is in hand. Without it `m`/`M`/`c`/`C` only ever appear under the `everything` modes,
+  // since those marks are produced from `sample` events alone.
+  //
+  // Defined below `sampleAll`, and only when that is undefined: in the `everything` modes the
+  // sampler already covers every node each poll, and two emitters marking one lane in one slot
+  // draws a contradictory pair (the `Mu` case the `token-arrived` handler in timeline.ts describes).
+  //
+  // In the `everything` modes, one round of bounded reads across every node and every note touched
+  // so far, logged as `sample`. Bounded so a blocked call records `timeout` rather than stalling the
+  // poll loop that calls it — the same discipline the propagation probe uses. `undefined` in
+  // strategic mode, so the call sites cost nothing.
+  const sampleAll = (opts.sampling ?? "strategic") === "strategic" ? undefined : async (): Promise<void> => {
+    const notes = [...touched];
+    if (notes.length === 0) return;
+    await Promise.all(drivers.map(async (dd) => {
+      // `ms` on every line below: one `sampleNotes` round trip produces all of this node's samples,
+      // so they share its cost. What the line says was observed, and what observing it cost.
+      const t0 = Date.now();
+      const r = await dd.sampleNotes(NOTE_DIR, notes, SAMPLE_CAP_MS);
+      const ms = Date.now() - t0;
+      for (const note of notes) {
+        const v = r.per.get(note);
+        if (!r.ok || !v) {
+          logger.log({ kind: "sample", node: dd.node, note, versStatus: "timeout", vers: null, fileStatus: "timeout", sync: "timeout", ms });
+          continue;
+        }
+        // The two readings do not agree: the note read as PRESENT, but the folder listing omitted
+        // it. Both replies arrived and both parsed — nothing was unreadable — they simply cannot
+        // both be right. Recorded as a weirdness rather than thrown, because a sampler must not
+        // abort a rep over a display concern, and the lane draws `!` (unexpected, worth a look)
+        // rather than `?` (unreadable). The oracle-grade read throws on this same condition.
+        if (v.inconsistent) {
+          logger.log({ kind: "weirdness", what: "cli-listing-inconsistent", node: dd.node, note });
+        }
+        logger.log({
+          kind: "sample", node: dd.node, note, ms,
+          vers: v.vers, versStatus: v.versStatus, sync: r.sync,
+          // The bytes behind an `unrecognized`. Saying only that something could not be parsed
+          // leaves nobody able to teach the recognizer — by the time the log is read, the call is
+          // long gone.
+          ...(v.versRaw !== undefined ? { versRaw: v.versRaw } : {}),
+          ...(v.fileRaw !== undefined ? { fileRaw: v.fileRaw } : {}),
+          ...fileFacts(dd.node, note, v.fileStatus, v.content, v.conflicts),
+        });
+      }
+      // Arrivals, from the reads already in hand. Only positively-answered looks: `timeout` or an
+      // unreadable reply means "we could not tell", which is not "not here yet" (see arrivals.ts).
+      if (!r.ok) return;
+      const seen = notes.flatMap((note) => {
+        const v = r.per.get(note);
+        if (!v || (v.fileStatus !== "present" && v.fileStatus !== "absent")) return [];
+        return [{
+          node: dd.node, note,
+          canonical: v.fileStatus === "present" ? v.content : null,
+          conflicts: v.conflicts.map((content, i) => ({ file: `${note} (conflict ${i})`, content })),
+        }];
+      });
+      if (seen.length > 0) arrivals.observe(seen, logger);
+    }));
+  };
+  const noteObserved = sampleAll !== undefined ? undefined : (o: NodeObservation, ms: number): void => {
+    logger.log({
+      kind: "sample", node: o.node, note: o.note, sync: "synced", ms,
+      ...fileFacts(
+        o.node, o.note,
+        o.canonical === null ? "absent" : "present",
+        o.canonical ?? "",
+        o.conflicts.map((c) => c.content),
+      ),
+    });
+  };
+  let earlyLoss = false; // a `W` saw the counter move while the disk stayed empty past the grace
 
   // NOTE: scripts/repro-lib.sh reimplements a simplified version of this op interpreter in bash,
   // for `make repro`'s standalone reproduction scripts (see src/repro.ts). If you change how an
   // op behaves here (append's create-vs-append fallback, disconnect/connect, what counts as
   // "synced", the token format), check whether scripts/repro-lib.sh needs the same update.
   const historyStartedAt = Date.now();
+  // One per rep. Records only; nothing here can change a verdict or how long a wait runs.
+  const arrivals = new ArrivalTracker();
   for (const op of history) {
     switch (op.cmd) {
       case "node":
@@ -691,8 +1086,30 @@ export async function runHistory(
         // Logged at START: a pause has no result to report beyond "I did the thing" (just the
         // requested duration, echoed — no measured outcome), unlike pause-snapshot below, which
         // DOES carry a real result and stays logged at its own finish.
-        logger.log({ kind: "pausing", seconds: op.seconds });
-        await sleep((op.seconds ?? DEFAULT_PAUSE_SEC) * 1000);
+        // The node carries so the timeline can draw the pause on the lane of whoever was holding
+        // the cursor. A pause is a user action like any other and belongs in the ops row; without a
+        // node it could only be drawn on every lane or none.
+        logger.log({ kind: "pausing", seconds: op.seconds, node: driverOf(activeNode).node });
+        // A pause is the most informative stretch of a `D...P...C` rep — it is where propagation
+        // actually happens — and it used to be the one stretch nothing watched, leaving the lanes
+        // blank across it and only `pause-snapshot` at the far end to say what changed. Under the
+        // `everything` modes it is now sampled throughout, at the same cadence the waits poll at.
+        //
+        // The pause must never come out SHORTER than asked: the loop is bounded on wall clock and
+        // sleeps out whatever the sampling round did not use, so elapsed >= requested. It can
+        // overrun by at most one round, which `assertNotFasterThanPossible` (a floor, not a
+        // ceiling) does not mind.
+        const pauseMs = (op.seconds ?? DEFAULT_PAUSE_SEC) * 1000;
+        if (!sampleAll) await sleep(pauseMs);
+        else {
+          const until = Date.now() + pauseMs;
+          while (Date.now() < until) {
+            // Swallowed like the waits do it: a lost round of diagnostics must never fail a rep.
+            await sampleAll().catch(() => {});
+            const left = until - Date.now();
+            if (left > 0) await sleep(Math.min(pollMs, left));
+          }
+        }
         // Snapshot every node (not just the active one — the whole point is seeing what a
         // DISCONNECTED node's own local state looks like during a D…P…C window, invisible
         // otherwise until the final settle). A snapshot is a LOOK, not a judgment: every call
@@ -702,7 +1119,7 @@ export async function runHistory(
         // Entirely opt-out via --skip-snapshot (opts.snapshot === false): none of these CLI
         // calls happen at all, and no `pause-snapshot` event is logged for this P — in case the
         // extra calls are suspected of perturbing timings/results (same caution as
-        // checkWouldFail's own opt-in design, just the opposite default).
+        // the retired would-fail peek's opt-in design, just the opposite default).
         if (opts.snapshot !== false) {
           // `NOTE_DIR` accumulates every rep of a soak, so a bare folder listing is mostly
           // OTHER reps' notes. Scope both listings down to files that belong to THIS rep: an
@@ -724,6 +1141,7 @@ export async function runHistory(
             const value = await fn();
             return { value, ms: Date.now() - t0 };
           };
+          const snapObs: NodeObservation[] = [];
           const nodesSnapshot = await Promise.all(
             drivers.map(async (d) => {
               const [syncT, fsT, filesT, notesT] = await Promise.all([
@@ -732,6 +1150,13 @@ export async function runHistory(
                 mkTimed(() => d.snapshotFiles(NOTE_DIR, probeMs)),
                 Promise.all(touchedList.map(async (fullname) => {
                   const { value: r, ms } = await mkTimed(() => d.snapshotRead(fullname, probeMs));
+                  // Feed the arrival tracker too: this is the ONLY look at a node that isn't the
+                  // active one outside the final settle, so it is where a slow delivery to an idle
+                  // node gets its lower bound. `unrecognized`/`timeout` mean we don't KNOW what the
+                  // node has — passing those on would fabricate an "absent" and invent a bound.
+                  if (r.status === "present" || r.status === "absent") {
+                    snapObs.push({ node: d.node, note: fullname, canonical: r.status === "present" ? (r.content ?? "") : null, conflicts: [] });
+                  }
                   return [noteLetters.get(fullname) ?? fullname, { ...r, ms }] as const;
                 })),
               ]);
@@ -750,8 +1175,8 @@ export async function runHistory(
             }),
           );
           logger.log({ kind: "pause-snapshot", seconds: op.seconds, nodes: nodesSnapshot });
+          arrivals.observe(snapObs, logger);
         }
-        await checkWouldFail(drivers, offline, touched, acked, opts, logger, (Date.now() - startedAt) / 1000);
         break;
       }
       case "disconnect":
@@ -784,9 +1209,23 @@ export async function runHistory(
           hostOutage ||= await assertLocalSyncOn(driverOf(activeNode), opts, logger);
           vaultDrift ||= await assertLocalVaultUnchanged(driverOf(activeNode), opts, logger);
         }
-        const w = await waitForSynced([driverOf(activeNode)], [activeNote], opts.wSettleSec ?? 4, opts, logger, { wait: driverOf(activeNode).node });
+        const d = driverOf(activeNode);
+        // A token still trapped on a DISCONNECTED node cannot arrive here, so requiring it would
+        // make a bare `W` wait forever on something the history itself made impossible —
+        // `N1DAaN2W` being the ordinary generated shape that would hang. Excluding it only ever
+        // makes `W` less strict, and the final settle still judges the rep on everything.
+        const offlineNames = new Set([...offline].map((n) => driverOf(n).node));
+        const expected = acked
+          .filter((a) => a.note === activeNote && !offlineNames.has(a.node))
+          .map((a) => a.token);
+        const key = baseKey(d.node, activeNote);
+        const w = await waitOnNode(
+          d, activeNote, expected, baselines.get(key), uploadPending.has(key), op.seconds, opts, logger,
+          arrivals, sampleAll, noteObserved,
+        );
         hostOutage ||= w.hostOutage;
-        await checkWouldFail(drivers, offline, touched, acked, opts, logger, (Date.now() - startedAt) / 1000);
+        if (w.uploadConfirmed) uploadPending.delete(key);
+        if (w.earlyLoss) earlyLoss = true;
         break;
       }
       case "append": {
@@ -799,6 +1238,28 @@ export async function runHistory(
         touched.add(activeNote);
         noteLetters.set(activeNote, noteLetter);
         const d = driverOf(activeNode);
+        // GENESIS: nobody has written this note anywhere yet. The vault name carries the rep id
+        // (`uniqueRepId`), so no node can hold server history for it and every baseline is provably
+        // `null` — the same value a read would return, for the price of an exec per node on the one
+        // op where the harness is trying hardest not to be in the way. Recorded and logged like any
+        // other baseline, marked `inferred`, which also starts the timeline's `vers` lanes at t=0 —
+        // the reason these samples are logged at all.
+        const genesis = !noteEverWritten.has(activeNote);
+        noteEverWritten.add(activeNote);
+        if (genesis) {
+          for (const dd of drivers) recordBaseline(dd.node, activeNote, { status: "absent" }, true);
+        } else {
+          // Only nodes that have never held a baseline for this note. The writing node is excluded
+          // because its own read rides in the write batch below; everyone else keeps what they have,
+          // for the reason set out at `baselines`. Bounded, and a blocked node simply records
+          // nothing.
+          const need = drivers.filter((dd) => dd !== d && !baselines.has(baseKey(dd.node, activeNote!)));
+          await Promise.all(need.map(async (dd) => {
+            const t0 = Date.now();
+            const r = await dd.snapshotVersionsTotal(activeNote!, probeMs);
+            recordBaseline(dd.node, activeNote!, r, false, Date.now() - t0);
+          }));
+        }
         const token = formatToken({ node: d.node, seq: ++seq, note: noteLetter });
         // Exit codes are meaningless (the CLI always exits 0) and append-to-missing
         // silently no-ops, so an edit is only acked after its token is read back
@@ -808,35 +1269,80 @@ export async function runHistory(
         // read just hid it — stop, so we never double-append (which would trip the
         // duplication oracle). The happy path logs no extra field — just the op.
         const MAX_ATTEMPTS = 3;
+        const tWrite = Date.now(); // the write's own cost, reported on whichever line it produces
         let landed = false;
         let created = false;
+        const open = opts.openNotes === true;
+        // Genesis already knows the answer, so only a non-genesis write asks for one, and only once.
+        let baselineWanted = !genesis;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS && !landed; attempt++) {
-          const before = await d.read(activeNote);
-          if (before.ok && (before.value ?? "").includes(token)) { landed = true; break; }
-          // Create if THIS node doesn't have the note locally yet, else append. So
-          // editing before propagation is a natural create-create; after, it's
-          // append-contention — timing decides, no forced sync. `before.ok` = present.
-          const exists = before.ok;
-          created = !exists;
-          // Foreground the note on the EDITING node before each edit — the active
-          // node changes via `N` without re-selecting, so opening here (not just on
-          // select) makes the GUI follow whichever node is actually writing.
-          if (exists) { await d.open(activeNote); await d.appendLine(activeNote, token); }
-          else { await d.createNote(activeNote, token); await d.open(activeNote); }
-          const back = await d.read(activeNote);
-          landed = back.ok && (back.value ?? "").includes(token);
-          if (!landed) logger.log({ kind: "edit-unconfirmed", node: d.node, note: noteLetter, token, attempt, fullname: activeNote });
+          // A RETRY reads first, and only a retry. We are here because the previous attempt could
+          // not be confirmed, which means it may still have landed — appending again would
+          // duplicate the token and trip the duplication oracle. On the first attempt there is
+          // nothing to be idempotent about, and the read would be a round trip spent guessing at
+          // something the write itself answers.
+          if (attempt > 1) {
+            const before = await d.read(activeNote);
+            if (before.ok && (before.value ?? "").includes(token)) { landed = true; break; }
+          }
+          // APPEND FIRST, create only if the note is positively reported missing. Deliberately this
+          // order and not the reverse: `create` on a note that already exists does not fail and does
+          // not overwrite — it silently makes a numbered sibling (`<note> 1.md`), which would litter
+          // the vault with a file the oracle never accounted for. Guessing wrong toward `append`
+          // costs one extra round trip and nothing else.
+          //
+          // The ONE case where the guess is not a guess is a note's genesis: nothing has tried to
+          // write it anywhere, so it exists nowhere, so `append` is certain to come back "not found".
+          // Going straight to `create` there spends one round trip instead of two, at the moment
+          // that decides whether two nodes create the same note independently or one merely appends
+          // to what the other already made — which is the difference between the history the string
+          // describes and a sequential one. Only on the FIRST attempt: a retry is here precisely
+          // because the previous write may have landed unseen, so it goes back to append-first.
+          //
+          // Editing before propagation is thus a natural create-create; after it, append-contention.
+          // Timing decides, no forced sync.
+          const straightToCreate = genesis && attempt === 1;
+          const versionsMs = baselineWanted ? probeMs : undefined;
+          baselineWanted = false;
+          const tBatch = Date.now();
+          let w = await d.editAndConfirm(activeNote, token, { create: straightToCreate, open, versionsMs });
+          // The baseline rode in this batch, so it costs what the batch cost — there is no separate
+          // call to attribute to it.
+          if (versionsMs !== undefined) recordBaseline(d.node, activeNote, w.versions, false, Date.now() - tBatch);
+          if (straightToCreate) created = true;
+          if (w.notFound) {
+            created = true;
+            w = await d.editAndConfirm(activeNote, token, { create: true, open });
+          }
+          landed = w.ok && w.present && (w.content ?? "").includes(token);
+          if (!landed) logger.log({ kind: "edit-unconfirmed", node: d.node, note: noteLetter, token, attempt, fullname: activeNote, ms: Date.now() - tBatch });
         }
         if (landed) {
           // Always `appended` so the log mirrors the history; `created` marks a create-create
           // (conflict genesis). The noisy exploded name trails as `fullname`.
-          logger.log({ kind: "appended", node: d.node, note: noteLetter, token, created, fullname: activeNote });
+          // `ms` spans every attempt and both round trips of a create, i.e. what putting this
+          // token on disk actually cost — which is the number the append-to-append gap is made of.
+          logger.log({ kind: "appended", node: d.node, note: noteLetter, token, created, fullname: activeNote, ms: Date.now() - tWrite });
+          uploadPending.add(baseKey(d.node, activeNote)); // cleared when this node's counter moves
+          arrivals.appended(token, d.node, activeNote, created);
           acked.push({ note: activeNote, node: d.node, token });
         } else {
-          logger.log({ kind: "edit-failed", node: d.node, note: noteLetter, token, attempts: MAX_ATTEMPTS, fullname: activeNote });
+          logger.log({ kind: "edit-failed", node: d.node, note: noteLetter, token, attempts: MAX_ATTEMPTS, fullname: activeNote, ms: Date.now() - tWrite });
         }
         break;
       }
+    }
+    // A `W` saw the server hold a version the disk never received, and the grace ran out. Executing
+    // the rest of the history would only pile edits onto a note already known to be broken, so stop
+    // here and go straight to the settle and the verdict.
+    //
+    // Note what this deliberately does NOT do: assert the outcome. The oracle still judges the rep
+    // on what it observes. If the settle recovers the token after all, the rep is clean and carries
+    // a loud `loss-detected` — which is more informative, and more honest, than a verdict the
+    // evidence would contradict.
+    if (earlyLoss) {
+      logger.log({ kind: "history-abandoned", reason: "loss-detected", atSec: (Date.now() - startedAt) / 1000 });
+      break;
     }
   }
 
@@ -856,7 +1362,10 @@ export async function runHistory(
   // Final settle: wait until the whole vault (canonical + conflict files) is
   // converged and quiescent for the long window — explicitly waiting out the
   // conflict file's own ~2-round-trip sync rather than dwelling blindly.
-  const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 15, opts, logger, { final: true });
+  // The final settle is where most arrivals are caught: it polls EVERY node at ~1/s for at least
+  // 16s, which is the only window in a rep long enough to span a ~10s download. A mid-history W
+  // lasts ~5s and usually ends before the token it is waiting for could have landed.
+  const stab = await waitForSynced(drivers, noteList, opts.finalSettleSec ?? 15, opts, logger, { final: true }, arrivals, sampleAll, noteObserved);
   hostOutage ||= stab.hostOutage;
 
   // Judge from the settle's window-confirmed observation, NOT a fresh re-read: a single
@@ -867,7 +1376,10 @@ export async function runHistory(
   // Independent FS second-source: at this settled point, what the CLI lists under bughunt/
   // must exactly match what's on disk — or flag an inconsistency (catches phantom/never-written conflict
   // files and listing dropouts alike).
-  await crossCheckFs(drivers, NOTE_DIR);
+  await crossCheckFs(drivers, NOTE_DIR, logger);
+  // ...and the same second source for what is INSIDE those files, on the very observation the
+  // verdict is about to be computed from. Without it every `lost` rests on obsidian-cli alone.
+  await crossCheckContent(drivers, observations, logger);
   const verdict = checkRun(acked, observations);
 
   // Surface conflict-file structure: device named in the file (the producing node),
@@ -883,16 +1395,16 @@ export async function runHistory(
   for (const f of forensics) {
     logger.log({
       kind: "lost-forensic", note: f.note, token: f.token, writer: f.writer,
-      serverRecoverable: f.serverRecoverable, serverVersions: f.serverVersions, conflictFileFound: f.conflictFileFound,
+      inServer: f.inServer, serverVersions: f.serverVersions, conflictFileFound: f.conflictFileFound,
     });
   }
 
   // A whole-history cross-check, deliberately redundant with every per-op check above. See floor.ts.
-  const minSec = durationFloorSec(history, opts.wSettleSec ?? 4);
+  const minSec = historyDurationExpectedMinSec(history);
   const timings = {
     totalSec: Math.round((Date.now() - startedAt) / 1000),
     convergenceSec: stab.seconds,
-    minSec, // the shortest this history could honestly take — see trace.ts's durationFloorSec
+    minSec, // the shortest this history could honestly take — see trace.ts's historyDurationExpectedMinSec
     unsynced: stab.unsynced,
     hostOutage,
     vaultDrift,

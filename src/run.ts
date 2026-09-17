@@ -51,7 +51,7 @@
 //   --generate       print N generated histories and exit (no nodes touched)
 //   --skip-host-check  skip the host-online preflight
 //   --vault-path     vault's on-disk root for the FS cross-check (default /root/vaults/TestVault)
-//   --poll-sec / --min-floor-sec / --cap-sec / --w-settle-sec / --final-settle-sec
+//   --poll-sec / --min-floor-sec / --cap-sec / --loss-grace-sec / --final-settle-sec
 //                    sync-wait tuning. There is no give-up deadline: Sync is an uncontrollable,
 //                    necessary external resource, so a settle/baseline wait is unbounded — it
 //                    waits for a real result rather than manufacturing an inconclusive timeout.
@@ -66,16 +66,21 @@
 //   --runs-dir       where run results go               (default ./runs)
 //   --skip-snapshot  skip the whole pause-snapshot mechanism (no extra CLI calls at all during a
 //                    P) — in case it's suspected of perturbing timings/results. On by default.
-//   --would-fail-check  opt-in early-warning: during a P/W with every relevant node online, judge
-//                    a fresh observation against the real oracle; log `would-fail` (+ WOULDFAIL.log)
-//                    on LOST/DUPL. Off by default — every check here is a real extra CLI call (see
-//                    execute.ts's checkWouldFail for why that matters).
+//   --sampling       strategic (default) | everything | everything-no-sleep. `strategic` looks at a
+//                    node when a `W`, a pause or the settle happens to touch it. The `everything`
+//                    modes read every node x every touched note on every poll AND throughout every
+//                    pause, which is what fills the timeline's lanes — and which perturbs what it
+//                    measures, so it is opt-in. `-no-sleep` drops the poll interval as well.
+//   --display        end (default) | bar | off. `end` prints the timeline block after each rep,
+//                    `bar` pins it as a live status bar above the scrolling log, `off` suppresses it.
+//   --open-notes     foreground the note on the editing node before each edit, so a watching human
+//                    sees the GUI follow the writer. Presentation, not measurement — hence opt-in.
 //
 // Mirrors all stdout to a timestamped log under runs/ (invocation as its first line).
 //
 //   npm run start -- --forced-turns P --cd-prob 0.4
 
-import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync } from "node:fs";
+import { existsSync, renameSync, readdirSync, statSync, mkdirSync, appendFileSync, readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -92,6 +97,7 @@ import { hostOnline } from "./net.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
 import { CliInconsistencyError, describeInconsistency, recordInconsistency, formatInconsistency } from "./inconsistency.js";
 import { NOTE_DIR } from "./types.js";
+import { foldEvents, renderLanes, StatusBar } from "./timeline.js";
 
 // Correctness-assumption violations are thrown deep in the driver/oracle; they're handled
 // per-rep in `runRep` (tagged -OBSFAIL/-UNKNOWN, soak continues). One that still escapes the
@@ -169,7 +175,10 @@ const { values } = parseArgs({
     "poll-sec": { type: "string" },
     "min-floor-sec": { type: "string" },
     "cap-sec": { type: "string" },
-    "w-settle-sec": { type: "string" },
+    "loss-grace-sec": { type: "string" },
+    sampling: { type: "string" },
+    "open-notes": { type: "boolean" },
+    display: { type: "string" },
     "final-settle-sec": { type: "string" },
     "probe-sec": { type: "string" },
     "reconnect-budget-ms": { type: "string" },
@@ -177,7 +186,6 @@ const { values } = parseArgs({
     "vault-path": { type: "string" },
     "runs-dir": { type: "string" },
     "skip-snapshot": { type: "boolean" },
-    "would-fail-check": { type: "boolean" },
     "local-vault-pin": { type: "boolean" },
   },
 });
@@ -364,11 +372,16 @@ if (isolator instanceof NetworkIsolator && values["reconnect-budget-ms"] !== und
   isolator.reconnectBudgetMs = ms;
 }
 
+// Where a rep's timeline goes: `end` prints it after the rep (the default), `off` suppresses it.
+const display = String(values.display ?? "end");
+
 const execBase: Omit<ExecuteOpts, "noteName"> = {
   pollSec: Number(values["poll-sec"] ?? 1),
   minFloorSec: Number(values["min-floor-sec"] ?? 3),
   capSec: Number(values["cap-sec"] ?? 120),
-  wSettleSec: Number(values["w-settle-sec"] ?? 4),
+  lossGraceSec: Number(values["loss-grace-sec"] ?? 60),
+  sampling: (values.sampling ?? "strategic") as "strategic" | "everything" | "everything-no-sleep",
+  openNotes: !!values["open-notes"],
   finalSettleSec: Number(values["final-settle-sec"] ?? 15),
   probeSec: Number(values["probe-sec"] ?? 5),
   hostCheck: !values["skip-host-check"], // on by default; --skip-host-check turns it off
@@ -379,7 +392,6 @@ const execBase: Omit<ExecuteOpts, "noteName"> = {
   localNode: localRequested ? drivers.length : undefined, // the local driver's own (last) position
   localObsidianVersion: await localObsidianVersion(),
   localVaultName: capturedLocalVaultName,
-  wouldFailCheck: !!values["would-fail-check"], // off by default — see execute.ts's checkWouldFail
   runsDir: runsRoot,
 };
 
@@ -544,12 +556,51 @@ async function recoverNodes(): Promise<void> {
 
 /** Resolves true when the rep produced a result (so it counts against REPEAT), false when it was
  *  abandoned to an -ENVFAIL and should be retried. */
+/**
+ * Draw a finished rep's timeline, reconstructed from its own log.
+ *
+ * Read back from the file rather than accumulated in memory: the log is the record, and rebuilding
+ * from it means the block a soak prints and the block `make timeline-rep` prints later are produced
+ * by the same code path over the same bytes. A rep that ended in a thrown assumption violation gets
+ * one too — that is the rep most worth looking at.
+ *
+ * `DISPLAY=off` skips it entirely, for a long soak where the blocks would be noise.
+ */
+function showTimeline(repPath: string, display: string): void {
+  if (display === "off") return;
+  let events: Record<string, unknown>[];
+  try {
+    events = readFileSync(repPath, "utf8").split("\n").filter(Boolean).flatMap((l: string) => {
+      try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; }
+    });
+  } catch { return; } // the rep may have been renamed by a -TAG already, or never written
+  const { slots, lanes, quietSettleSlots } = foldEvents(events);
+  if (lanes.length === 0) return;
+  for (const line of renderLanes(slots, lanes)) console.log(line);
+  if (quietSettleSlots > 0) console.log(`      (+${quietSettleSlots} quiet slots of closing settle, not shown)`);
+  console.log("");
+}
+
 async function runRep(history: History, str: string, strDir: string): Promise<boolean> {
   const id = uniqueRepId(strDir);
   console.log(`  rep ${id}  (running: ${nonOk()}/${pass + nonOk()} failed)`);
   drawStatus();
   const logger = new RunLogger(strDir, id);
   activeRep = logger.path; // in flight from here until runRepTracked's `finally` clears it
+  // DISPLAY=bar: keep the timeline pinned below the scrolling log while the rep runs. Folded from
+  // the events as they are logged, so the bar and the block printed afterwards are the same picture
+  // built by the same code — one of them being a live approximation of the other is how two views
+  // of the same thing quietly stop agreeing.
+  const bar = display === "bar" ? new StatusBar() : null;
+  if (bar) {
+    const seen: Record<string, unknown>[] = [];
+    logger.onEvent = (e) => {
+      seen.push(e);
+      const { slots, lanes } = foldEvents(seen);
+      if (lanes.length > 0) bar.set(renderLanes(slots, lanes));
+    };
+    bar.attach();
+  }
   const noteName = (L: string) => `${NOTE_DIR}/${id}-${L}-${str}`;
 
   // A correctness-assumption violation (unparseable CLI output, a wedged CLI, or a client
@@ -595,6 +646,12 @@ async function runRep(history: History, str: string, strDir: string): Promise<bo
     drawStatus();
     consecutiveEnvfails = 0; // a rep that produced a verdict proves the apparatus is working
     return true;
+  } finally {
+    // Whatever the rep concluded — pass, failure, or a thrown assumption violation — its log is
+    // complete by this point, so the timeline is drawn from the file rather than threaded through
+    // every exit path. A rep that ended badly is exactly the one worth having a picture of.
+    bar?.detach();
+    showTimeline(logger.path, display);
   }
   consecutiveEnvfails = 0;
   const { verdict, timings, forensics } = outcome;
@@ -633,9 +690,9 @@ async function runRep(history: History, str: string, strDir: string): Promise<bo
     if (suffix === "-UNKNOWN") unknown++; else fail++;
     const repPath = tagRep(logger.path, suffix);
     failures.push(repPath);
-    const dropped = forensics.filter((f) => f.serverRecoverable).length;
-    const unregistered = forensics.length - dropped;
-    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (server-dropped=${dropped}, never-registered=${unregistered}) total=${timings.totalSec}s → ${path.basename(repPath)}`);
+    const inServerCount = forensics.filter((f) => f.inServer).length;
+    const notInServerCount = forensics.length - inServerCount;
+    console.log(`  rep ${id}: *** ${suffix.slice(1)} *** lost=${lost.length} dup=${duplicated.length} (in-server=${inServerCount}, not-in-server=${notInServerCount}) total=${timings.totalSec}s → ${path.basename(repPath)}`);
   }
   drawStatus(); // refresh the bar with the updated tally
   return true;

@@ -1,12 +1,14 @@
 // Offline analyzer for soak runs. Layout is runs/<history-string>/<rep>/, where a
 // failing rep dir carries a `-LOST`/`-UNKNOWN` suffix. Aggregates per history string:
-// reps, losses (split server-dropped vs never-registered — the latter is worse),
+// reps, losses (split in-server vs not-in-server — the latter is worse),
 // the caught inconsistency outcomes (`-OBSFAIL`/`-UNKNOWN`, read from the dir suffix
 // since they have no verdict), the sync-duration distribution, and — written to
 // <dir>/analysis.md — a markdown table of each rep's whole "global state" (see
 // buildStateCells), grouped first by outcome (PASS/LOST/DUPL/...). Groups are per history
 // string only, NEVER merged across different histories — note letters/tokens from
-// unrelated DSL structures aren't comparable. A history that's all-PASS and landed in the
+// unrelated DSL structures aren't comparable. The single exception is the trailing
+// `# Sync latency` section: an upload/download duration carries no note letter, so pooling
+// those numbers across histories is sound (and necessary — it measures Sync, not the history). A history that's all-PASS and landed in the
 // exact same state every rep has nothing to dig into, so it renders SHORT in place — heading and
 // one-line stats, no state table — and is additionally listed, one row per history with its rep
 // count and its own convergence-time stats, in a trailing `# No data loss` table. History sections
@@ -17,14 +19,29 @@
 // stall) would drag an average up and hide what's actually typical. Pure file reader — run
 // anytime.
 //
+// IT READS THE CURRENT LOG FORMAT AND ONLY THAT. Never add a fallback for a field's older name, a
+// shim for a shape some earlier build wrote, or a guard that degrades gracefully on one — not a
+// one-line `??`, not a skip. It is fine for this to break outright on yesterday's logs. `runs/` is
+// scratch: re-runs, abandoned soaks, hand-driven experiments, expected to be deleted, and every
+// measurement in it is reproducible by re-running its history string. Rename freely on the writing
+// side; delete `runs/` if the old shapes get in the way.
+//
 //   npm run analyze            (reads ./runs, writes ./runs/analysis.md)
 //   npm run analyze -- <dir>
 
 import { readdirSync, readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { repLatencies, renderLatency, type Upload, type Download } from "./latency.js";
+import { foldEvents, renderLanes } from "./timeline.js";
 
-export interface Forensic { serverRecoverable: boolean }
+/** How many losing reps of one history get their timeline drawn. A history's reps are near-identical
+ *  by construction — same ops, same order — so the second and third are for checking that the shape
+ *  repeats, not for reading one by one. Beyond that they are bulk. */
+const TIMELINES_PER_HISTORY = 3;
+import { load as loadCorpus, renderCorpus } from "./corpus.js";
+
+export interface Forensic { inServer: boolean }
 export interface NoteVerdict {
   note: string; lost: string[]; onlyInConflict: string[]; converged: boolean; conflictFiles: number;
   duplicated: { token: string; maxCount: number }[];
@@ -117,7 +134,11 @@ export function stateKey(cells: Record<string, string>): string {
 export interface StateEntry { cells: Record<string, string>; count: number; reps: string[] }
 interface Group {
   reps: number; pass: number; fail: number;
-  lost: number; serverDropped: number; neverRegistered: number;
+  lost: number; inServer: number; notInServer: number;
+  // Losses this build could not put on either side of that split — the rep's forensics are in a
+  // shape it does not read. Carried per history so the group's own line adds up, rather than
+  // leaving a reader to notice that two numbers fell short of the total and go hunting for why.
+  unreadableLosses: number;
   duplReps: number; diffReps: number; unsyncedReps: number;
   timeouts: number; conv: number[];
   // Caught inconsistency outcomes (no results.json — counted from the rep dir suffix).
@@ -141,14 +162,14 @@ interface Group {
   // every W and settle since forever, and never once looked at. Worth surfacing because of what it
   // implies: the client said "synced" and then more arrived, i.e. the claim was premature.
   versionsGrew: number;
-  // The shortest a rep of this history could honestly take (trace.ts's durationFloorSec), read
+  // The shortest a rep of this history could honestly take (trace.ts's historyDurationExpectedMinSec), read
   // off any rep — it is a property of the history, identical for every rep of it. Absent for reps
   // recorded before the floor existed.
   minSec?: number;
   categories: Map<string, Map<string, StateEntry>>; // classify() -> stateKey() -> entry
 }
 const newGroup = (): Group => ({
-  reps: 0, pass: 0, fail: 0, lost: 0, serverDropped: 0, neverRegistered: 0, duplReps: 0, diffReps: 0,
+  reps: 0, pass: 0, fail: 0, lost: 0, inServer: 0, notInServer: 0, unreadableLosses: 0, duplReps: 0, diffReps: 0,
   unsyncedReps: 0, timeouts: 0, conv: [], obsfail: 0, unknown: 0, envfail: 0,
   checkedReps: 0, checksRun: 0, warnedFailed: 0, warnedOk: 0, failedUnwarned: 0, versionsGrew: 0, categories: new Map(),
 });
@@ -158,6 +179,24 @@ const isDir = (p: string) => existsSync(p) && statSync(p).isDirectory();
 // median, not avg — a single rare-but-huge transient outlier (e.g. one 8-hour stall) would drag
 // an average up and hide what's actually typical.
 interface Stats { min: number; median: number; max: number; span: number }
+/**
+ * What this run could not read, and where. Reported rather than swallowed: this file reads the
+ * CURRENT log format only (see the header), so a rep written by an older build is expected to be
+ * unreadable — but "expected" must never mean "invisible". A silent skip is how a report comes to
+ * cover less than it appears to, and a silent DEFAULT is worse: filing an unclassifiable rep under
+ * one side of a split states something about it that was never measured.
+ *
+ * Module-level because `analyze` is one shot, and threading a collector through every reader would
+ * cost more than it explains.
+ */
+const unreadable = new Map<string, { count: number; examples: string[] }>();
+const cannotRead = (reason: string, where: string): void => {
+  const e = unreadable.get(reason) ?? { count: 0, examples: [] };
+  e.count++;
+  if (e.examples.length < 3) e.examples.push(where);
+  unreadable.set(reason, e);
+};
+
 function median(xs: number[]): number {
   const s = [...xs].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
@@ -181,7 +220,10 @@ function tally(g: Group, r: Results, rep: string, warned = false, versionsGrew =
   if (r.timings?.unsynced) g.unsyncedReps++;
   const lost = r.verdict.notes.reduce((s, n) => s + n.lost.length, 0);
   g.lost += lost;
-  for (const f of r.forensics ?? []) (f.serverRecoverable ? g.serverDropped++ : g.neverRegistered++);
+  for (const f of r.forensics ?? []) {
+    if (typeof f.inServer !== "boolean") { g.unreadableLosses++; cannotRead("loss forensics carry no `inServer`", rep); continue; }
+    if (f.inServer) g.inServer++; else g.notInServer++;
+  }
 
   if (versionsGrew) g.versionsGrew++;
   g.checksRun += checksRun;
@@ -234,7 +276,14 @@ export const line = (g: Group) => {
   if (g.unknown) parts.push(`unknown=${g.unknown}`);
   if (g.envfail) parts.push(`envfail=${g.envfail}(retried)`);
   if (g.versionsGrew) parts.push(`versionsgrew=${g.versionsGrew}`);
-  if (g.lost) parts.push(`lost=${g.lost}(dropped=${g.serverDropped},unreg=${g.neverRegistered})`);
+  if (g.lost) {
+    // `unreadable` only when there is some, so an ordinary line stays two-term — but when it is
+    // there the three ALWAYS sum to `lost`, which is the only way this line can be read without
+    // cross-referencing another section.
+    const split = [`in-server=${g.inServer}`, `not-in-server=${g.notInServer}`,
+      ...(g.unreadableLosses ? [`unreadable=${g.unreadableLosses}`] : [])];
+    parts.push(`lost=${g.lost}(${split.join(",")})`);
+  }
   if (g.duplReps) parts.push(`dupl=${g.duplReps}`);
   if (g.diffReps) parts.push(`diff=${g.diffReps}`);
   if (g.unsyncedReps) parts.push(`unsynced=${g.unsyncedReps}`);
@@ -362,6 +411,12 @@ export function main(base: string): void {
   }
   const groups = new Map<string, Group>();
   let skipped = 0;
+  // Sync latency is the ONE quantity pooled across every history — see the note above renderLatency's
+  // call site for why that does not contradict this file's no-merging rule.
+  // history string -> rendered timeline blocks for its losing reps
+  const timelinesFor = new Map<string, string[]>();
+  const uploads: Upload[] = [];
+  const downloads: Download[] = [];
 
   // Sorted so processing order (and any downstream tie-break) is deterministic regardless of
   // filesystem/readdir ordering, not just cosmetic.
@@ -395,15 +450,45 @@ export function main(base: string): void {
           return typeof e.from === "number" && typeof e.to === "number" && e.to > e.from;
         } catch { return false; }
       });
+      // Sync-latency events. Parsed only when present, so a rep with none costs one substring test.
+      if (lines.some((l) => l.includes('"kind":"token-arrived"') || l.includes('"kind":"settle-poll"'))) {
+        const events: Record<string, unknown>[] = [];
+        for (const l of lines) {
+          if (!l.includes('"kind":"settle-poll"') && !l.includes('"kind":"token-arrived"') &&
+              !l.includes('"kind":"appended"') && !l.includes('"kind":"disconnecting"') &&
+              !l.includes('"kind":"connecting"')) continue;
+          try { events.push(JSON.parse(l)); } catch { /* a torn last line — ignore */ }
+        }
+        const { uploads: u, downloads: d } = repLatencies(events);
+        uploads.push(...u); downloads.push(...d);
+      }
       let last: Record<string, unknown>;
-      try { last = JSON.parse(lines[lines.length - 1]); } catch { skipped++; continue; }
+      try { last = JSON.parse(lines[lines.length - 1]); } catch { cannotRead("last line is not JSON", `${str}/${rep}`); skipped++; continue; }
+      // A losing rep gets its timeline drawn: a loss with its picture attached beats a loss you
+      // then have to go and reconstruct by hand. Capped per history because a history's reps are
+      // near-identical by construction, and 220 near-identical blocks would bury the report the
+      // section is meant to make readable.
+      if (last.kind === "results" && (last as unknown as Results).verdict?.notes?.some((n) => n.lost.length > 0)
+          && (timelinesFor.get(str)?.length ?? 0) < TIMELINES_PER_HISTORY) {
+        const events = lines.flatMap((l) => {
+          try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; }
+        });
+        const { slots, lanes, quietSettleSlots } = foldEvents(events);
+        if (lanes.length > 0) {
+          const tail = quietSettleSlots > 0 ? [`(+${quietSettleSlots} quiet slots of closing settle, not shown)`] : [];
+          const block = [`### ${rep}`, "", "```", ...renderLanes(slots, lanes), ...tail, "```", ""];
+          timelinesFor.set(str, [...(timelinesFor.get(str) ?? []), block.join("\n")]);
+        }
+      }
       if (last.kind === "results") { tally(g, last as unknown as Results, rep, warned, versionsGrew, checksRun); continue; }
       if (last.kind === "obsfail") { tallyThrown(g, "obsfail"); continue; }
       if (last.kind === "unknown") { tallyThrown(g, "unknown"); continue; }
       // Abandoned to an environment failure and retried — a real, explained ending, so not
       // "skipped"; but not a rep either (see Group.envfail).
       if (last.kind === "envfail") { g.envfail++; continue; }
-      skipped++; // genuinely incomplete — crashed before any verdict was ever logged
+      // Genuinely incomplete — crashed before any verdict was ever logged.
+      cannotRead(`no verdict: last event is \`${String(last.kind)}\``, `${str}/${rep}`);
+      skipped++;
     }
   }
 
@@ -412,6 +497,7 @@ export function main(base: string): void {
   // letters restart from `a` for every independently-generated history, so merging states (or
   // even convergence-time stats) across unrelated histories would be exactly the "collapsing
   // across different histories" mistake — this sort only reorders whole groups, never merges them.
+  // (`# Sync latency` below is the one exception, for the reason given at its call site.)
   const active = [...groups.entries()].filter(([, g]) => g.reps > 0 || g.envfail > 0).sort(([a], [b]) => b.localeCompare(a));
   const uninteresting = active.filter(([, g]) => isUninteresting(g));
 
@@ -426,11 +512,64 @@ export function main(base: string): void {
   // this table exists to show.
   const warned = active.filter(([, g]) => g.checksRun > 0);
   if (warned.length > 0) sections.push(renderEarlyWarning(warned));
+  // THE ONE LEGITIMATE CROSS-HISTORY AGGREGATION. Everything else in this file is per-history
+  // because note letters restart at `a` for every generated history, so states from unrelated DSL
+  // structures are not comparable. A latency carries no letter: the token and the note are resolved
+  // inside the rep and only the number is pooled, so merging is not just safe here but required —
+  // how fast Sync distributes a change is a property of Sync, not of the history that provoked it.
+  if (uploads.length > 0 || downloads.length > 0) sections.push(renderLatency(uploads, downloads));
+
+  // Timelines for losing reps. Placed after the aggregates: they are evidence to look at once a
+  // number above has raised a question, not something to read front to back.
+  if (timelinesFor.size > 0) {
+    const blocks = [...timelinesFor.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+    const shown = blocks.reduce((n, [, v]) => n + v.length, 0);
+    sections.push([
+      "# Timelines of losing reps",
+      "",
+      "_One column per sampling slot; `|` is a wallclock second. A `.` means we looked and nothing",
+      "had changed; a **blank means we did not look at all**. Most lanes are mostly blank because a",
+      "normal run samples strategically, on purpose — the gaps are in the instrument, not in Sync._",
+      "",
+      "_`a`/`b` a note written here · `D`/`C` disconnect/connect · `h` a `W<n>` handed off early ·",
+      "`F` the token became readable here · `!` a weirdness · `L` loss detected · a digit is a new",
+      "server version count · `x` the call blocked · `-` no server history yet._",
+      "",
+      `_Up to ${TIMELINES_PER_HISTORY} reps per history (${shown} blocks); a history's reps are near-identical by construction._`,
+      "",
+      ...blocks.flatMap(([hist, v]) => [`## ${hist}`, "", ...v]),
+    ].join("\n"));
+  }
+  // The cross-history sections close the file. They live in their own module because they answer a
+  // different kind of question (what is the whole corpus saying, and is the generator still finding
+  // anything new) — but they are written HERE, into the same analysis.md, because a report nobody
+  // remembers to generate is a report nobody reads.
+  const corpus = renderCorpus(loadCorpus(base));
+  if (corpus) sections.push(corpus);
+  if (unreadable.size > 0) {
+    const rows = [...unreadable.entries()].sort((a, b) => b[1].count - a[1].count);
+    sections.push([
+      "# Could not be read",
+      "",
+      "Reps this build could not make sense of. `analyze` reads the current log format only, so a rep",
+      "written by an older build belongs here — it is listed rather than skipped quietly, because a",
+      "report that silently covers less than it appears to is the failure this whole project is about.",
+      "Re-run the history string if the numbers matter.",
+      "",
+      "| what | reps | e.g. |",
+      "|---|---|---|",
+      ...rows.map(([reason, e]) => `| ${reason} | ${e.count} | ${e.examples.join(", ")} |`),
+      "",
+    ].join("\n"));
+  }
   const md = sections.join("\n");
   const outPath = path.join(base, "analysis.md");
   writeFileSync(outPath, md + "\n");
 
   console.log(`Analyzed ${totalReps} reps from ${base}/ (${skipped} skipped/incomplete)`);
+  for (const [reason, e] of [...unreadable.entries()].sort((a, b) => b[1].count - a[1].count)) {
+    console.log(`  could not read: ${reason} — ${e.count} (e.g. ${e.examples.join(", ")})`);
+  }
   console.log(`Wrote analysis to ${outPath}`);
 }
 

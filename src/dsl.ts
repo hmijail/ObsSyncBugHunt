@@ -4,7 +4,10 @@ import assert from "node:assert/strict";
 //
 // COMMANDS are uppercase, params are lowercase letters / digits. The active node is a
 // cursor that persists until changed (N). Each append names its own note, so a history
-// reads as what the USER does — the user never "syncs", they only Wait and hope it happens.
+// reads as what the USER does — the user never "syncs", they only Wait for it to happen. A real
+// user waiting has only their own client's word for it; the harness's `W` additionally knows which
+// tokens were introduced on the other nodes, which is legitimate because it is the same person
+// sitting at all of them (see execute.ts's "wait" case).
 //
 //   N<d>   set active node           (N1, N2 — always the container literally named n1/n2,
 //          regardless of --nodes order; see execute.ts's driverOf)
@@ -14,7 +17,10 @@ import assert from "node:assert/strict";
 //   A<x>   append a line to note <x> by the active node (first touch of a note creates it)
 //   D      disconnect the active node (network)
 //   C      connect the active node
-//   W      wait until the active node is synced & settled
+//   W      wait until the active node has the expected tokens on disk AND reports synced (with the
+//          server version counter corroborating that claim) — indefinitely, if that is what it takes
+//   W<n>   the same wait, abandoned after n seconds: the user who assumes they missed the sync and
+//          edits anyway. `W0` hands off at once.
 //   P[<n>] pause ~n seconds (default 10)
 //
 // Every history (generated or typed) is run through `normalize` first, so the printed
@@ -70,7 +76,15 @@ export function parse(s: string): History {
       }
       case "D": ops.push({ cmd: "disconnect" }); break;
       case "C": ops.push({ cmd: "connect" }); break;
-      case "W": ops.push({ cmd: "wait" }); break;
+      case "W": {
+        // `W<n>` is the IMPATIENT wait: give up after n seconds and carry on regardless — the user
+        // who assumes they simply missed the sync and edits anyway. Bare `W` has no `seconds` and
+        // waits indefinitely. `W0` is a real, distinct op (hand off immediately), so the test is
+        // for an absent count, never for a falsy one.
+        const n = digits();
+        ops.push(n ? { cmd: "wait", seconds: Number(n) } : { cmd: "wait" });
+        break;
+      }
       case "L": ops.push({ cmd: "local" }); break;
       case "P": {
         const n = digits();
@@ -94,7 +108,7 @@ export function serialize(h: History): string {
         case "append": return `A${op.note}`;
         case "disconnect": return "D";
         case "connect": return "C";
-        case "wait": return "W";
+        case "wait": return op.seconds === undefined ? "W" : `W${op.seconds}`;
         case "pause": return op.seconds === DEFAULT_PAUSE_SEC ? "P" : `P${op.seconds}`;
       }
     })
@@ -110,7 +124,8 @@ export function serialize(h: History): string {
 //                             dropped if there is none); carried pauses sum.
 //   2. dropRedundantNodes   — an N/L overwritten before use, or re-selecting the active
 //                             node/local instance, goes.
-//   3. collapseAdjacent     — dedup adjacent A(same note)/D/C/W; sum adjacent pauses.
+//   3. collapseAdjacent     — dedup adjacent A(same note)/D/C; sum adjacent pauses and the
+//                             patience of adjacent waits (an unbounded `W` absorbing any neighbour).
 //   4. assertLocalAlwaysConnected — the local instance must never be D/C'd; throws otherwise.
 
 /** Move "floating" pauses (not adjacent to an action) forward to the next action. */
@@ -200,7 +215,18 @@ function collapseAdjacent(h: History): History {
         continue;
       }
       if (op.cmd === "append" && prev.note === op.note) continue; // back-to-back same-note edit
-      if (op.cmd === "disconnect" || op.cmd === "connect" || op.cmd === "wait") continue;
+      if (op.cmd === "disconnect" || op.cmd === "connect") continue;
+      if (op.cmd === "wait") {
+        // Adjacent waits merge by PATIENCE, not by dropping the second one. `WW` is still `W` — a
+        // wait whose conditions already hold returns at once, so a second unbounded one adds
+        // nothing. But `W1W1` is a two-second budget and collapsing it to `W1` would silently halve
+        // the impatience the history was written to express. An unbounded wait absorbs whatever it
+        // is adjacent to, in either order: `W5W` ends up waiting indefinitely, and `WW5` has
+        // already satisfied its conditions by the time the `W5` is reached.
+        if (prev.seconds === undefined || op.seconds === undefined) { prev.seconds = undefined; continue; }
+        prev.seconds += op.seconds;
+        continue;
+      }
     }
     out.push({ ...op });
   }

@@ -68,12 +68,35 @@ test("generateScript: NODES is sparse, keyed by node NUMBER, not a compact 0-bas
   assert.match(script, /^ALL_NODES=\(3\)$/m);
 });
 
-test("generateScript: a bare W with nothing appended yet is a no-op (matches execute.ts) and emits nothing; a W after an append does", () => {
+test("generateScript: a bare W with nothing appended yet is a no-op (matches execute.ts) and emits nothing; a W after an append emits a token-aware WaitFor", () => {
   const skipped = generateScript(parse("N1W"), baseOpts);
-  assert.doesNotMatch(skipped, /^Wait /m);
+  assert.doesNotMatch(skipped, /^WaitFor /m);
 
+  // NOT `/^Wait 1$/` — the FINAL SETTLE emits `Wait 1` for every node, so matching on that passes
+  // whether or not the mid-history W emitted anything at all. It has to assert the WaitFor.
   const real = generateScript(parse("N1AaW"), baseOpts);
-  assert.match(real, /^Wait 1$/m);
+  assert.match(real, /^WaitFor 1 a 60 '\(n1-1-a\)'$/m);
+});
+
+test("generateScript: a W waits for the tokens written by OTHER nodes, which is the whole point of it", () => {
+  // n2 has written nothing, so the old sync:status-only W returned instantly here — the defect the
+  // token-aware redesign removed. n2 must wait for n1's token.
+  const script = generateScript(parse("N1AaN2W"), baseOpts);
+  assert.match(script, /^WaitFor 2 a 60 '\(n1-1-a\)'$/m);
+});
+
+test("generateScript: W<n> carries its own patience; bare W falls back to WAIT_CAP_SEC", () => {
+  assert.match(generateScript(parse("N1AaN2W30"), baseOpts), /^WaitFor 2 a 30 /m);
+  assert.match(generateScript(parse("N1AaN2W0"), baseOpts), /^WaitFor 2 a 0 /m);
+  assert.match(generateScript(parse("N1AaN2W"), baseOpts), /^WaitFor 2 a 60 /m);
+});
+
+test("generateScript: a W does not wait for tokens stranded on a DISCONNECTED node — they cannot arrive", () => {
+  // Matches execute.ts's own exclusion: requiring them would hang a bare W forever on a history
+  // the generator produces routinely.
+  const script = generateScript(parse("N1AaN2DAaN1W"), baseOpts);
+  assert.match(script, /^WaitFor 1 a 60 '\(n1-1-a\)'$/m);
+  assert.doesNotMatch(script, /^WaitFor 1 a 60 '\(n1-1-a\)' '\(n2-2-a\)'$/m);
 });
 
 test("generateScript: a local-instance op calls the same functions with selector \"L\", and LOCAL_BIN/LOCAL_NODE_ID are set", () => {

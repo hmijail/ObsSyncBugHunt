@@ -16,11 +16,16 @@
 # landed, since any configured node is a live, continuously-syncing participant regardless of
 # whether this particular history happens to touch it — mirrors execute.ts's own final settle,
 # which always checks every configured driver, never just touched ones), VERBOSE (0/1),
-# WAIT_CAP_SEC/WAIT_POLL_SEC (Wait's bounded-poll tuning). LOCAL_BIN/LOCAL_NODE_ID are only needed
+# WAIT_CAP_SEC/WAIT_POLL_SEC (Wait/WaitFor's bounded-poll tuning), OPEN_NOTES (0/1, default 0 —
+# mirrors the harness's opt-in `--open-notes`). LOCAL_BIN/LOCAL_NODE_ID are only needed
 # if the history ever calls a function with "L".
 #
+# Two waits, deliberately: `WaitFor` is the mid-history `W` (token-aware, see below) and `Wait` is
+# the final settle (synced only). They were one function until `W` stopped meaning "report synced".
+#
 # This is a SIMPLIFIED, hand-maintained reimplementation of src/execute.ts's real op interpreter
-# (runHistory) — no retries, no settle/quiet-window logic. If execute.ts's own op semantics
+# (runHistory) — no retries, no version-counter corroboration, no settle machinery. If execute.ts's
+# own op semantics
 # change (append's create-vs-append fallback, what a disconnect/connect actually does, what
 # counts as "synced", the token format), check whether this file needs the same update —
 # execute.ts carries the reverse pointer back to here for the same reason.
@@ -63,12 +68,15 @@ Append() {
     out=$(run $b create path="$note.md" content="($id-$SEQ-$2)")
     [[ "$out" == Created:* ]] || die "create failed for $note: $out"
   fi
-  run $b open file="$note"
+  # Presentation, not measurement, and opt-in in the harness too (`--open-notes`, default off).
+  # It was unconditional here, which made every repro's write path a shape no default rep uses.
+  [ "${OPEN_NOTES:-0}" = 1 ] && run $b open file="$note"
   SEQ=$((SEQ+1))
 }
 
-# Wait <node> — bounded poll of this node's own sync:status until it says "synced". Simplistic:
-# no per-note settle/quiet-window logic (see execute.ts for the real thing); gives up silently
+# Wait <node> — bounded poll of this node's own sync:status until it says "synced". This is the
+# FINAL SETTLE only; a mid-history `W` is WaitFor, below. Simplistic:
+# no per-note settle logic (see execute.ts for the real thing); gives up silently
 # once WAIT_CAP_SEC has elapsed rather than aborting — a node that's slow (or stuck) to sync is
 # often the actual finding being reproduced, not a broken step, so this deliberately does NOT die.
 Wait() {
@@ -79,6 +87,44 @@ Wait() {
     status=$(run $b sync:status)
     [[ "$status" == status:\ synced* ]] && break
     sleep "$WAIT_POLL_SEC"
+  done
+}
+
+# WaitFor <node> <letter> <capSec> [<token>...] — the mid-history `W`.
+#
+# The real `W` (execute.ts's "wait" case) is TOKEN-AWARE: it waits until every expected token is on
+# the active node's disk AND that node reports synced. Polling sync:status alone — which this
+# library did until the `W` redesign — returns instantly on a node that has not itself written,
+# because it has nothing pending to report. That was the defect the redesign removed, and a repro
+# that waits differently races differently, so it is reproduced here rather than simplified away.
+#
+# Content is read ONLY from a node already reporting synced: a read on a still-syncing node blocks,
+# and can return mid-flux content (see execute.ts's own note on this).
+#
+# Two deliberate divergences from the real thing, both in the direction of a debugging script:
+#   - no server-version-counter corroboration. The real `W` uses the counter to tell "nothing is
+#     happening" from "something happened but the tokens are missing" (the data-loss case). That is
+#     diagnosis; the wait CONDITION here is tokens + synced.
+#   - a bare `W` is capped at WAIT_CAP_SEC, where the real one waits indefinitely. A hand-run script
+#     that hangs forever is worse than one that gives up and lets the final Check report the truth.
+# Like Wait, it gives up silently rather than dying — a node that never receives the tokens is
+# usually the finding being reproduced, not a broken step.
+WaitFor() {
+  local b node letter cap note i status content missing t
+  node=$1; letter=$2; cap=$3; shift 3
+  b=$(bin_for "$node")
+  note="$NOTE_DIR/$TS-$letter-$RUN_ID"
+  i=0
+  while [ "$i" -lt "$cap" ]; do
+    status=$(run $b sync:status)
+    if [[ "$status" == status:\ synced* ]]; then
+      content=$(run $b read file="$note")
+      missing=0
+      for t in "$@"; do [[ "$content" == *"$t"* ]] || missing=1; done
+      [ "$missing" = 0 ] && return 0
+    fi
+    sleep "$WAIT_POLL_SEC"
+    i=$((i + WAIT_POLL_SEC))
   done
 }
 
@@ -93,7 +139,7 @@ Pause()      { sleep "$1"; }                                                    
 # Check <letter> <token1> [<token2> ...] — the actual verdict: hunt for each token across every
 # node/local instance's canonical content AND any "(Conflicted copy ...)" file for this note (token survival
 # is "found somewhere", exactly the real oracle's rule in oracle.ts — just without its settle
-# timing/quiet-window machinery). Call this ONLY after every node has had a chance to sync (the
+# timing/settle machinery). Call this ONLY after every node has had a chance to sync (the
 # generated script always runs a Wait per node first — see generateScript's final step).
 Check() {
   local letter=$1; shift

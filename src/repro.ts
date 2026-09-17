@@ -1,7 +1,9 @@
 // Generate a standalone bash script that reproduces a DSL history's real commands, bypassing
 // execute.ts/runHistory entirely — for manual debugging of one specific finding. Deliberately
-// simplistic: no retries, no read-verify-token loop, no settle/quiet-window logic (see
-// execute.ts for the real thing). The actual op implementations (Append/Wait/Disconnect/
+// simplistic: no retries, no server-version-counter corroboration, no settle machinery (see
+// execute.ts for the real thing). Its `W` IS token-aware, though — that is what `W` MEANS, not a
+// robustness detail, and a repro whose waits return at a different moment races differently and
+// reproduces nothing. See WaitFor in repro-lib.sh. The actual op implementations (Append/Wait/Disconnect/
 // Connect/Pause/Check) live in scripts/repro-lib.sh, a small hand-maintained bash library every
 // generated script sources — this file only translates the DSL into a flat call sequence.
 //
@@ -109,6 +111,10 @@ export function generateScript(history: History, opts: ReproOpts): string {
     "SEQ=1",
     `WAIT_CAP_SEC=${waitCapSec}`,
     `WAIT_POLL_SEC=${waitPollSec}`,
+    // Foregrounding the note in the GUI is presentation, not measurement, and is OPT-IN in the
+    // harness (`--open-notes`, default off). Kept in step here so a repro's write path is the
+    // same shape as a real rep's by default.
+    "OPEN_NOTES=${OPEN_NOTES:-0}",
     "",
   );
 
@@ -127,7 +133,11 @@ export function generateScript(history: History, opts: ReproOpts): string {
   let activeNode: number | "local" = 1;
   let anyAppendYet = false;
   const offline = new Set<number>(); // node numbers left disconnected so far
-  const tokensByLetter = new Map<string, string[]>(); // DSL letter -> tokens appended to it, in order
+  // DSL letter -> tokens appended to it, in order, each with the node that wrote it. The owner is
+  // needed by `W`: the real one ignores tokens stranded on a DISCONNECTED node, since those cannot
+  // arrive and requiring them would hang forever (see execute.ts's "wait" case).
+  const tokensByLetter = new Map<string, { token: string; owner: number | "local" }[]>();
+  let activeNote: string | null = null; // the note cursor a `W` waits on — set by append, like execute.ts
   const sel = (n: number | "local") => (n === "local" ? "L" : String(n));
   let seq = 0;
 
@@ -154,18 +164,34 @@ export function generateScript(history: History, opts: ReproOpts): string {
         offline.delete(n);
         break;
       }
-      case "wait":
-        if (anyAppendYet) lines.push(`Wait ${sel(activeNode)}`, ""); // else a no-op, matches execute.ts
+      case "wait": {
+        // A `W` before any append is a no-op, matching execute.ts (`if (!activeNote) break`).
+        if (!activeNote) break;
+        // The REAL `W` is token-aware: it waits until every acked token for the ACTIVE NOTE, from
+        // every node not currently disconnected, is on this node's disk AND this node reports
+        // synced. Polling only sync:status — what this generator used to emit — is the OLD `W`,
+        // and it returns instantly on a node that has not written anything itself, which is the
+        // exact defect the redesign removed. A repro that waits differently races differently.
+        const expected = (tokensByLetter.get(activeNote) ?? [])
+          .filter((t) => t.owner === "local" || !offline.has(t.owner))
+          .map((t) => t.token);
+        // `W<n>` carries its own patience; bare `W` uses WAIT_CAP_SEC (see the header note on how
+        // that differs from the real bare `W`, which waits indefinitely).
+        const cap = op.seconds ?? waitCapSec;
+        const args = [`WaitFor ${sel(activeNode)} ${activeNote} ${cap}`, ...expected.map(sq)].join(" ");
+        lines.push(args, "");
         break;
+      }
       case "append": {
         anyAppendYet = true;
         const letter = op.note!;
+        activeNote = letter;
         lines.push(`Append ${sel(activeNode)} ${letter}`, "");
         seq++;
         const id = activeNode === "local" ? (opts.localNodeId ?? "local") : `n${activeNode}`;
         const token = formatToken({ node: id, seq, note: letter });
         const list = tokensByLetter.get(letter);
-        if (list) list.push(token); else tokensByLetter.set(letter, [token]);
+        if (list) list.push({ token, owner: activeNode }); else tokensByLetter.set(letter, [{ token, owner: activeNode }]);
         break;
       }
     }
@@ -177,7 +203,7 @@ export function generateScript(history: History, opts: ReproOpts): string {
   for (const n of offline) lines.push(`Connect ${n}`, "");
   if (anyAppendYet) {
     for (const n of allSelectors) lines.push(`Wait ${n}`, "");
-    for (const [letter, tokens] of tokensByLetter) lines.push(`Check ${letter} ${tokens.map(sq).join(" ")}`, "");
+    for (const [letter, tokens] of tokensByLetter) lines.push(`Check ${letter} ${tokens.map((t) => sq(t.token)).join(" ")}`, "");
   }
 
   return lines.join("\n").replace(/\n+$/, "\n");

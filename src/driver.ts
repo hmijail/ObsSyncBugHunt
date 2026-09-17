@@ -201,7 +201,337 @@ export class ObsidianDriver {
     return { ok: true, entries };
   }
 
+  /**
+   * Independent second source for CONTENT: the bytes actually in `<vaultPath>/<relPath>`, via
+   * `cat`. The sibling of `listDirFs`, and the same trust policy — retries an untimely call,
+   * throws if it never answers — because it too is only used at the settled verdict.
+   *
+   * `relPath` is vault-relative and carries its own extension (`bughunt/x-a-H.md`), matching what
+   * `files` reports, so a conflict file's own name can be handed straight in.
+   *
+   * Costs nothing the CLI would not: `cat` and `read` measure the same, since the exec round trip
+   * is the whole cost (docs/DESIGN.md). It is not a cheaper `read` — it is a DIFFERENT witness,
+   * which is the entire point: `read` says what Obsidian believes, `cat` says what is on disk.
+   */
+  async readFileFs(relPath: string): Promise<{ ok: true; content: string } | { ok: false; reason: "missing" | "unavailable" }> {
+    if (!this.vaultPath) return { ok: false, reason: "unavailable" };
+    const raw = await this.runShell(["cat", `${this.vaultPath}/${relPath}`]);
+    if (raw.code !== 0) return { ok: false, reason: "missing" }; // cat exits non-zero for "no such file"
+    return { ok: true, content: raw.stdout };
+  }
+
   // --- note mutations -------------------------------------------------------
+
+  /**
+   * Run several CLI invocations in one round trip, returning each stdout separately.
+   *
+   * The round trip IS the cost: an empty `docker exec` measured 68ms against these containers while
+   * `read`/`create`/`open` measured 62-66ms each, so the Obsidian work is under the exec's own noise
+   * floor. Four calls went 259ms -> 71ms batched (2026-09-06).
+   *
+   * Falls back to running them one at a time when the executor cannot batch, so callers get the same
+   * outputs either way and never have to branch on the transport.
+   */
+  async batch(
+    cmds: string[][],
+    timeoutMs?: number,
+    /** Per-command bounds, overriding `timeoutMs` where present. See `Executor.execBatch`. */
+    perCmdMs?: (number | undefined)[],
+    // `raw` is the whole reply, kept for the one case that has nothing else to show: a batch that
+    // could not be split into one output per command has no per-command outputs at all, and a
+    // reader still needs to see what came back.
+  ): Promise<{ ok: boolean; outputs: string[]; killed: boolean[]; timedOut: boolean; raw: string }> {
+    if (this.executor.execBatch) {
+      const r = await this.executor.execBatch(cmds, { timeoutMs, perCmdMs });
+      // `timedOut` is the WHOLE round trip being killed, which is a different thing from a split
+      // that did not line up — one means the node stopped answering, the other that it answered
+      // something we cannot cut apart. The mutation path has to tell them apart.
+      return { ok: r.ok, outputs: r.outputs, killed: r.killed, timedOut: r.raw.killed, raw: r.raw.stdout };
+    }
+    // Fallback for an executor that cannot batch: same calls, same order, each bounded on its own,
+    // and one that runs out of time does NOT stop the rest — the container path's behaviour.
+    const outputs: string[] = [];
+    const killed: boolean[] = [];
+    for (let i = 0; i < cmds.length; i++) {
+      const ms = perCmdMs?.[i] ?? timeoutMs;
+      const raw = await this.executor.exec(cmds[i], ms === undefined ? undefined : { timeoutMs: ms });
+      outputs.push(raw.stdout);
+      killed.push(raw.killed);
+    }
+    return { ok: true, outputs, killed, timedOut: killed.some(Boolean), raw: outputs.join("\n---\n") };
+  }
+
+  /**
+   * Make one edit and read it back, in a single round trip.
+   *
+   * Exactly the calls the un-batched path made — an optional leading `sync:history total`, an
+   * optional `open`, then `create` or `append`, then the confirming `read` — with the same parsers
+   * on the same outputs. Only the transport is shared,
+   * so nothing in docs/cli-trust.md is relaxed: an unrecognized mutation reply or a split that does
+   * not yield one output per command returns `ok: false`, and the caller retries rather than
+   * proceeding on a guess.
+   *
+   * The write is issued ONCE, never retried inside here, for the same reason `runMutationOnce`
+   * exists: a retried append that actually landed the first time duplicates a token and trips the
+   * duplication oracle.
+   */
+  async editAndConfirm(
+    name: string,
+    token: string,
+    o: {
+      create: boolean;
+      open: boolean;
+      /** Also take this note's version-counter baseline, as the FIRST command of the same batch.
+       *  Costs no round trip, and the ordering is stronger than a separate call can be: the read
+       *  and the write are consecutive statements of one `sh -c`, so nothing at all can happen
+       *  between them. Bounded on its own (`versionsMs`) while the write stays unbounded — see the
+       *  `perCmdMs` note on `Executor.execBatch` for why that distinction has to exist. */
+      versionsMs?: number;
+    },
+  ): Promise<{
+    ok: boolean; present: boolean; content: string | null; notFound?: boolean;
+    /** Present only when `versionsMs` was given. Same shape `snapshotVersionsTotal` returns, so a
+     *  caller can treat the two interchangeably. */
+    versions?: { status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string };
+  }> {
+    const vp = this.vaultParams();
+    const miss = { ok: false, present: false, content: null };
+    const write = o.create
+      // The CLI's `name=` rejects "/", so a note in a folder must be created via `path=`.
+      ? ["create", ...(name.includes("/") ? [`path=${name}.md`] : [`name=${name}`]), `content=${token}`, ...vp]
+      : ["append", `file=${name}`, `content=${token}`, ...vp];
+    const openCmd = ["open", `file=${name}`, ...vp];
+    // Ordering mirrors the un-batched path: for an existing note the GUI is foregrounded before the
+    // edit, for a new one it can only be opened after the file exists.
+    const body = o.create
+      ? [write, ...(o.open ? [openCmd] : []), ["read", `file=${name}`, ...vp]]
+      : [...(o.open ? [openCmd] : []), write, ["read", `file=${name}`, ...vp]];
+    // The baseline goes at the HEAD, ahead of even the `open`: it must be a reading of the counter
+    // as it stood before this edit existed, and the head is the only position where that needs no
+    // argument about how quickly the counter refreshes.
+    const wantVersions = o.versionsMs !== undefined;
+    const cmds = wantVersions ? [["sync:history", `file=${name}`, "total"], ...body] : body;
+    const off = wantVersions ? 1 : 0;
+
+    const r = await this.batch(cmds, undefined, wantVersions ? [o.versionsMs, ...body.map(() => undefined)] : undefined);
+    // A mutation whose call never came back is an APPARATUS failure, not a rep outcome: the harness
+    // aborts the rep as an inconsistency rather than retrying, because a write that may or may not
+    // have landed cannot be safely repeated. `runMutationOnce` has always thrown here, and batching
+    // the write quietly downgraded it to an ordinary retry until this line.
+    if (r.timedOut) {
+      throw new CliInconsistencyError("cli-mutation-unresponsive", {
+        node: this.node, command: o.create ? "create" : "append", durationMs: 0,
+      });
+    }
+    if (!r.ok) return miss;
+    // Parsed with the same rules `snapshotVersionsTotal` uses, so the two are interchangeable: a
+    // killed command is a timeout, an unparseable one is `unrecognized`, and NEITHER is allowed to
+    // affect the write's own outcome — a baseline we could not read costs the caller its
+    // corroboration, never its edit.
+    const versions = wantVersions
+      ? ((): { status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string } => {
+        if (r.killed[0]) return { status: "timeout" };
+        const t = parseTotal(r.outputs[0]);
+        if (t === UNRECOGNIZED) return { status: "unrecognized", raw: r.outputs[0] };
+        return t === "absent" ? { status: "absent" } : { status: "ok", total: t };
+      })()
+      : undefined;
+    const writeOut = r.outputs[off + (o.create ? 0 : (o.open ? 1 : 0))];
+    // `append` to a note this node does not have answers `Error: File "..." not found.` — it does
+    // NOT silently no-op, as a comment in execute.ts long claimed. That makes "you should have
+    // created it" a POSITIVE reply rather than an inference, which is what lets the caller try an
+    // append first and only then create, with no speculative read in front.
+    if (!o.create && isNotFoundError(writeOut)) return { ok: true, present: false, content: null, notFound: true, versions };
+    if (parseMutation(writeOut) === UNRECOGNIZED) return { ...miss, versions }; // never guess at a mutation's reply
+    const read = parseRead(r.outputs[r.outputs.length - 1]);
+    if (read === UNRECOGNIZED) return { ...miss, versions };
+    return read.present
+      ? { ok: true, present: true, content: read.content ?? null, versions }
+      : { ok: true, present: false, content: null, versions }; // positively absent, which is a real answer
+  }
+
+  // --- what an observation of one note MEANS ---------------------------------
+  //
+  // Two paths ask these same questions: `gatherObservation` (oracle-grade, retries until every
+  // reply is recognized, throws on a contradiction) and `sampleNotes` (a bounded look that must
+  // never stall or throw). They differ only in TRUST POLICY — how hard they try, and what they do
+  // when the readings do not agree with each other. The interpretation is identical, so it lives
+  // here once: a
+  // future fix to what counts as a conflict copy, or to the cross-check, reaches both.
+
+  /** The conflict copies of `note` within a folder listing. */
+  static conflictsOf(files: string[], note: string): string[] {
+    return files.filter((f) => isConflictFile(f) && f.startsWith(`${note} (Conflicted copy`));
+  }
+
+  /**
+   * Does the folder listing contradict the read?
+   *
+   * If the note read as PRESENT, the listing must contain it. When a listing omits a note we just
+   * read, both replies arrived and both parsed — they simply cannot both be right, and taking the
+   * listing at face value has fabricated a false "loss" before now (the founding incident in
+   * docs/cli-trust.md). Callers decide what to DO about it: the oracle throws, the sampler reports.
+   *
+   * `listingUsable` is required, and false means "no opinion": an unreadable listing cannot
+   * contradict anything, and treating it as a contradiction would invent evidence.
+   */
+  static listingContradictsRead(present: boolean, listingUsable: boolean, files: string[], note: string): boolean {
+    return present && listingUsable && !files.includes(`${note}.md`);
+  }
+
+  /**
+   * A batch run with the paranoid discipline: retry until EVERY output is positively recognized,
+   * then hand back the parsed values. Same contract as `runRecognized`, one round trip instead of N.
+   *
+   * The retry is on the WHOLE batch, which is the honest way to do it here: a batch that came back
+   * unsplittable, or with any part unreadable, has not produced a trustworthy picture of that node,
+   * and re-asking one command would pair a fresh answer with stale neighbours. These commands are
+   * all read-only — the mutation path never batches through here — so re-running them is free of
+   * consequence.
+   *
+   * Throws `CliUnrecognizedOutput` after RECOGNIZE_MAX_RETRIES, exactly as the single-call path
+   * does: an answer we cannot identify is never returned as if it were one.
+   */
+  private async batchRecognized<T extends readonly unknown[]>(
+    cmds: string[][],
+    recognizers: { [K in keyof T]: (stdout: string) => T[K] | Unrecognized },
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const r = await this.batch(cmds, this.recognizeCallTimeoutMs);
+      // A command killed at its own cap is UNRECOGNIZED here regardless of what it managed to emit:
+      // a truncated reply must never be parsed as if it were a complete one. The oracle path retries
+      // it; only the bounded sampler is allowed to record "I ran out of time" as an answer.
+      const parsed = r.ok
+        ? recognizers.map((rec, i) => (r.killed[i] ? UNRECOGNIZED : rec(r.outputs[i])))
+        : [UNRECOGNIZED];
+      if (r.ok && !parsed.includes(UNRECOGNIZED)) return parsed as unknown as T;
+      if (attempt >= RECOGNIZE_MAX_RETRIES) {
+        // `batch` hands back only ok+outputs, so synthesise the ExecResult the error wants. The
+        // joined stdout is what a reader needs to see: which part of the batch was unreadable.
+        throw new CliUnrecognizedOutput({
+          argv: cmds.flat(), code: r.ok ? 0 : 1, stdout: r.outputs.join("\n---\n"),
+          stderr: r.ok ? "" : "batch could not be split into one output per command",
+          startedAt: new Date().toISOString(), durationMs: 0, killed: !r.ok,
+        }, "batchRecognized");
+      }
+      this.emit({
+        kind: "cli-batch-unrecognized-retry",
+        node: this.node, commands: cmds.map((c) => c[0]), attempt: attempt + 1, split: r.ok,
+        // WHICH command was unreadable and what it actually said. "One of these five did not parse"
+        // is not something anyone can act on; the offending bytes are.
+        unrecognized: r.ok
+          ? parsed.flatMap((pv, i) => pv === UNRECOGNIZED
+            ? [{ command: cmds[i][0], killed: r.killed[i], stdout: r.outputs[i] }] : [])
+          : [],
+        // A batch that could not be split has no per-command outputs, so the whole reply is the
+        // only thing there is to show.
+        ...(r.ok ? {} : { stdout: r.raw }),
+      });
+      await sleep(this.recognizeBackoffMs);
+    }
+  }
+
+  /** The oracle-grade read of one note plus the folder listing, in ONE round trip. Both are
+   *  retried-until-recognized together; the caller does the CLI-vs-listing cross-check. */
+  async readWithListing(note: string, folder?: string): Promise<{ canonical: string | null; files: string[] }> {
+    const vp = this.vaultParams();
+    const [rd, files] = await this.batchRecognized<[ReturnType<typeof parseRead>, string[]]>(
+      [["read", `file=${note}`, ...vp], ["files", ...(folder ? [`folder=${folder}`] : []), ...vp]],
+      [parseRead, parseFilesList] as never,
+    );
+    const r = rd as Exclude<ReturnType<typeof parseRead>, Unrecognized>;
+    return { canonical: r.present ? (r.content ?? null) : null, files };
+  }
+
+  /** Oracle-grade reads of several exact vault paths, in one round trip. */
+  async readPathsRecognized(paths: string[]): Promise<string[]> {
+    if (paths.length === 0) return [];
+    const vp = this.vaultParams();
+    const out = await this.batchRecognized<unknown[]>(
+      paths.map((p) => ["read", `path=${p}`, ...vp]),
+      paths.map(() => parseRead) as never,
+    );
+    return out.map((v) => {
+      const r = v as Exclude<ReturnType<typeof parseRead>, Unrecognized>;
+      return r.present ? (r.content ?? "") : "";
+    });
+  }
+
+  /**
+   * One node's whole picture for a set of notes, in one round trip: its sync state, the folder
+   * listing, and each note's server version count, content and conflict files.
+   *
+   * All of it batched, because the round trip is the cost — this replaces `1 + 2*notes` separate
+   * execs with one (two when conflict files exist and must be read). Bounded and non-retrying like
+   * the other `snapshot*` calls: a look, never a judgment. Every reply is parsed by the same parser
+   * it would have had alone; a batch that cannot be split returns `ok: false`.
+   *
+   * Conflict files matter here because a token sitting in one is NOT lost — the oracle counts it as
+   * `onlyInConflict`. A sampler that read the note alone would report loss the moment a merge moved
+   * a token into a conflict copy, which is a different and much less serious thing.
+   */
+  async sampleNotes(folder: string, notes: string[], timeoutMs: number): Promise<{
+    ok: boolean;
+    sync: string;
+    per: Map<string, { versStatus: string; vers: number | null; fileStatus: string; content: string; conflicts: string[]; inconsistent: boolean; versRaw?: string; fileRaw?: string }>;
+  }> {
+    const per = new Map<string, { versStatus: string; vers: number | null; fileStatus: string; content: string; conflicts: string[]; inconsistent: boolean; versRaw?: string; fileRaw?: string }>();
+
+    // PARALLEL, not batched — though the honest reason is weaker than it once looked. An early
+    // measurement said 371ms batched against 284ms as parallel execs; running the full matrix
+    // repeatedly (`make bench-cli`, and the table in docs/DESIGN.md) showed that difference was
+    // noise, and the two are indistinguishable. What IS real is that unbatched + SEQUENTIAL costs
+    // ~500ms, because it pays the ~65ms exec overhead four times end to end.
+    //
+    // So: parallel matters, batched-or-not does not, and this form is kept because it gives each
+    // call its own timeout for free. The write path batches for a different and still-valid reason —
+    // it is inherently sequential (read, write, read back), so unbatched would put it in the one
+    // slow cell.
+    const [sync, listing, ...reads] = await Promise.all([
+      this.syncStateProbe(timeoutMs),
+      this.snapshotFiles(folder, timeoutMs),
+      ...notes.flatMap((n) => [this.snapshotVersionsTotal(n, timeoutMs), this.snapshotRead(n, timeoutMs)]),
+    ]);
+    const files = listing.status === "ok" ? (listing.entries ?? []) : [];
+    // A listing that timed out or could not be parsed has NO OPINION, so it must not be allowed to
+    // contradict a read (see listingContradictsRead).
+    const listingUsable = listing.status === "ok";
+
+    const wanted: string[] = []; // conflict copies to fetch, usually none
+    notes.forEach((n, i) => {
+      const tot = reads[i * 2] as Awaited<ReturnType<ObsidianDriver["snapshotVersionsTotal"]>>;
+      const rd = reads[i * 2 + 1] as Awaited<ReturnType<ObsidianDriver["snapshotRead"]>>;
+      const mine = ObsidianDriver.conflictsOf(files, n);
+      wanted.push(...mine);
+      const present = rd.status === "present";
+      // The same CLI-vs-listing cross-check the oracle-grade read does (see gatherObservation).
+      // Both halves are already in hand, so the check is free; unlike the oracle path it must never
+      // throw, so the caller records it and the lane draws `!`.
+      const inconsistent = ObsidianDriver.listingContradictsRead(present, listingUsable, files, n);
+      per.set(n, {
+        versStatus: tot.status,
+        vers: tot.status === "ok" ? (tot.total ?? null) : null,
+        fileStatus: inconsistent ? "inconsistent" : rd.status,
+        content: present ? (rd.content ?? "") : "",
+        conflicts: [],
+        inconsistent,
+        // Carried through so the `sample` event can show what could not be parsed. Present only
+        // when there is something to show.
+        ...(tot.raw !== undefined ? { versRaw: tot.raw } : {}),
+        ...(rd.raw !== undefined ? { fileRaw: rd.raw } : {}),
+      });
+    });
+
+    if (wanted.length > 0) {
+      const bodies = await Promise.all(wanted.map((f) => this.snapshotReadByPath(f, timeoutMs)));
+      wanted.forEach((f, i) => {
+        const b = bodies[i];
+        const body = b.status === "present" ? (b.content ?? "") : "";
+        for (const [n, v] of per) if (ObsidianDriver.conflictsOf([f], n).length > 0) v.conflicts.push(body);
+      });
+    }
+    return { ok: true, sync, per };
+  }
 
   async createNote(name: string, content = ""): Promise<OpResult> {
     // The CLI's `name=` rejects "/", so a note inside a folder must be created via `path=`
@@ -358,21 +688,51 @@ export class ObsidianDriver {
 
   /** Single bounded attempt to read a note. Never retries; a timeout or unrecognized reply
    *  is reported as such, not chased. */
-  async snapshotRead(name: string, timeoutMs: number): Promise<{ status: "present" | "absent" | "unrecognized" | "timeout"; content?: string }> {
+  async snapshotRead(name: string, timeoutMs: number): Promise<{ status: "present" | "absent" | "unrecognized" | "timeout"; content?: string; raw?: string }> {
     const raw = await this.executor.exec(["read", `file=${name}`, ...this.vaultParams()], { timeoutMs });
     if (raw.killed) return { status: "timeout" };
     const r = parseRead(raw.stdout);
-    if (r === UNRECOGNIZED) return { status: "unrecognized", content: raw.stdout };
+    // `raw`, not `content`: an unparsed reply is not the note's content, and calling it that
+    // invited a caller to display it as one.
+    if (r === UNRECOGNIZED) return { status: "unrecognized", raw: raw.stdout };
+    return r.present ? { status: "present", content: r.content } : { status: "absent" };
+  }
+
+  /** Single bounded attempt at the server-side version count. Never retries.
+   *
+   *  `syncVersionsTotal` goes through `runRecognized`, which retries for up to ~30s — fine for a
+   *  verdict, fatal inside a sampling loop, where a call that quietly retried would time the retry
+   *  rather than the thing being sampled. Note `sync:history` is also the call most likely to block:
+   *  see docs/DESIGN.md on what it does with no network. */
+  async snapshotVersionsTotal(name: string, timeoutMs: number): Promise<{ status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string }> {
+    const raw = await this.executor.exec(["sync:history", `file=${name}`, "total"], { timeoutMs });
+    if (raw.killed) return { status: "timeout" };
+    const r = parseTotal(raw.stdout);
+    // `raw` on every unrecognized reply, here and in the snapshots below. "We could not parse it"
+    // is useless without the it: teaching the recognizer needs the exact bytes, and by the time
+    // anyone reads the log the call is long gone. Not truncated — a reply worth reporting is worth
+    // reporting whole.
+    if (r === UNRECOGNIZED) return { status: "unrecognized", raw: raw.stdout };
+    return r === "absent" ? { status: "absent" } : { status: "ok", total: r };
+  }
+
+  /** Single bounded attempt to read an exact vault path — the form conflict copies need. Never
+   *  retries; the bounded sibling of `readByPath`. */
+  async snapshotReadByPath(path: string, timeoutMs: number): Promise<{ status: "present" | "absent" | "unrecognized" | "timeout"; content?: string; raw?: string }> {
+    const raw = await this.executor.exec(["read", `path=${path}`, ...this.vaultParams()], { timeoutMs });
+    if (raw.killed) return { status: "timeout" };
+    const r = parseRead(raw.stdout);
+    if (r === UNRECOGNIZED) return { status: "unrecognized", raw: raw.stdout };
     return r.present ? { status: "present", content: r.content } : { status: "absent" };
   }
 
   /** Single bounded attempt at the vault-relative file listing (CLI's own view — includes
    *  "(Conflicted copy …)" names). Never retries. */
-  async snapshotFiles(folder: string, timeoutMs: number): Promise<{ status: "ok" | "unrecognized" | "timeout"; entries?: string[] }> {
+  async snapshotFiles(folder: string, timeoutMs: number): Promise<{ status: "ok" | "unrecognized" | "timeout"; entries?: string[]; raw?: string }> {
     const raw = await this.executor.exec(["files", `folder=${folder}`, ...this.vaultParams()], { timeoutMs });
     if (raw.killed) return { status: "timeout" };
     const r = parseFilesList(raw.stdout);
-    if (r === UNRECOGNIZED) return { status: "unrecognized" };
+    if (r === UNRECOGNIZED) return { status: "unrecognized", raw: raw.stdout };
     return { status: "ok", entries: r };
   }
 
@@ -393,11 +753,11 @@ export class ObsidianDriver {
    *  assertLocalVaultUnchanged in execute.ts) — a vault name is an open string, so (unlike
    *  syncStateProbe's status words) this returns a discriminated result instead of a sentinel
    *  string, to avoid any collision with a real vault literally named "timeout". */
-  async vaultNameProbe(timeoutMs: number): Promise<{ status: "ok"; name: string } | { status: "unrecognized" | "timeout" }> {
+  async vaultNameProbe(timeoutMs: number): Promise<{ status: "ok"; name: string } | { status: "unrecognized" | "timeout"; raw?: string }> {
     const raw = await this.executor.exec(["vault", "info=name"], { timeoutMs });
     if (raw.killed) return { status: "timeout" };
     const r = parseVaultName(raw.stdout);
-    if (r === UNRECOGNIZED) return { status: "unrecognized" };
+    if (r === UNRECOGNIZED) return { status: "unrecognized", raw: raw.stdout };
     return { status: "ok", name: r };
   }
 

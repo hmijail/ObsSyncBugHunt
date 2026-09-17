@@ -14,12 +14,19 @@ export class RunLogger {
     this.path = path.join(base, `${name}.jsonl`);
   }
 
+  /** Called with each event as it is written, before it reaches the terminal. The live status bar
+   *  uses it to keep an in-memory copy of what the rep has logged so far; nothing else may depend
+   *  on it, and it must never throw — a display concern cannot be allowed to fail a rep. */
+  onEvent?: (event: Record<string, unknown>) => void;
+
   /** Append one event. Relative time `t` (seconds since rep start) leads so a plain-text read
    *  is easy to eyeball; the noisy absolute `ts` trails at the end. */
   log(event: Record<string, unknown>): void {
     const t = Number(((Date.now() - this.start) / 1000).toFixed(3));
-    const line = JSON.stringify({ t, ...event, ts: new Date().toISOString() });
+    const full = { t, ...event, ts: new Date().toISOString() };
+    const line = JSON.stringify(full);
     appendFileSync(this.path, line + "\n");
+    try { this.onEvent?.(full); } catch { /* the display is never allowed to fail the rep */ }
     console.log(`· ${line}`);
   }
 

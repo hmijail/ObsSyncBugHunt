@@ -197,3 +197,21 @@ test("requiredNodes: an empty or pause-only history requires nothing", () => {
 test("requiredNodes: D/C alone (no append) still marks its node required", () => {
   assert.deepEqual(requiredNodes(parse("N2DC")), { containers: [2], local: false });
 });
+
+test("W<n>: the impatient wait parses, round-trips, and is distinct from a bare W", () => {
+  assert.deepEqual(parse("W"), [{ cmd: "wait" }]);
+  assert.deepEqual(parse("W5"), [{ cmd: "wait", seconds: 5 }]);
+  // W0 is a real op — hand off immediately — not an absent count, so it must survive round-trip.
+  assert.deepEqual(parse("W0"), [{ cmd: "wait", seconds: 0 }]);
+  for (const s of ["W", "W0", "W5", "N1AaW3N2W"]) assert.equal(serialize(parse(s)), s);
+});
+
+test("W<n>: adjacent waits merge by patience, and an unbounded one absorbs its neighbour", () => {
+  // Collapsing `W1W1` to `W1` would halve the impatience the history was written to express.
+  assert.equal(serialize(normalize(parse("N1AaW1W1"))), "N1AaW2");
+  assert.equal(serialize(normalize(parse("N1AaWW"))), "N1AaW");
+  // Unbounded absorbs in either order: `W5W` ends up waiting indefinitely; by the time `WW5` is
+  // reached the conditions already hold.
+  assert.equal(serialize(normalize(parse("N1AaW5W"))), "N1AaW");
+  assert.equal(serialize(normalize(parse("N1AaWW5"))), "N1AaW");
+});

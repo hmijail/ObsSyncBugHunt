@@ -85,6 +85,25 @@ async function check(): Promise<number> {
   if (settled.v === "synced" && settled.ms < 2000) ok(`a synced node answers sync:status in ${settled.ms}ms`);
   else fail(`expected a prompt "synced" from an idle node, got "${settled.v}" in ${settled.ms}ms`);
 
+  // What does `sync:history` do when the CALLING node has an upload still pending? It is the call
+  // that returns the server version count, and both `latency.ts` and the settle lean on the counter,
+  // so its behaviour mid-upload decides what the counter can be used for at all. Provoke a pending
+  // upload deliberately: a second edit inside the ~10s per-note throttle window cannot go out
+  // immediately (see src/probe-propagation.ts), so n1 is holding it while we ask.
+  const before = await n1.snapshotVersionsTotal(note, CAP_MS);
+  await n1.appendLine(note, "(pending-probe-1)");
+  await n1.appendLine(note, "(pending-probe-2)"); // throttled behind the first
+  const during = await ms(() => n1.snapshotVersionsTotal(note, CAP_MS));
+  if (during.v.status === "timeout") {
+    ok(`sync:history BLOCKS on a node with a pending upload (killed at ${CAP_MS}ms) — so a blocked call is itself a "sync in flight" signal`);
+  } else if (during.v.status === "ok" && before.status === "ok" && during.v.total === before.total) {
+    ok(`a node with a pending upload answers sync:history in ${during.ms}ms with its PRE-upload count (${during.v.total}) — the counter cannot see a sync in flight, not even the node's own`);
+  } else if (during.v.status === "ok") {
+    fail(`a node with a pending upload reported total=${during.v.total} (was ${before.status === "ok" ? before.total : "?"}) in ${during.ms}ms — the counter now moves ahead of delivery, which would make it a usable pending-sync signal; docs/DESIGN.md says otherwise and needs revisiting`);
+  } else {
+    fail(`sync:history answered "${during.v.status}" on a node with a pending upload — neither blocking nor a count, so src/driver.ts's parsers need a look`);
+  }
+
   await runProcess(engine, ["network", "disconnect", "obsidian-net", names[1]]);
   try {
     const off = await ms(() => n2.syncStateProbe(CAP_MS));
