@@ -55,6 +55,29 @@ nodeid_for() { # the real node-id string embedded in tokens (container name, or 
   if [ "$1" = "L" ]; then echo "$LOCAL_NODE_ID"; else echo "${NODES[$1]}"; fi
 }
 
+# AssertSyncRunning — refuse to start against a node whose Sync is not running.
+#
+# This script has no preflight (see src/dsl.ts on why a D/C's exit code is its only world-check),
+# and Wait/WaitFor below give up SILENTLY on purpose, because a node that never receives the tokens
+# is usually the very finding being reproduced. Against a paused node those two facts combine
+# badly: Check reports missing tokens, which is exactly what a real data loss looks like. A fresh
+# container boots paused, so this is one command away from happening after every `containers-up`.
+#
+# Asserts rather than resuming: a repro that started Sync would no longer be replaying the world the
+# history ran in.
+#
+# Only a positively-reported off-state counts. A node that does not answer is a different problem,
+# and one the ops below report in their own terms.
+AssertSyncRunning() {
+  local n b st off=""
+  for n in "${ALL_NODES[@]}"; do
+    b=$(bin_for "$n")
+    st=$(run $b sync:status 2>/dev/null | sed -n 's/^status:[[:space:]]*//p' | head -1)
+    case "$st" in paused|error|stopped|offline) off="$off $(nodeid_for "$n")($st)" ;; esac
+  done
+  [ -z "$off" ] || die "Sync is not running on:$off — a fresh container boots paused. Resume it with 'make unpause-sync' and re-run."
+}
+
 # Append <node> <letter> — try append, fall back to create if this node doesn't have the note
 # yet (decided from the reply text, since exit codes are meaningless here — see above). Aborts if
 # create itself doesn't report success — a note that silently never got created is exactly the

@@ -150,6 +150,91 @@ for it.
 
 ## The server version counter cannot see a pending sync
 
+### `sync:history` without `total` is a per-note upload clock
+
+The same command, minus the `total` flag, lists the versions themselves:
+
+```
+0: 2026-09-18 13:14:58 (73 bytes) [n1]
+1: 2026-09-18 13:14:48 (64 bytes) [n1]
+```
+
+**That timestamp dates the version's UPLOAD** — not the edit that produced it, and not a peer's
+receipt of it. Measured 2026-09-18 against Obsidian 1.13.7: writes placed 1s, 5s and 9s into a note's
+10s window were all dated at the window's **expiry** (+1.0s, +0.0s, +0.0s from it; 10.0s, 5.0s and
+0.9s after their own edits), while a write made past the window was dated at the edit itself. Asserted
+by `npm run probe-sync-versions -- --check`.
+
+This is the only **per-note** "my push went out" signal the CLI exposes, and it is what
+`probe-propagation` dates each note's throttle window from. `sync:status` cannot do the job: it is per
+NODE, so with two notes outstanding on one writer it cannot say which upload a `synced` refers to. It
+used to be used anyway, and the consequence was that note `a` in the probe's default history was never
+dated at all — its modelled floor read `~0s` against a real ~9s, so the floor check passed by
+asserting nothing.
+
+The intervals in the listing above are 10s, 11s, 10s — the throttle, visible directly, which is a
+second and independent confirmation of `CYCLE_SEC`. Every earlier measurement of that constant came
+from arrival times, i.e. upload *plus* download.
+
+Three properties to respect when using it:
+
+- **One-second resolution.** No sub-second field, so a reading is up to a second early. `upload` is
+  therefore biased low by up to 1s and `download`, being the subtraction, biased high by the same.
+- **UTC inside the container**, while the host need not be. Parsed explicitly as UTC in
+  `cli-parse.ts`; an hour's error would read as a plausible stale reading rather than as a bug.
+- **The entry appears only once a peer has the data**, exactly as the counter does. The time inside it
+  is still the upload's, so this reads the past accurately rather than reporting the present promptly
+  — which is why `probe-propagation` reads it once per arrival rather than once per slot.
+
+Note also that this is a **third** version-listing format, sharing nothing with `diff filter=sync` or
+with local `history` beyond listing versions; each has its own parser.
+
+### The throttle is keyed per note, and its window slides
+
+Both halves of that were argued indirectly for a long time — from a per-vault model over-predicting
+by seconds, and from arrival times. The per-note upload clock above makes each one directly testable,
+and both were tested on 2026-09-18 against Obsidian 1.13.7.
+
+**Per note, not per vault.** Two notes were given windows deliberately 5s apart and both kept
+permanently dirty, so neither was ever waiting on a writer — only on its window. Their uploads:
+
+```
+  a uploads at t+[0, 10, 20, 30, 40, 51]     phase (mod 10s): [8, 8, 8, 8, 8, 9]
+  b uploads at t+[5, 15, 25, 35, 46, 56]     phase (mod 10s): [3, 3, 3, 3, 4, 4]
+```
+
+Independent phases, 5s apart, held for six cycles with no drift. A global cycle would have collapsed
+them onto one grid at once. (Within-note spread of 1s is the timestamp truncation, not jitter.) This
+is also a third independent measurement of `CYCLE_SEC`, and the first from two notes simultaneously.
+
+Note that the uploader serviced both notes at 5s intervals here with no visible contention — so the
+queueing that produces overshoot appears when two notes' phases *coincide*, not merely when both
+notes are active.
+
+**The window slides; it is not a fixed phase grid.** The distinction only shows for a note idle past
+its window by a non-multiple of the cycle: a sliding window is long expired and uploads at once,
+while a fixed grid makes the write wait for that note's next grid point. One note, nothing else
+dirty:
+
+| idle | sliding predicts | fixed grid predicts | measured |
+|---|---|---|---|
+| 23s | 0s | 7s | **−0.1s** |
+| 25s | 0s | 5s | **−0.2s** |
+| 27s | 0s | 3s | **−0.1s** |
+
+So `expect` is `max(0, CYCLE_SEC - sinceSynced)`, which is the sliding formula.
+
+This one nearly went the other way. A probe run had two rows whose overshoot matched the grid
+prediction — one of them (16.1s idle, 3.9s wait against a 3.9s grid prediction) *exactly* — and both
+were also explicable as queueing behind the other note, which is what they turned out to be. The
+single-note test is what separated them. Add it to the list in `probe-propagation`'s header of
+timing conclusions that were wrong on first measurement.
+
+Both claims are asserted by `npm run probe-sync-versions -- --check`, which fails with a distinct
+message naming the replacement formula if the window ever becomes a grid.
+
+### The counter itself
+
 `sync:history file=<n> total` gives a server-side count of versions for a note. It is tempting as a
 signal the *user* does not have: if it rose while a node still lacked the content, the harness could
 tell that a sync was in flight — catching the case of a user who waited, gave up, and edited anyway.
@@ -584,6 +669,15 @@ matters once you are stuck with sequential.**
 
 The write path's arrangement is the same cell the benchmark's control rows use, so it is measured
 directly on every run rather than argued about.
+
+**Both are measurements of one environment** — Obsidian 1.13.7, Docker on macOS — and not properties
+of Obsidian. They hold because the exec round trip dominates everything else; an engine or a CLI that
+changed what an exec costs would move the whole ranking. So the choice is re-checked rather than
+remembered: `make check-assumptions` (step 12) runs `BENCH_CHECK=1 scripts/bench-cli.sh`, which
+re-measures the matrix and reports whether the two cells the code uses are still within twice the
+run's own noise floor of the fastest cell. It is advisory — a cell going slow does not invalidate a
+result, it means this section has gone stale and the design should probably be revised. The methods
+themselves (`sampleNotes`, `editAndConfirm`) carry the same caveat where the arrangement is chosen.
 
 ### Append before create, never the reverse
 

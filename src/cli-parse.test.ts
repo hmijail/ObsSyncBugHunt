@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   UNRECOGNIZED, isNotFoundError,
   parseRead, parseFilesList, parseSyncStatus, parseTotal, parseSyncRead,
-  parseSyncVersions, parseFileVersions, parseMutation, parseVaultName,
+  parseSyncVersions, parseSyncHistoryVersions, parseFileVersions, parseMutation, parseVaultName,
 } from "./cli-parse.js";
 
 // Samples are the real obsidian-cli outputs captured 2026-06-26 (see docs/cli-trust.md).
@@ -80,4 +80,36 @@ test("isNotFoundError matches only the canonical absent form", () => {
   assert.equal(isNotFoundError('Error: File "bughunt/x" not found.'), true);
   assert.equal(isNotFoundError("Error: Failed to retrieve version: …"), false);
   assert.equal(isNotFoundError("(op-n1-1)"), false);
+});
+
+// --- sync:history file= (the per-note upload clock) --------------------------------------------
+
+test("parseSyncHistoryVersions: rows carry an upload time, a size and the producing device", () => {
+  const out = parseSyncHistoryVersions(
+    "0: 2026-09-18 13:14:58 (73 bytes) [n1]\n1: 2026-09-18 13:14:48 (64 bytes) [n2]\n");
+  assert.ok(Array.isArray(out));
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[0], {
+    version: 0,
+    // UTC, explicitly: the container reports UTC while the host may not, and an hour's error would
+    // read as a plausible stale reading rather than as a parse bug.
+    uploadedAt: Date.parse("2026-09-18T13:14:58Z"),
+    bytes: 73,
+    device: "n1",
+  });
+  assert.equal(out[1].device, "n2", "the device column attributes a version to the node that made it");
+  // 10s apart — the throttle, visible in the record itself.
+  assert.equal(out[0].uploadedAt - out[1].uploadedAt, 10_000);
+});
+
+test("parseSyncHistoryVersions: a missing note is positively absent, not unrecognized", () => {
+  assert.equal(parseSyncHistoryVersions('Error: File "bughunt/gone" not found.'), "absent");
+});
+
+test("parseSyncHistoryVersions: one unparseable row rejects the WHOLE listing", () => {
+  // Never a partial listing: the caller dates a note's throttle window from the newest row, so a
+  // listing with a row silently dropped could hand it the wrong version as the newest one.
+  assert.equal(parseSyncHistoryVersions("0: 2026-09-18 13:14:58 (73 bytes) [n1]\nError: Sync is in error state."), UNRECOGNIZED);
+  assert.equal(parseSyncHistoryVersions(""), UNRECOGNIZED);
+  assert.equal(parseSyncHistoryVersions("0: 2026-09-18 13:14 (73 bytes) [n1]"), UNRECOGNIZED, "minute-only stamps are the LOCAL history format, not this one");
 });

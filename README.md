@@ -331,10 +331,9 @@ make check-assumptions     # when coming back to the project after a long break,
 
 `make timeline-rep REP=...` plots the rep's timeline from the data in the given log.
 
-`make probe-propagation HISTORY=...` runs a history while sampling everything that can be sampled, and presents a timeline showing what happened at every node with every edit and Sync status change.
-Most of the same functionality can be obtained in e.g. `make run ... SAMPLING=everything-no-sleep DISPLAY=bar`.
+`make probe-propagation` runs histories with the goal of measuring the timings imposed by Obsidian: when is an edited note synced to the server? Are writes batched? How long until the other clients download it? As of 0.13.7, syncs happen immediately on first write, but subsequent ones are spaced to happen once every 10s per note.
 
-`make bench-cli` measures the speed of sampling various statuses and timings against Obsidian in a container, sequentially or in parallel, batched or not.
+`make bench-cli` measures the speed of running various Obsidian sampling commands in a container, sequentially or in parallel, batched or not. It helps ensure that the sampling mechanisms being used are still the fastest available.
 
 ## Parameters to make and npm
 
@@ -390,7 +389,7 @@ Node is pinned in `.nvmrc`, enforced by `engines` + `engine-strict`; use `npm ci
 
 Podman and Docker on macOS. The images are built with a view to be easy to run on Linux and AWS-EC2, but didn't try.
 
-Developed using Claude Code, with Claude Opus 4.8 and Opus 5, on a Claude Pro Claude subscription and no extra Claude credits.
+Developed using Claude Code, with models Opus 4.8 and Opus 5, on a Pro subscription and no extra credits.
 
 ## Project files layout
 

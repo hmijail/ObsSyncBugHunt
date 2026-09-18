@@ -130,6 +130,10 @@ export function generateScript(history: History, opts: ReproOpts): string {
   if (opts.localBin) allSelectors.push("L");
   lines.push(`ALL_NODES=(${allSelectors.join(" ")})`, "");
 
+  // Before the first op: this script has no preflight, and its waits fail silently, so a paused
+  // node would surface as missing tokens in the final Check — indistinguishable from a real loss.
+  lines.push("AssertSyncRunning", "");
+
   let activeNode: number | "local" = 1;
   let anyAppendYet = false;
   const offline = new Set<number>(); // node numbers left disconnected so far

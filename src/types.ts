@@ -62,6 +62,22 @@ export interface SyncVersion {
   device: string; // e.g. "HMMBP.local"
 }
 
+/**
+ * One entry of `sync:history file=<n>`, the note's SERVER-side version list.
+ *
+ * Distinct from `SyncVersion` (which is `diff filter=sync`) and from `FileVersion` (local File
+ * recovery); all three list versions, in three different formats.
+ *
+ * `uploadedAt` is epoch ms, parsed as UTC — the container reports UTC while the host may not, and
+ * an hour's error here would read as a plausible stale reading rather than as a bug.
+ */
+export interface SyncHistoryVersion {
+  version: number;      // 0 is newest
+  uploadedAt: number;   // epoch ms, from a UTC "YYYY-MM-DD HH:MM:SS" with NO sub-second field
+  bytes: number;
+  device: string;       // the node that produced this version, e.g. "n1"
+}
+
 /** A local (File recovery) version, as listed by `history`. */
 export interface FileVersion {
   version: number;

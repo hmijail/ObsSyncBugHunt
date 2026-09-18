@@ -1,12 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { renderLanes, slot, CounterLane, FileLane, MARK, fileMark, syncMark, type Slot } from "./timeline.js";
+import { renderLanes, slot, CounterLane, FileLane, Live, MARK, fileMark, physicalRows, RULER_LANE, syncMark, type Slot } from "./timeline.js";
 
 /** The lane content, with its label stripped — what the eye actually reads along the row. Sliced at
  *  the width the renderer itself uses, never trimmed: a leading or trailing space in a lane is real
  *  data ("did not look"), so trimming it would hide exactly what these tests are checking. */
 const body = (line: string, lanes: string[]): string =>
-  line.slice(6 + Math.max(...lanes.map((l) => l.length)) + 2);
+  line.slice(6 + Math.max(...lanes.map((l) => l.length), RULER_LANE.length) + 2);
+
+/** renderLanes puts the seconds ruler FIRST, then the lanes in the order given. Every test below
+ *  wants a lane, so they all go through this rather than indexing the raw array. */
+const lane = (slots: Slot[], lanes: string[], which: string): string =>
+  body(renderLanes(slots, lanes)[1 + lanes.indexOf(which)], lanes);
+/** The ruler itself. */
+const rulerOf = (slots: Slot[], lanes: string[]): string => body(renderLanes(slots, lanes)[0], lanes);
 
 const build = (spec: [number, Record<string, string>][]): Slot[] =>
   spec.map(([t, marks]) => {
@@ -25,9 +32,8 @@ test("renderLanes: a lane that was never sampled renders spaces, not dots", () =
     [0.6, { "n1 sync": ".", "n2 sync": "x" }],
   ]);
   const lanes = ["n1 sync", "n2 sync"];
-  const [n1, n2] = renderLanes(slots, lanes);
-  assert.equal(body(n1, lanes), "...");
-  assert.equal(body(n2, lanes), ". x");
+  assert.equal(lane(slots, lanes, lanes[0]), "...");
+  assert.equal(lane(slots, lanes, lanes[1]), ". x");
 });
 
 test("renderLanes: a second containing no slot renders as ||", () => {
@@ -35,12 +41,12 @@ test("renderLanes: a second containing no slot renders as ||", () => {
     [0.5, { "n1 ops": "a" }],
     [3.5, { "n1 ops": "b" }], // seconds 1 and 2 had no sampling at all
   ]);
-  assert.equal(body(renderLanes(slots, ["n1 ops"])[0], ["n1 ops"]), "a|||b");
+  assert.equal(lane(slots, ["n1 ops"], "n1 ops"), "a|||b");
 });
 
 test("renderLanes: one bar per second boundary, and none before the first slot", () => {
   const slots = build([[0.1, { x: "1" }], [0.9, { x: "2" }], [1.1, { x: "3" }]]);
-  assert.equal(body(renderLanes(slots, ["x"])[0], ["x"]), "12|3");
+  assert.equal(lane(slots, ["x"], "x"), "12|3");
 });
 
 test("renderLanes: lanes stay column-aligned when nodes are sampled unequally", () => {
@@ -50,7 +56,7 @@ test("renderLanes: lanes stay column-aligned when nodes are sampled unequally", 
     [0.4, { "n1 ops": "." }],
     [1.4, { "n2 file b": "." }],
   ]);
-  const lines = renderLanes(slots, ["n1 ops", "n2 ops", "n2 file b"]);
+  const lines = renderLanes(slots, ["n1 ops", "n2 ops", "n2 file b"]).slice(1); // past the ruler
   assert.equal(new Set(lines.map((l) => l.length)).size, 1, "every rendered lane is the same width");
   // ...and every lane's content starts at the same column, so the `|` bars line up vertically.
   const lanes = ["n1 ops", "n2 ops", "n2 file b"];
@@ -60,7 +66,8 @@ test("renderLanes: lanes stay column-aligned when nodes are sampled unequally", 
 
 test("renderLanes: no lanes, or no slots, is not an error", () => {
   assert.deepEqual(renderLanes(build([[0, { x: "." }]]), []), []);
-  assert.equal(body(renderLanes([], ["x"])[0], ["x"]), "");
+  assert.equal(renderLanes([], ["x"]).length, 2, "a ruler and the one lane, both empty");
+  assert.equal(body(renderLanes([], ["x"])[1], ["x"]), "");
 });
 
 test("fileMark: every combination of state and change gets its own character", () => {
@@ -184,8 +191,8 @@ import { foldEvents } from "./timeline.js";
 
 const NOTE = "bughunt/x-a-N1AaN2W";
 const row = (r: { slots: Slot[]; lanes: string[] }, lane: string): string => {
-  const line = renderLanes(r.slots, r.lanes)[r.lanes.indexOf(lane)];
-  return line.slice(6 + Math.max(...r.lanes.map((l) => l.length)) + 2);
+  const line = renderLanes(r.slots, r.lanes)[1 + r.lanes.indexOf(lane)];
+  return line.slice(6 + Math.max(...r.lanes.map((l) => l.length), RULER_LANE.length) + 2);
 };
 
 test("foldEvents: an append marks its own note letter on its own node's ops lane", () => {
@@ -409,4 +416,117 @@ test("foldEvents: where the sampler watches a file lane, token-arrived does not 
     { t: 1.2, kind: "token-arrived", to: "n2", note: NOTE, token: "(t)" },
   ]);
   assert.equal(row(strategic, "n2 file a"), " |u");
+});
+
+// --- what the live rewind counts ---------------------------------------------------------------
+//
+// Live rewinds by cursor-up, which moves PHYSICAL rows. Every row it fails to count is a row of the
+// previous frame left on screen, and the next redraw strands another — the failure seen as a
+// screenful of repeated table headers.
+
+test("physicalRows: an element carrying its own newline is two rows, not one", () => {
+  // The bug exactly: frame() built its two legend lines as one string with a \n between them.
+  assert.equal(physicalRows(["a\nb"], 80), 2);
+  assert.equal(physicalRows(["a", "b"], 80), 2);
+});
+
+test("physicalRows: a line wider than the terminal counts the rows it wraps to", () => {
+  assert.equal(physicalRows(["x".repeat(80)], 80), 1);
+  assert.equal(physicalRows(["x".repeat(81)], 80), 2);
+  assert.equal(physicalRows(["x".repeat(240)], 80), 3);
+});
+
+test("physicalRows: an empty line still occupies a row", () => {
+  // frame() uses "" as a spacer; counting it as zero would undercount every redraw.
+  assert.equal(physicalRows(["", "", ""], 80), 3);
+});
+
+test("physicalRows: a lane row of marks is measured by columns, not UTF-16 units", () => {
+  // The table's "—" and the lane marks are one column each; measuring .length would be right here
+  // only by accident, so the check is that a full-width row of them is one line.
+  assert.equal(physicalRows(["—".repeat(80)], 80), 1);
+  assert.equal(physicalRows(["—".repeat(81)], 80), 2);
+});
+
+/** Drive a Live against a faked terminal, returning everything it wrote. `Live` reads isTTY at
+ *  construction, so the property is set before the callback builds one. */
+const onFakeTty = (rows: number, run: (live: Live) => void): string => {
+  const d = (k: string, v: unknown): void => { Object.defineProperty(process.stdout, k, { value: v, configurable: true }); };
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const realTty = process.stdout.isTTY, realCols = process.stdout.columns, realRows = process.stdout.rows;
+  const out: string[] = [];
+  try {
+    d("isTTY", true); d("columns", 80); d("rows", rows);
+    (process.stdout as unknown as { write: unknown }).write = (c: unknown) => { out.push(String(c)); return true; };
+    run(new Live());
+  } finally {
+    (process.stdout as unknown as { write: unknown }).write = realWrite;
+    d("isTTY", realTty); d("columns", realCols); d("rows", realRows);
+  }
+  return out.join("");
+};
+
+test("Live.log: a line printed mid-frame rewinds first, so it lands ABOVE the block", () => {
+  // The bug: probe-propagation left its drivers on emit()'s console.warn fallback, so an event
+  // wrote straight into rows the renderer owned and every later rewind counted from the wrong place.
+  const frame = ["  header", "  row a", "  row b"];
+  const seq = onFakeTty(40, (live) => { live.draw(frame); live.log("· event"); live.draw(frame); });
+  const rewindThenEvent = seq.indexOf("\x1b[3A\x1b[J· event");
+  assert.ok(rewindThenEvent > 0, `expected a 3-row rewind immediately before the event, got: ${JSON.stringify(seq)}`);
+  // ...and the frame is redrawn after it, rather than the event sitting inside the block.
+  assert.ok(seq.indexOf("  header") < rewindThenEvent, "the first frame should precede the event");
+  assert.ok(seq.lastIndexOf("  header") > rewindThenEvent, "the frame should be redrawn after the event");
+});
+
+test("Live.draw: a frame taller than the window stops drawing instead of smearing", () => {
+  // Cursor-up clamps at the top of the screen, so a frame that does not fit cannot be redrawn in
+  // place at all; the end-of-run print is what carries it.
+  const tall = Array.from({ length: 30 }, (_, i) => `line ${i}`);
+  const seq = onFakeTty(24, (live) => { live.draw(["a", "b"]); live.draw(tall); live.draw(["a", "b"]); });
+  assert.ok(!seq.includes("line 29"), "the too-tall frame should not be drawn");
+  assert.equal(seq.split("a\nb\n").length - 1, 1, "and drawing stays off afterwards");
+});
+
+// --- the seconds ruler -------------------------------------------------------------------------
+
+test("ruler: a label's FIRST DIGIT sits in the same column as the bar that opens its second", () => {
+  // One slot per second, so every second is one mark plus its opening bar. Labels every 5s.
+  const slots = build(Array.from({ length: 12 }, (_, i) => [i + 0.5, { x: "." }] as [number, Record<string, string>]));
+  const lanes = ["x"];
+  const bar = lane(slots, lanes, "x");
+  const rule = rulerOf(slots, lanes);
+  assert.equal(bar.length, rule.length, "ruler and lane must be the same width or nothing lines up");
+  for (const second of [5, 10]) {
+    const col = bar.indexOf("|", second === 5 ? 0 : bar.indexOf("|") + 1);
+    assert.ok(col >= 0);
+  }
+  // The checkable form of "aligned": at every column where the ruler starts a number, the lane has
+  // the bar that opens that second.
+  for (let i = 0; i < rule.length; i++) {
+    const isLabelStart = rule[i] !== " " && (i === 0 || rule[i - 1] === " ");
+    if (!isLabelStart || i === 0) continue;
+    assert.equal(bar[i], MARK.second, `a label starts at column ${i}, so that column must be a second boundary`);
+  }
+  // And the numbers are the seconds those bars open, every 5.
+  assert.deepEqual(rule.trim().split(/\s+/), ["0", "5", "10"]);
+});
+
+test("ruler: second 0 is labelled at the left edge, where no bar precedes it", () => {
+  const slots = build([[0.1, { x: "." }], [1.1, { x: "." }]]);
+  assert.ok(rulerOf(slots, ["x"]).startsWith("0"), "the left edge is the start of the first second");
+});
+
+test("ruler: a timeline starting mid-run labels only the multiples it actually contains", () => {
+  // A reconstruction can start anywhere; the ruler must carry real second numbers, not an offset
+  // from wherever the log happened to begin.
+  const slots = build([[7.2, { x: "." }], [8.2, { x: "." }], [9.2, { x: "." }], [10.2, { x: "." }]]);
+  assert.deepEqual(rulerOf(slots, ["x"]).trim().split(/\s+/), ["10"], "7 is not a multiple of 5, and 10 is where its bar is");
+});
+
+test("ruler: a label that would collide with the previous one is dropped, not merged", () => {
+  // Pathological but reachable: seconds one column wide and labels long enough to overrun the step.
+  // A gap in the ruler is readable; two numbers run together are not.
+  const slots = build([[1000.5, { x: "." }], [1001.5, { x: "." }], [1005.5, { x: "." }]]);
+  const rule = rulerOf(slots, ["x"]);
+  assert.ok(!/\d{5,}/.test(rule), `no two labels may merge into one run of digits: ${JSON.stringify(rule)}`);
 });

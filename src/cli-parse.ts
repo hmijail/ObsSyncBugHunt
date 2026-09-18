@@ -8,7 +8,7 @@
 // halts loudly instead of silently mis-scoring. "Looks like it isn't an error" is NOT
 // enough; the output must affirmatively match a known answer.
 
-import type { ExecResult, SyncVersion, FileVersion } from "./types.js";
+import type { ExecResult, SyncVersion, FileVersion, SyncHistoryVersion } from "./types.js";
 
 export const UNRECOGNIZED = Symbol("unrecognized-cli-output");
 export type Unrecognized = typeof UNRECOGNIZED;
@@ -89,6 +89,40 @@ export function parseSyncHistory(stdout: string): string | "absent" | Unrecogniz
   if (isNotFoundError(t)) return "absent";
   if (t === "" || t.startsWith("Error:")) return UNRECOGNIZED;
   return t;
+}
+
+// --- sync:history file= (parsed rows) ----------------------------------------
+//
+// Rows: "<ver>: <YYYY-MM-DD HH:MM:SS> (<n> bytes) [<device>]", newest first. A THIRD version-listing
+// format, sharing nothing with `diff filter=sync` (SYNC_ROW) or local `history` (HISTORY_ROW) beyond
+// carrying versions — hence its own row pattern rather than a relaxed shared one.
+//
+// The timestamp dates when that version was UPLOADED, not when the edit was made and not when a
+// peer received it. Measured 2026-09-18 against Obsidian 1.13.7: writes placed 1s, 5s and 9s into a
+// note's 10s window were all dated at the window's expiry, +0.0/+0.0/+1.0s, while a write past the
+// window was dated at the edit itself. Re-check with `npm run probe-sync-versions -- --check`.
+//
+// UTC, and with no sub-second field: worth at most one-second resolution.
+const SYNC_HISTORY_ROW = /^(\d+):\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+\((\d+) bytes\)\s+\[([^\]]+)\]\s*$/;
+export function parseSyncHistoryVersions(stdout: string): SyncHistoryVersion[] | "absent" | Unrecognized {
+  const t = stdout.trim();
+  if (isNotFoundError(t)) return "absent";
+  if (t === "") return UNRECOGNIZED;
+  const out: SyncHistoryVersion[] = [];
+  for (const line of stdout.split("\n")) {
+    if (line.trim().length === 0) continue;
+    const m = SYNC_HISTORY_ROW.exec(line.trim());
+    if (m === null) return UNRECOGNIZED; // including every `Error:` — never a partial listing
+    out.push({
+      version: Number(m[1]),
+      // `Z` makes the parse explicit rather than leaving it to the host's zone.
+      uploadedAt: Date.parse(`${m[2].replace(" ", "T")}Z`),
+      bytes: Number(m[3]),
+      device: m[4],
+    });
+  }
+  if (out.some((v) => !Number.isFinite(v.uploadedAt))) return UNRECOGNIZED;
+  return out;
 }
 
 // --- sync:read file= version= ------------------------------------------------

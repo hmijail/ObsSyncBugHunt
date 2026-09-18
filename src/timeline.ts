@@ -16,7 +16,9 @@
 // and not otherwise — so most lanes are mostly empty, and drawing a `.` there would claim an
 // observation that never happened. `.` means "looked, nothing changed"; ` ` means "did not look".
 //
-// SECONDS. A `|` is a wallclock second boundary. A second containing no slot at all contributes a
+// SECONDS. A `|` is a wallclock second boundary, and the `seconds` lane above them carries the
+// second numbers, every RULER_STEP_SEC, each label's first digit in the same column as the bar that
+// opens it. A second containing no slot at all contributes a
 // bar with nothing after it, so an idle stretch reads as `||` — the gaps in our own instrument,
 // visible rather than implied.
 import type { NodeId } from "./types.js";
@@ -210,50 +212,138 @@ export interface Slot {
 export const slot = (t: number): Slot => ({ t, marks: new Map() });
 
 /**
- * Lanes as text, one column per slot, `|` at each wallclock second boundary.
+ * Lanes as text, one column per slot, `|` at each wallclock second boundary, with the seconds
+ * ruler as the first line returned.
  *
  * Label width is derived from the lanes themselves rather than fixed. Hand-spacing these is exactly
  * how the ops row ended up one column out of step with the three below it, and with `L` in play and
  * note letters in the label there is no constant that stays right.
  */
+/** How often the ruler is labelled, in seconds. Every second would not fit: a second is only about
+ *  three columns wide at the default slot, and one column wide across a pause nobody sampled. */
+export const RULER_STEP_SEC = 5;
+/** The ruler's lane label. Named like the others so it pads to the same width. */
+export const RULER_LANE = "seconds";
+
+/**
+ * The ruler: the second numbers, every RULER_STEP_SEC, each one's FIRST DIGIT in the same column as
+ * the `|` that opens that second. So a label marks where its second begins, and reading down from a
+ * digit lands on the marks recorded in that second.
+ *
+ * `bars` is (column, the second that bar opens), collected while the grid is built rather than
+ * recomputed, so the ruler cannot drift from the bars it labels.
+ *
+ * Second 0 has no bar — nothing precedes it — so it is labelled at column 0 when the timeline starts
+ * on a multiple of the step, which anchors the left edge.
+ *
+ * A label is dropped rather than allowed to overwrite one already placed. At one column per second a
+ * four-digit number exactly fills the step, and beyond that the honest thing is a gap in the ruler
+ * instead of two numbers merged into an unreadable one.
+ */
+function ruler(bars: { col: number; second: number }[], firstSecond: number, len: number): string {
+  const out = new Array<string>(len).fill(" ");
+  const place = (col: number, second: number): void => {
+    const label = String(second);
+    if (col + label.length > len) return;
+    for (let i = 0; i < label.length; i++) if (out[col + i] !== " ") return; // would collide
+    for (let i = 0; i < label.length; i++) out[col + i] = label[i];
+  };
+  if (firstSecond % RULER_STEP_SEC === 0) place(0, firstSecond);
+  for (const b of bars) if (b.second % RULER_STEP_SEC === 0) place(b.col, b.second);
+  return out.join("");
+}
+
 export function renderLanes(slots: Slot[], lanes: LaneId[]): string[] {
   if (lanes.length === 0) return [];
-  const width = Math.max(...lanes.map((l) => l.length)) + 2;
+  const width = Math.max(...lanes.map((l) => l.length), RULER_LANE.length) + 2;
   const chars = new Map<LaneId, string[]>(lanes.map((l) => [l, []]));
+  const bars: { col: number; second: number }[] = [];
 
   // Bars are derived from the slot times rather than pushed as the run goes, so a reconstruction
   // from timestamps and a live loop produce the same grid.
-  let second = slots.length > 0 ? Math.floor(slots[0].t) : 0;
+  const firstSecond = slots.length > 0 ? Math.floor(slots[0].t) : 0;
+  let second = firstSecond;
+  let col = 0;
   for (const s of slots) {
     const sec = Math.floor(s.t);
-    for (let i = 0; i < sec - second; i++) for (const cs of chars.values()) cs.push(MARK.second);
+    for (let i = 0; i < sec - second; i++) {
+      for (const cs of chars.values()) cs.push(MARK.second);
+      bars.push({ col, second: second + i + 1 }); // this bar OPENS that second
+      col++;
+    }
     second = sec;
     for (const l of lanes) chars.get(l)!.push(s.marks.get(l) ?? MARK.unsampled);
+    col++;
   }
-  return lanes.map((l) => `      ${l.padEnd(width)}${chars.get(l)!.join("")}`);
+  return [
+    `      ${RULER_LANE.padEnd(width)}${ruler(bars, firstSecond, col)}`,
+    ...lanes.map((l) => `      ${l.padEnd(width)}${chars.get(l)!.join("")}`),
+  ];
 }
 
 /**
  * A block redrawn in place, so a table and its lanes grow while the run happens instead of appearing
  * only at the end.
  *
- * Rewinding is a cursor-up by LINE count, which is a physical-ROW count: a lane long enough to wrap
- * would undercount and each redraw would walk a little further up the screen. A run is assumed to
- * fit the terminal, so nothing here truncates.
+ * Rewinding is a cursor-up, which counts PHYSICAL rows, so that is what is counted here. An array
+ * element is not reliably one row: it can carry an embedded newline, and anything wider than the
+ * terminal wraps. Counting elements instead undercounted the rewind, which left the top of the
+ * previous frame on screen — one stale row per redraw, seen as a screenful of repeated table
+ * headers.
+ *
+ * A frame taller than the window cannot be redrawn in place at all: cursor-up clamps at the top of
+ * the screen, so each redraw would strand whatever did not fit. There is nothing to truncate to —
+ * the lanes grow as the run goes — so drawing simply stops, and the caller's end-of-run print
+ * carries the whole block, as it does with no TTY at all.
  */
+/** Rows these lines will actually occupy at a given terminal width. Code points rather than UTF-16
+ *  units, since the marks and the table's em-dashes are one column each. An empty line still takes
+ *  a row. */
+export function physicalRows(lines: string[], cols: number): number {
+  let n = 0;
+  for (const line of lines) {
+    for (const seg of line.split("\n")) n += Math.max(1, Math.ceil([...seg].length / cols));
+  }
+  return n;
+}
+
 export class Live {
   private rows = 0;
+  private stopped = false;
   readonly on = Boolean(process.stdout.isTTY);
+
   draw(lines: string[]): void {
-    if (!this.on) return;
+    if (!this.on || this.stopped) return;
+    const need = physicalRows(lines, process.stdout.columns || 80);
+    if (need >= (process.stdout.rows || 24)) {
+      this.rewind(); // take the partial frame back off the screen rather than leave half of it
+      this.stopped = true;
+      // Said once. Without it, drawing that simply stops reads as the thing it is there to avoid.
+      process.stdout.write(`  (timeline is taller than this window — printed in full when the run ends)\n`);
+      return;
+    }
     this.rewind();
     process.stdout.write(lines.join("\n") + "\n");
-    this.rows = lines.length;
+    this.rows = need;
   }
   rewind(): void {
     if (!this.on || this.rows === 0) return;
     process.stdout.write(`\x1b[${this.rows}A\x1b[J`);
     this.rows = 0;
+  }
+
+  /**
+   * Write a line ABOVE the block instead of into it.
+   *
+   * Anything printed while a frame is on screen lands in rows this owns, and the next rewind then
+   * walks up through the printed line instead of the frame — the display comes apart, and it does so
+   * exactly when something is wrong enough to be printing. The caller's next `draw` repaints.
+   *
+   * With no TTY there is no frame to protect, so this is an ordinary write.
+   */
+  log(line: string): void {
+    this.rewind();
+    process.stdout.write(line + "\n");
   }
 }
 
@@ -520,8 +610,8 @@ export class StatusBar {
     if (!this.live.on || this.original !== null) return;
     this.original = console.log;
     console.log = (...args: unknown[]): void => {
-      this.live.rewind();
-      this.original!(...args);
+      this.live.rewind();            // same reason as Live.log; the bar cannot use it directly
+      this.original!(...args);       // because console.log's formatting is the caller's, not ours
       this.live.draw(this.lines);
     };
   }

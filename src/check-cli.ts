@@ -17,6 +17,10 @@
 // for a human to read while DESIGNING parsers. This asserts the existing parsers still hold,
 // against the container nodes, non-interactively, with an exit code.
 //
+// Scope: the format sweep runs on ONE node (the first that answers) because output format is a
+// property of the binary and every node runs the same image. `vault info=name` and `sync:status` run
+// on every node, because which vault is open and whether Sync answers are per-node facts.
+//
 //   --nodes   comma-separated container names   (default n1,n2)
 //   --bin     CLI path inside the container     (default /opt/obsidian/obsidian-cli)
 //
@@ -84,6 +88,18 @@ async function probe(command: string, call: () => Promise<OpResult<unknown>>): P
 let failed = 0;
 let skipped = 0;
 
+// TWO DIFFERENT QUESTIONS, asked at their own scopes.
+//
+// Output FORMAT is a property of the BINARY, and every node runs the same image seeded from the same
+// captured login — so sweeping it on each node in turn re-asks a question already answered. It used
+// to, and the cost was not just time: the sweep mutates (create, append, delete permanent), so it
+// ran three writes per node where one node settles the matter.
+//
+// What IS per node is whether that node's Obsidian has the right vault open and answers at all. A
+// renderer that SIGTRAPs on launch (see scripts/wait-node.sh) can leave a node up but useless, and
+// `vault info=name` is the call that says so. Read-only, so asking it everywhere costs nothing.
+let sweptOn: string | null = null;
+
 for (const node of nodes) {
   const executor = new ContainerExecutor(node, bin);
   const d = new ObsidianDriver(executor);
@@ -97,25 +113,29 @@ for (const node of nodes) {
     skipped++;
     continue;
   }
-
-  // Under bughunt/ like every other harness note, so a real vault is never touched, and uniquely
-  // named so a concurrent run (or a previous interrupted check) can't collide with it.
-  const note = `${NOTE_DIR}/checkcli-${node}-${Date.now()}`;
   console.log(`\n=== ${node} ===`);
 
-  // Ordered so the scratch note exists before anything reads it. `create` first also means a
-  // failure here reports as a create problem rather than as a confusing read-of-nothing.
   const results: Outcome[] = [];
+  // Per node, read-only: which vault this Obsidian actually has open, and whether Sync answers.
   results.push(await probe("vault info=name", () => d.vaultNameProbe(15_000).then(toOp)));
   results.push(await probe("sync:status", () => d.syncStatus()));
-  results.push(await probe("create", () => d.createNote(note, "(checkcli)")));
-  results.push(await probe("read", () => d.read(note)));
-  results.push(await probe("append", () => d.appendLine(note, "(checkcli-2)")));
-  results.push(await probe(`files folder=${NOTE_DIR}`, () => d.listFiles(NOTE_DIR)));
-  results.push(await probe("sync:history file= total", () => d.syncVersionsTotal(note)));
-  // Cleanup is also a probe: `delete` is a command the harness relies on (clean-notes.ts), so a
-  // drift in its reply matters too — and doing it last leaves the vault as we found it.
-  results.push(await probe("delete permanent", () => d.deleteNote(note, true)));
+
+  if (sweptOn === null) {
+    // The format sweep, once. Ordered so the scratch note exists before anything reads it; `create`
+    // first also means a failure here reports as a create problem rather than as a confusing
+    // read-of-nothing. Under bughunt/ like every other harness note, so a real vault is never
+    // touched, and uniquely named so a concurrent run cannot collide with it.
+    const note = `${NOTE_DIR}/checkcli-${node}-${Date.now()}`;
+    results.push(await probe("create", () => d.createNote(note, "(checkcli)")));
+    results.push(await probe("read", () => d.read(note)));
+    results.push(await probe("append", () => d.appendLine(note, "(checkcli-2)")));
+    results.push(await probe(`files folder=${NOTE_DIR}`, () => d.listFiles(NOTE_DIR)));
+    results.push(await probe("sync:history file= total", () => d.syncVersionsTotal(note)));
+    // Cleanup is also a probe: `delete` is a command the harness relies on (clean-notes.ts), so a
+    // drift in its reply matters too — and doing it last leaves the vault as we found it.
+    results.push(await probe("delete permanent", () => d.deleteNote(note, true)));
+    sweptOn = node;
+  }
 
   for (const r of results) {
     console.log(`  ${r.ok ? "ok  " : "FAIL"}  ${r.command.padEnd(24)} ${r.detail}`);
@@ -141,7 +161,8 @@ if (skipped === nodes.length) {
 }
 if (failed === 0) {
   const checked = nodes.length - skipped;
-  console.log(`check-cli: PASS — every obsidian-cli command the harness depends on still parses, on ${checked} node(s).`);
+  console.log(`check-cli: PASS — the mutating commands parse (swept on ${sweptOn}); vault identity and `
+    + `sync:status answered on ${checked} node(s).`);
   process.exit(0);
 }
 console.error(

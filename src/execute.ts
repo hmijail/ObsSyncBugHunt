@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { formatToken, NOTE_DIR, type NodeId } from "./types.js";
-import { isConflictFile, type ObsidianDriver } from "./driver.js";
+import { isConflictFile, SYNC_OFF_STATES, type ObsidianDriver } from "./driver.js";
 import { CliInconsistencyError } from "./inconsistency.js";
 import type { Isolator } from "./isolate.js";
 import type { RunLogger } from "./history.js";
@@ -220,24 +220,23 @@ async function waitForHostReconnect(logger: RunLogger, context: Record<string, u
  *  the whole soak, not just tag one rep -OBSFAIL. Returns whether either detour actually
  *  happened (so the caller can flag this rep's timings as unreliable even if it goes on to finish
  *  normally). */
-const LOCAL_SYNC_OFF_STATES = new Set(["paused", "error", "stopped", "offline"]);
 const LOCAL_SYNC_GRACE_ATTEMPTS = 3;
 const LOCAL_SYNC_GRACE_MS = 5_000;
 async function assertLocalSyncOn(driver: ObsidianDriver, opts: ExecuteOpts, logger: RunLogger): Promise<boolean> {
   const probeMs = (opts.probeSec ?? 5) * 1000;
   let state = await syncState(driver, probeMs);
   let hostOutage = false;
-  if (LOCAL_SYNC_OFF_STATES.has(state) && opts.hostCheck !== false) {
+  if (SYNC_OFF_STATES.has(state) && opts.hostCheck !== false) {
     hostOutage = await waitForHostReconnect(logger, { node: driver.node }); // waits out an ACTIVE outage, if any
     const graceMs = opts.localSyncGraceMs ?? LOCAL_SYNC_GRACE_MS;
     const graceAttempts = opts.localSyncGraceAttempts ?? LOCAL_SYNC_GRACE_ATTEMPTS;
-    for (let i = 0; i < graceAttempts && LOCAL_SYNC_OFF_STATES.has(state); i++) {
+    for (let i = 0; i < graceAttempts && SYNC_OFF_STATES.has(state); i++) {
       hostOutage = true; // any grace retry means this rep waited extra recovery time — flag it either way
       await sleep(graceMs);
       state = await syncState(driver, probeMs);
     }
   }
-  if (LOCAL_SYNC_OFF_STATES.has(state)) {
+  if (SYNC_OFF_STATES.has(state)) {
     throw new Error(`the local node's Sync is not on (observed "${state}") — the harness requires it to stay always-connected. Check Sync on ${driver.node} and re-run.`);
   }
   return hostOutage;

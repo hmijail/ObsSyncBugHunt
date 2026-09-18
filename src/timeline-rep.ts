@@ -13,7 +13,7 @@
 // Usage: make timeline-rep REP=runs/<history>/<rep>.jsonl
 //        npm run timeline-rep -- runs/<history>/<rep>.jsonl
 import { readFileSync } from "node:fs";
-import { foldEvents, renderLanes } from "./timeline.js";
+import { foldEvents, renderLanes, RULER_STEP_SEC } from "./timeline.js";
 
 function main(): void {
   const file = process.argv[2];
@@ -35,7 +35,7 @@ function main(): void {
     return;
   }
   console.log("    ops:   a/b/... note written   D/C disconnect/connect   W wait   P pause   h handed off early");
-  console.log("    | second boundary");
+  console.log(`    | second boundary; the seconds lane numbers every ${RULER_STEP_SEC}th, first digit on the bar`);
   console.log("    (blank) not sampled");
   console.log("    every lane: a column where nothing noteworthy happened holds only dots.");
   console.log("    file:  . complete   u complete, changed here   m missing a token   M missing, changed here");

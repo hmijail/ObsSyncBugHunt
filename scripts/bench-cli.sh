@@ -45,10 +45,15 @@ NODE="${1:-${BENCH_NODE:-n2}}"
 #             Run it both ways and watch the controls' p90 span.
 # BENCH_BIN_MS histogram bin width. Fixed, so a bar means the same latency in every run.
 # BENCH_SHOW=1 print the exact command each row times, and run nothing.
-N="${BENCH_N:-10}"
+# BENCH_CHECK=1 skip the single-command section, and end with one verdict line plus an exit code:
+#             are the two arrangements the harness actually uses still among the fast ones?
+#             Fewer samples by default, since the question is "is this cell still fast", not
+#             "how fast" — check-assumptions runs it this way.
+N="${BENCH_N:-$([ -n "${BENCH_CHECK:-}" ] && echo 5 || echo 10)}"
 GAP="${BENCH_GAP:-0}"
 INTERLEAVED="${BENCH_INTERLEAVED:-1}"
 SHOW="${BENCH_SHOW:-}"
+CHECK="${BENCH_CHECK:-}"
 ENGINE="${CONTAINER_ENGINE:-$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)}"
 CLI=/opt/obsidian/obsidian-cli
 VAULT="${BENCH_VAULT:-/root/vaults/TestVault}"
@@ -60,6 +65,16 @@ cleanup() { cli delete "file=$NOTE" >/dev/null 2>&1 || true; cli delete "file=$N
 trap cleanup EXIT
 
 "$ENGINE" exec "$NODE" true >/dev/null 2>&1 || { echo "node '$NODE' is not up — make containers-up"; exit 2; }
+
+# Two of the timed rows are `sync:status` and `sync:history`, and both are far cheaper on a node
+# whose Sync is not running — so a paused node does not fail here, it just quietly reports the wrong
+# cost for the two calls the harness makes most. A fresh container boots paused.
+sync_state=$("$ENGINE" exec "$NODE" "$CLI" sync:status 2>/dev/null | sed -n 's/^status:[[:space:]]*//p' | head -1)
+case "$sync_state" in
+  paused|error|stopped|offline)
+    echo "node '$NODE' has Sync $sync_state — these timings would not be the ones the harness pays."
+    echo "  Resume it with 'make unpause-sync' and re-run."; exit 2 ;;
+esac
 
 # --- the commands ------------------------------------------------------------------------------
 CLI_R="$CLI read file=$NOTE";      FS_R="cat $VAULT/$NOTE.md"
@@ -291,8 +306,10 @@ echo "rows marked '↳ in container' are timed INSIDE the node — the rest arou
 echo "histogram bins are shared down each section, so further right really is slower"
 echo
 [ "$INTERLEAVED" = "0" ] && echo "  BENCH_INTERLEAVED=0: rows run consecutively. Expect the controls to disagree — that is the point."
-run_rows 0 $(( SINGLES - 1 ))
-render 0 $(( SINGLES - 1 ))
+if [ -z "$CHECK" ]; then
+  run_rows 0 $(( SINGLES - 1 ))
+  render 0 $(( SINGLES - 1 ))
+fi
 echo
 echo "  the four sampling calls, across every way of issuing them."
 echo "  Axes: sequential vs parallel; one exec or one each; obsidian-cli vs the filesystem."
@@ -379,3 +396,75 @@ for which in ('med', 'p90', 'max', 'span'):
     print(f'    {which:<8} {floor:6.0f}ms   >{2 * floor:5.0f}ms   {inside} of {len(ot)} are inside it')" \
   ${SAMP[$CA]} -- ${SAMP[$CB]} -- ${SAMP[$CSAME]} == $ALL
 echo
+
+# --- the verdict, for check-assumptions ---------------------------------------------------------
+#
+# The harness picked its two arrangements from this table (docs/DESIGN.md, "How the calls are
+# issued"): the sampler issues its four calls UNBATCHED + PARALLEL, and the write path, which cannot
+# be parallel because each call depends on the last, goes BATCHED + SEQUENTIAL. Both were fast here
+# under Obsidian 1.13.7 and Docker on macOS. Neither is a law about Obsidian; both are measurements
+# of one environment, and an engine or a CLI that changed what an exec costs would move them.
+#
+# So the question asked here is not "how fast", it is "is the cell the code uses still among the fast
+# ones". A cell is called slow when its median stands more than twice this run's noise floor clear of
+# the best cell in the table — the same 2x the row markers use, and for the same reason: the floor is
+# the range of three medians, which understates the spread, and every difference this benchmark has
+# reported among the fast cells has evaporated on re-measurement.
+if [ -n "$CHECK" ]; then
+  ROWARGS=()
+  for i in $(seq "$SINGLES" $(( ${#LABELS[@]} - 1 ))); do
+    ROWARGS+=("${LABELS[$i]}|$(echo ${SAMP[$i]} | tr ' ' ',')")
+  done
+  python3 -c "
+import sys, statistics
+
+FLOOR = float(sys.argv[1])
+rows = {}
+for a in sys.argv[2:]:
+    label, _, vals = a.partition('|')
+    v = sorted(float(x) * 1000 for x in vals.split(',') if x)
+    if v: rows[label.strip()] = statistics.median(v)
+
+# The two the code uses. Named by the exact labels above; a rename there must break this loudly
+# rather than silently check nothing.
+USED = {
+    'unbatched, parallel    (cli)': 'the sampler (ObsidianDriver.sampleNotes)',
+    'batched,   sequential  (cli)': 'the write path (ObsidianDriver.editAndConfirm)',
+}
+missing = [k for k in USED if k not in rows]
+if missing:
+    print('  -- cannot check: no row labelled ' + '; '.join(repr(m) for m in missing))
+    sys.exit(2)
+
+best = min(rows.values())
+margin = 2 * FLOOR
+bad = []
+print()
+print(f'  best cell {best:.0f}ms; noise floor {FLOOR:.0f}ms, so \"noticeably worse\" is more than {margin:.0f}ms above it')
+for label, why in sorted(USED.items()):
+    med = rows[label]
+    over = med - best
+    verdict = 'ok' if over <= margin else '--'
+    print(f'  {verdict}  {label}  {med:6.0f}ms  ({over:+.0f}ms vs best)   {why}')
+    if over > margin: bad.append((label, med, over, why))
+
+if not bad:
+    print()
+    print('  ok  both arrangements the design uses are still among the fast ones')
+    sys.exit(0)
+print()
+print('  -- the design uses an arrangement that is no longer among the fast ones:')
+for label, med, over, why in bad:
+    print(f'       {why}')
+    print(f'       uses {label.strip()}, now {over:.0f}ms above the best cell')
+print()
+print('     These were the arguably best arrangements under the Obsidian and container engine of')
+print('     the day; they are measurements, not properties of Obsidian. If one is now noticeably')
+print('     worse than the rest, the design should probably be revised: see docs/DESIGN.md,')
+print('     \"How the calls are issued\", and the comments on the two methods named above.')
+# 3, not 1: a slow cell is a finding about the DESIGN, while 1 and 2 mean this benchmark could not
+# answer at all (a command broke, or a row label was renamed out from under the check).
+sys.exit(3)
+" "${FLOORS##* }" "${ROWARGS[@]}"
+  exit $?
+fi

@@ -48,7 +48,18 @@ CLI=/opt/obsidian/obsidian-cli
 
 fails=0
 step=0
-say()  { step=$((step + 1)); printf '\n[%d/11] %s\n' "$step" "$1"; }
+# say <description> [command...] — the step header, then the command(s) it is about to run, so a
+# FAIL below can be re-run by hand without first reading this script to work out what it did. The
+# commands are written out at each call site rather than derived, which means they can drift from
+# what actually runs; they are worth more than nothing and less than the code, so anything printed
+# here must stay copy-pasteable.
+say()  {
+  step=$((step + 1))
+  printf '\n[%d/12] %s\n' "$step" "$1"
+  shift
+  for _c in "$@"; do printf '        $ %s\n' "$_c"; done
+  return 0
+}
 ok()   { printf '      ok   %s\n' "$1"; }
 bad()  { printf '      FAIL %s\n' "$1" >&2; fails=$((fails + 1)); }
 note() { printf '      --   %s\n' "$1"; }
@@ -57,7 +68,7 @@ echo "check-assumptions: engine=$CONTAINER_ENGINE image=$IMAGE:$OBSIDIAN_VERSION
 
 # 1. The engine itself. Everything below is meaningless if this isn't answering, and "which engine
 #    and which version" is precisely the thing that changes under you between sessions.
-say "container engine responds"
+say "container engine responds" "$CONTAINER_ENGINE --version"
 if ver=$("$CONTAINER_ENGINE" --version 2>&1); then
   ok "$ver"
 else
@@ -84,6 +95,30 @@ if [ -z "$live" ]; then
   exit 1
 fi
 
+# And is Sync actually RUNNING on them? A fresh container boots paused, and nothing in
+# `containers-up` changes that. Paused, this script does not fail — it answers. Step 7's blocking
+# claims, step 8's write path, step 9's divergence and step 10's race all read differently against a
+# node whose Sync was never started, and the verdict at the end would say the apparatus is sound.
+#
+# A STOP rather than a `sync on`: resuming here would make the script the thing that set the world
+# up, and a `paused` nobody noticed would go on being unnoticed everywhere else.
+#
+# Only positively-reported off-states count. A node that does not answer is not a paused node, and
+# is step 6's business, not this one's.
+paused=""
+for n in $(echo "$NODES" | tr ',' ' '); do
+  st=$("$CONTAINER_ENGINE" exec "$n" "$CLI" sync:status 2>/dev/null | sed -n 's/^status:[[:space:]]*//p' | head -1)
+  case "$st" in paused|error|stopped|offline) paused="$paused $n($st)" ;; esac
+done
+if [ -n "$paused" ]; then
+  echo >&2
+  echo "check-assumptions: STOP — Sync is not running on:$paused" >&2
+  echo "  A fresh container boots paused; these checks would answer without Sync ever taking part." >&2
+  echo >&2
+  echo "  Run:  make unpause-sync && make check-assumptions" >&2
+  exit 1
+fi
+
 # 2. The test network. What matters is NOT which subnet it happens to carry — any private range
 #    would do — but whether the addresses this harness actually pins are assignable inside it.
 #    Every node is started and reconnected with an explicit `--ip`, so if the network's subnet
@@ -96,7 +131,7 @@ fi
 #    The nasty case is a network that ALREADY EXISTS with the wrong subnet — left over from an
 #    older Makefile that created it without `--subnet`, or made by hand. `make net` is idempotent
 #    and skips creating it, so a wrong one survives indefinitely.
-say "test container network is as expected"
+say "test container network is as expected" "$CONTAINER_ENGINE network inspect $NET"
 
 # Portable dotted-quad <-> integer, arithmetic only: no shifts (whose signedness varies) and no
 # bitwise ops (which POSIX sh has, but dash/ash disagree on for 32-bit-boundary values).
@@ -183,7 +218,9 @@ fi
 #    not a standalone binary, so `obsidian-cli version` in a bare container answers "The CLI is
 #    unable to find Obsidian" — there is no headless mode. The version comparison therefore needs
 #    a live node, and happens in step 6 with the rest of the live-node checks.
-say "node image $IMAGE:$OBSIDIAN_VERSION is present and ships the CLI"
+say "node image $IMAGE:$OBSIDIAN_VERSION is present and ships the CLI" \
+    "$CONTAINER_ENGINE image inspect $IMAGE:$OBSIDIAN_VERSION" \
+    "$CONTAINER_ENGINE run --rm --entrypoint /bin/sh $IMAGE:$OBSIDIAN_VERSION -c 'test -x $CLI && echo present'"
 if ! "$CONTAINER_ENGINE" image inspect "$IMAGE:$OBSIDIAN_VERSION" >/dev/null 2>&1; then
   bad "no such image — run 'make build-image' (or 'make list-images' to see what is built)"
 else
@@ -199,7 +236,8 @@ fi
 # 4. Advisory only: how far behind the pin is. After a long break the useful signal is simply
 #    "there are newer releases" — never a failure, since testing an older build is legitimate
 #    (and bisecting across releases is an explicit workflow here).
-say "pinned Obsidian vs upstream (advisory)"
+say "pinned Obsidian vs upstream (advisory)" \
+    "curl -fsSL https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/desktop-releases.json"
 latest=$(curl -fsSL https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/desktop-releases.json 2>/dev/null \
          | sed -n 's/.*"latestVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 if [ -z "$latest" ]; then
@@ -213,7 +251,8 @@ fi
 # 5. The fault primitive. A D/C must still be a brief link blip rather than a network reset, or
 #    every history containing D/C tests something other than what it says. Nothing else exercises
 #    this: a history with no `D` never touches it, so it needs its own deliberate measurement.
-say "a D/C reconnect is still a brief blip (check-net, $ROUNDS rounds x 10s outage)"
+say "a D/C reconnect is still a brief blip (check-net, $ROUNDS rounds x 10s outage)" \
+    "ROUNDS=$ROUNDS $here/check-net.sh $ROUNDS 10 1.0"
 if ROUNDS="$ROUNDS" "$here/check-net.sh" "$ROUNDS" 10 1.0; then
   ok "reconnect stays within budget on its pinned IP"
 else
@@ -225,7 +264,8 @@ fi
 #    format change is the likeliest breakage right after an Obsidian upgrade — i.e. right when
 #    this script gets run — check it up front. Needs live nodes, so it goes last; with them down
 #    it FAILS rather than skipping (see the header: an unanswered check must never read as PASS).
-say "obsidian-cli output still parses (nodes: $NODES)"
+say "obsidian-cli output still parses (nodes: $NODES)" \
+    "npm run check-cli -- --nodes $NODES"
 npm run --silent check-cli -- --nodes "$NODES"
 case $? in
   0) ok "every command the harness depends on is still recognized" ;;
@@ -239,7 +279,8 @@ esac
 #    until a node is synced; if it stopped blocking, a probe timeout would no longer mean "not
 #    synced yet" and every settle would be reading noise. Per-attempt capping likewise assumes sync
 #    reads can hang. Measured, not asserted: see docs/DESIGN.md.
-say "sync:status / sync:history still block the way the settle assumes"
+say "sync:status / sync:history still block the way the settle assumes" \
+    "npm run probe-sync-versions -- --check"
 if npm run --silent probe-sync-versions -- --check; then
   ok "the bounded-probe design still rests on true behaviour"
 else
@@ -259,8 +300,10 @@ fi
 #    Both measured against obsidian-cli 1.13.7 on 2026-09-06. Neither is documented by Obsidian, so
 #    an upgrade can change either without warning — exactly the silent-wrong-experiment shape this
 #    script exists to catch.
-say "the write path's create-vs-append CLI behaviour is unchanged"
 probe="bughunt/check-assumptions-write-$$"
+say "the write path's create-vs-append CLI behaviour is unchanged" \
+    "$CONTAINER_ENGINE exec $live $CLI append 'file=$probe' 'content=(x)'   # expect: not found" \
+    "$CONTAINER_ENGINE exec $live $CLI create 'path=$probe.md' 'content=(second)'   # expect: original intact"
 cli() { "$CONTAINER_ENGINE" exec "$live" "$CLI" "$@" 2>&1; }
 cli delete "file=$probe" >/dev/null 2>&1 || true
 cli delete "file=$probe 1" >/dev/null 2>&1 || true
@@ -318,12 +361,27 @@ cli delete "file=$probe 1" >/dev/null 2>&1 || true
 #    Note that 20/20 says loss is RARE here, not impossible: this provocation's divergence window is
 #    only as wide as two back-to-back appends, far tighter than a real `D...C` history, and it will
 #    widen on a slower or busier machine. That is exactly why absence must not fail.
-say "a real divergence still produces a conflict file, not a merge"
 cg_live=""
 for n in $(echo "$NODES" | tr ',' ' '); do
   "$CONTAINER_ENGINE" exec "$n" true >/dev/null 2>&1 && cg_live="$cg_live $n"
 done
 set -- $cg_live
+# The provocation itself, rather than a pointer at this script: no single command reproduces the
+# step, and the sequence IS the experiment. Re-runnable by hand against any note name.
+if [ "$#" -ge 2 ]; then
+  # Printed resolved, not as the formula: a command nobody can paste is not worth a line. Same guard
+  # cg_ip uses below, so a node whose name is not nN prints a placeholder instead of an arithmetic error.
+  case "${2#n}" in ""|*[!0-9]*) cgB_ip="<its pinned ip>" ;; *) cgB_ip="10.89.0.$((100 + ${2#n}))" ;; esac
+  say "a real divergence still produces a conflict file, not a merge" \
+    "$CONTAINER_ENGINE exec $1 $CLI create 'path=<note>.md' 'content=(base)'   # then wait for it on $2" \
+    "$CONTAINER_ENGINE network disconnect $NET $2" \
+    "$CONTAINER_ENGINE exec $1 $CLI append 'file=<note>' 'content=(from-$1)'" \
+    "$CONTAINER_ENGINE exec $2 $CLI append 'file=<note>' 'content=(from-$2)'" \
+    "$CONTAINER_ENGINE network connect --ip $cgB_ip $NET $2" \
+    "$CONTAINER_ENGINE exec $2 $CLI files 'folder=bughunt'   # expect: a (Conflicted copy ...) sibling"
+else
+  say "a real divergence still produces a conflict file, not a merge"
+fi
 if [ "$#" -lt 2 ]; then
   note "SKIPPED — needs two live nodes, found $#; a PASS below does NOT cover conflict-file mode"
 else
@@ -450,11 +508,13 @@ fi
 #
 #    The gap between the appends is reported, never asserted on: below ~370ms it has conflicted
 #    33 times out of 34, above ~390ms never, and near the boundary it is a distribution.
-say "N1AaN2Aa still produces a conflict file (no partition, timing only)"
 # Whether the checks above passed, read before this step adds to the count. Only used to say so in
 # the loss message — a reader deciding whether to trust this result wants to know.
 pre10_fails=$fails
+race_clean=0
 race_dir="./check-assumptions-runs/step10-$(date -u +%Y%m%dT%H%M%SZ)"
+say "N1AaN2Aa still produces a conflict file (no partition, timing only)" \
+    "npm run start -- --history N1AaN2Aa --repeat 3 --runs-dir ${race_dir#./} --display off"
 rm -rf "$race_dir"
 # Not runs/: corpus.ts parses a run directory as `<ts>-<history>` and analyze.ts groups by the
 # directory name, so a telltale name there would enter the corpus tables as a bogus history.
@@ -504,7 +564,7 @@ PY
   echo "$race_out" | while IFS= read -r l; do note "$l"; done
   if [ "$race_rc" -eq 0 ]; then
     ok "3/3 reps diverged and conflicted"
-    rm -rf "$race_dir"
+    race_clean=1
   else
     bad "N1AaN2Aa did not produce a conflict file in every rep"
     note "rep logs kept: $race_dir"
@@ -539,6 +599,10 @@ PY
   fi
   # Leave the vault as we found it. Driven off the LISTING rather than the log's conflict-file
   # events, which are not a complete inventory. Deleted on one node; the deletion propagates.
+  #
+  # BEFORE the logs are discarded, not after: the note names come out of those logs, so deleting
+  # them first left this loop with nothing to iterate and the reps' notes in the vault — on the
+  # PASSING path only, which is the one nobody looks at.
   race_notes=$(python3 - "$race_dir" <<'PY'
 import json, sys, pathlib
 out = set()
@@ -557,6 +621,7 @@ PY
         "$CONTAINER_ENGINE" exec "$live" "$CLI" delete "file=${f%.md}" >/dev/null 2>&1 || true
       done
   done
+  [ "${race_clean:-0}" = 1 ] && rm -rf "$race_dir"
 fi
 
 # 11. Advisory: how fast a change actually reaches the other node. NOT a showstopper check — these
@@ -564,12 +629,35 @@ fi
 #    is read, and how patient a `W<n>` has to be, so a silent shift is exactly the kind of thing
 #    that leaves old conclusions standing on a floor that moved. It prints its own verdict; the exit
 #    code is reserved for a change that never arrived at all, which is breakage rather than drift.
-say "sync propagation is still as fast as recorded (advisory)"
+say "sync propagation is still as fast as recorded (advisory)" \
+    "npm run probe-propagation"
 if npm run --silent probe-propagation; then
   :
 else
   bad "a change never arrived at the peer at all — that is not drift, something is broken"
 fi
+
+# 12. Advisory: are the two call arrangements the harness actually uses still among the fast ones?
+#
+#    The sampler issues its four calls unbatched + parallel; the write path, whose calls each depend
+#    on the last, goes batched + sequential. Those were the arguably best arrangements measured
+#    against the Obsidian and container engine of the day — measurements of one environment, not
+#    properties of Obsidian, and an engine that changed what an exec costs would move them.
+#
+#    Advisory, like step 11: a slower cell does not invalidate a result, it means a design choice
+#    has gone stale. The exit code is reserved for the benchmark failing to answer at all, which is
+#    breakage — a composed row that no longer runs, or a row label renamed out from under the check.
+#
+#    Reduced sample count (BENCH_CHECK's own default) because the question is "is this cell still
+#    fast", not "how fast". `make bench-cli` is the full table.
+say "the call arrangements the design uses are still among the fast ones (advisory)" \
+    "BENCH_CHECK=1 bash $here/bench-cli.sh $live"
+BENCH_CHECK=1 bash "$here/bench-cli.sh" "$live"
+case $? in
+  0) ok "both arrangements the design uses are still among the fast ones" ;;
+  3) note "see above: an arrangement the design uses is no longer among the fast ones" ;;
+  *) bad "bench-cli could not answer — a command it depends on broke, or a row it checks was renamed" ;;
+esac
 
 # The deferred half of step 3: does the Obsidian actually running in a node self-report the version
 # its image is tagged with? An image that drifted from its tag would mislabel every run's results.

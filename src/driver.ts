@@ -13,11 +13,12 @@
 
 import assert from "node:assert/strict";
 import type { Executor } from "./exec.js";
-import type { ExecResult, FileVersion, OpResult, SyncVersion } from "./types.js";
+import type { ExecResult, FileVersion, OpResult, SyncHistoryVersion, SyncVersion } from "./types.js";
 import {
   CliUnrecognizedOutput, UNRECOGNIZED, type Unrecognized,
   parseRead, parseFilesList, parseSyncStatus, parseTotal, parseSyncRead,
-  parseSyncVersions, parseFileVersions, parseMutation, parseSyncHistory, parseVaultName, isNotFoundError,
+  parseSyncVersions, parseFileVersions, parseMutation, parseSyncHistory, parseSyncHistoryVersions,
+  parseVaultName, isNotFoundError,
 } from "./cli-parse.js";
 import { CliInconsistencyError } from "./inconsistency.js";
 
@@ -274,6 +275,12 @@ export class ObsidianDriver {
    * The write is issued ONCE, never retried inside here, for the same reason `runMutationOnce`
    * exists: a retried append that actually landed the first time duplicates a token and trips the
    * duplication oracle.
+   *
+   * BATCHED, SEQUENTIAL is not a preference here, it is forced: each call depends on the one before
+   * it, and unbatched + sequential is the single arrangement `make bench-cli` finds slow — it pays
+   * the exec round trip once per call end to end. Batching is what keeps a path that has to be
+   * sequential out of that cell. Measured against Obsidian 1.13.7 under Docker on macOS; see
+   * `docs/DESIGN.md`, "How the calls are issued", and check-assumptions, which re-measures it.
    */
   async editAndConfirm(
     name: string,
@@ -458,24 +465,24 @@ export class ObsidianDriver {
   }
 
   /**
-   * One node's whole picture for a set of notes, in one round trip: its sync state, the folder
-   * listing, and each note's server version count, content and conflict files.
+   * One node's whole picture for a set of notes: its sync state, the folder listing, and each note's
+   * server version count, content and conflict files.
    *
-   * All of it batched, because the round trip is the cost — this replaces `1 + 2*notes` separate
-   * execs with one (two when conflict files exist and must be read). Bounded and non-retrying like
-   * the other `snapshot*` calls: a look, never a judgment. Every reply is parsed by the same parser
-   * it would have had alone; a batch that cannot be split returns `ok: false`.
+   * Issued as separate execs, all in flight at once — see the note on the call below, and
+   * `docs/DESIGN.md`, "How the calls are issued". Bounded and non-retrying like the other
+   * `snapshot*` calls: a look, never a judgment. Every reply is parsed by the same parser it would
+   * have had alone.
    *
    * Conflict files matter here because a token sitting in one is NOT lost — the oracle counts it as
    * `onlyInConflict`. A sampler that read the note alone would report loss the moment a merge moved
    * a token into a conflict copy, which is a different and much less serious thing.
    */
-  async sampleNotes(folder: string, notes: string[], timeoutMs: number): Promise<{
+  async sampleNotes(folder: string, notes: string[], timeoutMs: number, withUploads = false): Promise<{
     ok: boolean;
     sync: string;
-    per: Map<string, { versStatus: string; vers: number | null; fileStatus: string; content: string; conflicts: string[]; inconsistent: boolean; versRaw?: string; fileRaw?: string }>;
+    per: Map<string, { versStatus: string; vers: number | null; uploads?: SyncHistoryVersion[]; fileStatus: string; content: string; conflicts: string[]; inconsistent: boolean; versRaw?: string; fileRaw?: string }>;
   }> {
-    const per = new Map<string, { versStatus: string; vers: number | null; fileStatus: string; content: string; conflicts: string[]; inconsistent: boolean; versRaw?: string; fileRaw?: string }>();
+    const per = new Map<string, { versStatus: string; vers: number | null; uploads?: SyncHistoryVersion[]; fileStatus: string; content: string; conflicts: string[]; inconsistent: boolean; versRaw?: string; fileRaw?: string }>();
 
     // PARALLEL, not batched — though the honest reason is weaker than it once looked. An early
     // measurement said 371ms batched against 284ms as parallel execs; running the full matrix
@@ -487,10 +494,22 @@ export class ObsidianDriver {
     // call its own timeout for free. The write path batches for a different and still-valid reason —
     // it is inherently sequential (read, write, read back), so unbatched would put it in the one
     // slow cell.
+    //
+    // THIS IS A MEASUREMENT, AND IT IS OF ONE ENVIRONMENT: Obsidian 1.13.7 under Docker on macOS.
+    // It holds because the exec round trip dominates, and an engine or CLI that changed that would
+    // move the whole ranking. `make bench-cli` re-measures all eight cells; check-assumptions runs
+    // it and complains if this cell stops being among the fast ones.
     const [sync, listing, ...reads] = await Promise.all([
       this.syncStateProbe(timeoutMs),
       this.snapshotFiles(folder, timeoutMs),
-      ...notes.flatMap((n) => [this.snapshotVersionsTotal(n, timeoutMs), this.snapshotRead(n, timeoutMs)]),
+      // `withUploads` swaps `sync:history total` for the LISTING, which is the same call without the
+      // flag: measured 87-117ms against the counter's 83-176ms, and `total` equals the row count, so
+      // it is strictly more information at the same price. Off by default — the harness needs only
+      // the count, and a caller should opt into carrying rows it will not read.
+      ...notes.flatMap((n) => [
+        withUploads ? this.snapshotSyncHistory(n, timeoutMs) : this.snapshotVersionsTotal(n, timeoutMs),
+        this.snapshotRead(n, timeoutMs),
+      ]),
     ]);
     const files = listing.status === "ok" ? (listing.entries ?? []) : [];
     // A listing that timed out or could not be parsed has NO OPINION, so it must not be allowed to
@@ -499,7 +518,8 @@ export class ObsidianDriver {
 
     const wanted: string[] = []; // conflict copies to fetch, usually none
     notes.forEach((n, i) => {
-      const tot = reads[i * 2] as Awaited<ReturnType<ObsidianDriver["snapshotVersionsTotal"]>>;
+      const tot = reads[i * 2] as Awaited<ReturnType<ObsidianDriver["snapshotVersionsTotal"]>>
+        & Awaited<ReturnType<ObsidianDriver["snapshotSyncHistory"]>>;
       const rd = reads[i * 2 + 1] as Awaited<ReturnType<ObsidianDriver["snapshotRead"]>>;
       const mine = ObsidianDriver.conflictsOf(files, n);
       wanted.push(...mine);
@@ -510,7 +530,10 @@ export class ObsidianDriver {
       const inconsistent = ObsidianDriver.listingContradictsRead(present, listingUsable, files, n);
       per.set(n, {
         versStatus: tot.status,
-        vers: tot.status === "ok" ? (tot.total ?? null) : null,
+        // One number from either form: the counter, or the listing's length. They agree — measured
+        // from a note's genesis onward, `total` and the row count matched at every reading.
+        vers: tot.status !== "ok" ? null : (tot.total ?? tot.versions?.length ?? null),
+        ...(tot.versions !== undefined ? { uploads: tot.versions } : {}),
         fileStatus: inconsistent ? "inconsistent" : rd.status,
         content: present ? (rd.content ?? "") : "",
         conflicts: [],
@@ -664,6 +687,17 @@ export class ObsidianDriver {
    * node as `-TIMEOUT`). Unlike `run`, a timeout here is EXPECTED, not an outage, so it never
    * reaches the killed→CliInconsistencyError path.
    */
+  /** Is this node's container answering at all? True only when the ENGINE call itself succeeded —
+   *  the CLI's own exit code is never trusted (see docs/cli-trust.md), but `exec` failing to reach a
+   *  container is the engine's answer, not the CLI's, and that one is meaningful.
+   *
+   *  Deliberately `version` rather than `sync:status`: the latter BLOCKS until the node is synced,
+   *  so a busy but perfectly healthy node would time out and read as absent. */
+  async reachable(timeoutMs: number): Promise<boolean> {
+    const raw = await this.executor.exec(["version"], { timeoutMs });
+    return !raw.killed && raw.code === 0;
+  }
+
   async syncStateProbe(timeoutMs: number): Promise<string> {
     assert(timeoutMs > 0, "syncStateProbe needs a positive timeout");
     const raw = await this.executor.exec(["sync:status"], { timeoutMs });
@@ -761,6 +795,29 @@ export class ObsidianDriver {
     return { status: "ok", name: r };
   }
 
+  /**
+   * When this note's versions were UPLOADED, newest first, as the server recorded it.
+   *
+   * The one per-NOTE upload signal the CLI exposes. `sync:status` is per node, so with two notes
+   * outstanding on one writer it cannot say which upload a `synced` refers to; these rows can,
+   * because each carries its own note, time and producing device.
+   *
+   * Bounded and non-retrying, like the other `snapshot*` calls: a look, never a judgment. The
+   * ENTRY becomes visible only once a peer has the data (the same lag `snapshotVersionsTotal`
+   * documents), but the TIME inside it is the upload's, so this reads the past accurately rather
+   * than reporting the present promptly.
+   */
+  async snapshotSyncHistory(name: string, timeoutMs: number): Promise<{
+    status: "ok" | "absent" | "unrecognized" | "timeout"; versions?: SyncHistoryVersion[]; raw?: string;
+  }> {
+    const raw = await this.executor.exec(["sync:history", `file=${name}`], { timeoutMs });
+    if (raw.killed) return { status: "timeout" };
+    const r = parseSyncHistoryVersions(raw.stdout);
+    if (r === UNRECOGNIZED) return { status: "unrecognized", raw: raw.stdout };
+    if (r === "absent") return { status: "absent" };
+    return { status: "ok", versions: r };
+  }
+
   /** Raw server-side sync version listing for a note. !ok = positively absent. */
   async syncHistory(name: string): Promise<OpResult> {
     const { value: r, raw } = await this.runRecognized("sync:history", [`file=${name}`], parseSyncHistory);
@@ -802,6 +859,54 @@ export class ObsidianDriver {
 }
 
 // --- shared helpers ----------------------------------------------------------
+
+/** The states in which a node's Sync is NOT running. A fresh container boots `paused` and stays
+ *  that way until something resumes it — run.ts's preflight, or `make unpause-sync` by hand.
+ *
+ *  `timeout` and `?` are deliberately absent: a call that was killed, or answered with something
+ *  unrecognized, carries no positively-confirmed state, and treating a non-answer as "off" would
+ *  invent the very condition this set exists to detect. Absence is checked separately, below. */
+export const SYNC_OFF_STATES = new Set(["paused", "error", "stopped", "offline"]);
+
+/**
+ * Refuse to start against nodes that cannot answer, or whose Sync is not running.
+ *
+ * For the tools that reach the nodes WITHOUT going through run.ts's preflight — probe-propagation,
+ * probe-sync-versions — each of which otherwise runs to completion against a broken world and
+ * reports the damage as data.
+ *
+ * TWO conditions, because they fail in opposite directions and one cannot stand in for the other:
+ *
+ *   - ABSENT. `<engine> exec` itself fails. A down node cannot be detected from `sync:status`: the
+ *     reply is empty, which parses as unrecognized, which is `?` — and `?` must stay non-committal
+ *     for the reason above. Probed with `version`, which is cheap and, unlike `sync:status`, does
+ *     not block. Without this the propagation probe ran its whole history against nothing, printing
+ *     one `sync-status-unreadable` line per call and creating whatever it could.
+ *   - PAUSED. Reachable, answering, but Sync was never started.
+ *
+ * It asserts rather than repairs, the same choice assertLocalSyncOn makes: a tool that quietly
+ * fixed the world would be measuring a world other than the one the operator set up.
+ */
+export async function assertNodesReady(drivers: ObsidianDriver[], probeMs = 10_000): Promise<void> {
+  const absent: string[] = [];
+  await Promise.all(drivers.map(async (d) => {
+    const raw = await d.reachable(probeMs);
+    if (!raw) absent.push(d.node);
+  }));
+  if (absent.length > 0) {
+    throw new Error(
+      `node(s) not answering: ${absent.join(", ")} — is \`make containers-up\` done, and are the ` +
+      `containers actually running? Nothing was run.`,
+    );
+  }
+  const states = await Promise.all(drivers.map((d) => d.syncStateProbe(probeMs)));
+  const off = drivers.map((d, i) => [d.node, states[i]] as const).filter(([, st]) => SYNC_OFF_STATES.has(st));
+  if (off.length === 0) return;
+  throw new Error(
+    `Sync is not running on ${off.map(([n, st]) => `${n} (${st})`).join(", ")} — a fresh container ` +
+    `boots paused. Resume it with \`make unpause-sync\` and re-run.`,
+  );
+}
 
 export function isConflictFile(name: string): boolean {
   // e.g. "Meeting notes (Conflicted copy MyMacBook2 202411281430).md"
