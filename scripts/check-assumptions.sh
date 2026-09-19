@@ -494,7 +494,7 @@ else
   cg_restore
 fi
 
-# 10. `N1AaN2Aa` still produces a conflict file, with no partition to force it.
+# 10. `N1AaN2Aa` still conflicts, with no partition to force it — in 2 reps of 4.
 #
 #    Step 9 forces a divergence and asks whether Sync still conflicts it. This asks the other half:
 #    does the canonical race still race? `N1AaN2Aa` is two appends to a note that does not exist
@@ -502,19 +502,33 @@ fi
 #    note reaches the other, so anything the harness does between the two appends can suppress it —
 #    a pre-write `sync:history` read did exactly that on 2026-09-07, and nothing failed.
 #
-#    The ASSERTION is the conflict file. `created` on the two appends is the discriminator that says
-#    which failure this is, not the assertion itself: across 53 reps in runs/, `created: [true,
-#    true]` has produced a conflict file, a clean merge, and a lost token.
+#    The ASSERTION is the conflict file, in 2 REPS OF 4 — not in every rep. Measured over a 90-rep
+#    soak (2026-09-18, Obsidian 1.13.7): 84 conflicted, 3 lost a token, 3 merged. At 93% per rep,
+#    demanding 3 of 3 fails about one run in five, and that is what this step was doing before the
+#    rate was known: flapping between PASS and FAIL with nothing wrong. 2-of-4 fails 0.1% of the
+#    time at that rate, 5% if the rate falls to 75%, 31% if it halves. Coarse on purpose — a change
+#    finer than that is a soak's question, not a four-rep one.
 #
-#    The gap between the appends is reported, never asserted on: below ~370ms it has conflicted
-#    33 times out of 34, above ~390ms never, and near the boundary it is a distribution.
+#    `created` on the two appends is the discriminator for WHY a rep did not conflict, never the
+#    assertion: it was [true, true] in 90 of 90, so the race itself is not the variable.
+#
+#    The gap is reported, never asserted on, and the soak says what it decides:
+#
+#      gap        <130ms   130-400ms   >400ms
+#      outcome    2 of 5 LOST    conflict    merge (3 of 3)
+#
+#    The two narrowest gaps in 90 reps (120ms, 122ms) both lost, so loss concentrates where the race
+#    is tightest rather than falling at random — and every loss so far was `inServer: true`, meaning
+#    the token is in the server's version history but in no node's note and no conflict copy. A user
+#    would see no conflict file and never know. The merges are entirely a wide-gap effect, which
+#    retires the "unexplained create-create merge" question DESIGN used to carry.
 # Whether the checks above passed, read before this step adds to the count. Only used to say so in
 # the loss message — a reader deciding whether to trust this result wants to know.
 pre10_fails=$fails
 race_clean=0
 race_dir="./check-assumptions-runs/step10-$(date -u +%Y%m%dT%H%M%SZ)"
-say "N1AaN2Aa still produces a conflict file (no partition, timing only)" \
-    "npm run start -- --history N1AaN2Aa --repeat 3 --runs-dir ${race_dir#./} --display off"
+say "N1AaN2Aa still conflicts: 2+ of 4 reps (no partition, timing only)" \
+    "npm run start -- --history N1AaN2Aa --repeat 4 --runs-dir ${race_dir#./} --display off"
 rm -rf "$race_dir"
 # Not runs/: corpus.ts parses a run directory as `<ts>-<history>` and analyze.ts groups by the
 # directory name, so a telltale name there would enter the corpus tables as a bogus history.
@@ -524,7 +538,7 @@ rm -rf "$race_dir"
 # than dismiss. Whether the run happened is decided by whether it left rep logs.
 #
 # `cd` because this script runs from any directory but `npm run` does not.
-(cd "$here/.." && npm run --silent start -- --history N1AaN2Aa --repeat 3 \
+(cd "$here/.." && npm run --silent start -- --history N1AaN2Aa --repeat 4 \
    --runs-dir "$here/../${race_dir#./}" --display off) >/dev/null 2>&1 || true
 race_dir="$here/../${race_dir#./}"
 if [ -z "$(find "$race_dir" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
@@ -532,6 +546,25 @@ if [ -z "$(find "$race_dir" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
 else
   race_out=$(python3 - "$race_dir" <<'PY'
 import json, sys, pathlib
+# FOUR reps, and two conflict files are a pass.
+#
+# The conflict file is not certain per rep, and gating on "every rep" was gating on a coin that
+# lands heads 93 times in 100. Measured over a 90-rep soak, 2026-09-18: 84 conflict, 3 lost, 3
+# merged. At that rate "3 of 3" fails about one run in five, which is exactly the flapping this
+# step was doing — no change in Obsidian required to produce it.
+#
+# 2-of-4 costs almost nothing in false alarms and still catches a collapse:
+#
+#   conflict rate   93%    85%    75%    60%    50%    25%
+#   this step fails 0.1%   1.2%   5.1%  17.9%  31.3%  73.8%
+#
+# So it is a coarse gate on purpose: it will not notice the rate halving, and it will not cry wolf.
+# A rate that needs detecting more finely than that needs a soak, not three more reps.
+#
+# LOSS is still printed on every rep that shows it, pass or fail. It is the thing this project
+# hunts, and a passing gate must not swallow it.
+conflicts = 0
+reps = 0
 bad = 0
 for f in sorted(pathlib.Path(sys.argv[1]).glob("*/*.jsonl")):
     ev = [json.loads(l) for l in f.open()]
@@ -543,30 +576,33 @@ for f in sorted(pathlib.Path(sys.argv[1]).glob("*/*.jsonl")):
     gap = round((ap[1]["t"] - ap[0]["t"]) * 1000)
     created = [e["created"] for e in ap]
     v = res[0]["verdict"]["notes"][0]
+    reps += 1
     if v.get("conflictFiles", 0) >= 1:
+        conflicts += 1
         print("ok  %s: gap=%dms conflict file" % (f.stem, gap))
     elif not all(created):
         print("SLOW %s: gap=%dms created=%s — n1's note reached n2 first, so n2 appended to it"
               " instead of creating its own. No divergence, so nothing to conflict." % (f.stem, gap, created))
-        bad += 1
     elif v.get("lost"):
         print("LOSS %s: gap=%dms both nodes created, no conflict file, and %s is in neither the note"
               " nor any conflict copy on either node" % (f.stem, gap, ", ".join(v["lost"])))
-        bad += 1
     else:
         print("MERGE %s: gap=%dms both nodes created and the two edits MERGED into one note with no"
-              " conflict file — see step 9" % (f.stem, gap))
-        bad += 1
-sys.exit(1 if bad else 0)
+              " conflict file — see step 9. Measured: every merge in a 90-rep soak had a gap above"
+              " 400ms, so a merge at a NARROW gap is the surprising one" % (f.stem, gap))
+print("%d of %d reps produced a conflict file (2 needed)" % (conflicts, reps))
+# `bad` is only ever a rep that could not be READ. An outcome is never itself a failure here; the
+# count decides.
+sys.exit(1 if (bad or conflicts < 2) else 0)
 PY
   )
   race_rc=$?
   echo "$race_out" | while IFS= read -r l; do note "$l"; done
   if [ "$race_rc" -eq 0 ]; then
-    ok "3/3 reps diverged and conflicted"
+    ok "the race still conflicts at the rate it should"
     race_clean=1
   else
-    bad "N1AaN2Aa did not produce a conflict file in every rep"
+    bad "N1AaN2Aa produced fewer than 2 conflict files in 4 reps"
     note "rep logs kept: $race_dir"
     case "$race_out" in
       *"SLOW "*)

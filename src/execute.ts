@@ -180,6 +180,21 @@ async function syncState(d: ObsidianDriver, probeMs: number): Promise<string> {
   return d.syncStateProbe(probeMs);
 }
 
+/**
+ * Refuse the local node, and hand back the container number it must be.
+ *
+ * Takes the value as a PARAMETER rather than asserting on the captured `activeNode`. Under
+ * `@types/node`'s assertion signature for `assert`, a guard on a captured variable narrows it for
+ * the rest of the enclosing switch, so the next identical guard reads as provably unnecessary
+ * (TS2367) — a true statement about the types and a false one about the intent, since each guard is
+ * meant to hold on its own. Surfaced by the `@types/node` 22 -> 26 bump, which is the upgrade doing
+ * its job.
+ */
+function refuseLocal(n: number | "local"): number {
+  assert(n !== "local", "the local node must never be disconnected");
+  return n;
+}
+
 const HOST_RECHECK_MS = 5_000; // recheck host connectivity every 5s while it's down
 
 /** If the host (the machine running the harness — not any node) is currently offline, wait for
@@ -1178,22 +1193,24 @@ export async function runHistory(
         }
         break;
       }
-      case "disconnect":
+      case "disconnect": {
         // Defense-in-depth: dsl.ts's assertLocalAlwaysConnected already makes this unreachable
         // via any real history, but never trust a single layer for "never disconnect the local instance".
-        assert(activeNode !== "local", "the local node must never be disconnected");
+        const node = refuseLocal(activeNode);
         // Logged at START: no result of its own beyond "I did the thing" — the actual outcome
         // (each reachability attempt, and how long it took) is network-probe's job, at ITS finish.
-        logger.log({ kind: "disconnecting", node: driverOf(activeNode).node });
-        await isolator.disconnect(driverOf(activeNode).node);
-        offline.add(activeNode);
+        logger.log({ kind: "disconnecting", node: driverOf(node).node });
+        await isolator.disconnect(driverOf(node).node);
+        offline.add(node);
         break;
-      case "connect":
-        assert(activeNode !== "local", "the local node must never be disconnected");
-        logger.log({ kind: "connecting", node: driverOf(activeNode).node });
-        await isolator.connect(driverOf(activeNode).node);
-        offline.delete(activeNode);
+      }
+      case "connect": {
+        const node = refuseLocal(activeNode);
+        logger.log({ kind: "connecting", node: driverOf(node).node });
+        await isolator.connect(driverOf(node).node);
+        offline.delete(node);
         break;
+      }
       case "wait": {
         if (!activeNote) break; // nothing selected to wait on
         // W is the active node's OWN view — a user at that node only knows what their own

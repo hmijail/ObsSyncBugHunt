@@ -8,13 +8,9 @@ Inspired by [Jepsen](https://jepsen.io/), which would be overkill for something 
 
 **I wrote this README personally. Everything else, including the docs/ dir, are Claude artifacts.**
 
-# Motivating example:
+# Some background: data loss in Obsidian Sync
 
-XXX
-
-# Some background
-
-Obsidian is a nice note-taking app. It's closed-source but free. It has a sync service, Obsidian Sync, which is subscription-based. This service has data-losing bugs. A thread in the Obsidian forums has been running for 2 years now gathering complaints, but the devs seem unable to find the problem. They proposed workarounds, but they fail too.
+Obsidian is a nice note-taking app. It's closed-source but free. It has a sync service, Obsidian Sync, which is subscription-based. This service has data-losing bugs. A [thread in the Obsidian forums](https://forum.obsidian.md/t/obsidian-sync-on-iphone-overwrites-newer-data-causing-data-loss/85214?u=hmijail) has been running for 2 years now gathering complaints, but the devs seem unable to find the problem. They proposed workarounds, but they fail too.
 
 I lost data to Obsidian Sync and found that thread. I proposed using e.g. Jepsen to find bugs in a systematic way. There was no response.
 
@@ -25,20 +21,53 @@ So I started guiding the design, following the adversarial/paranoiac themes from
 **So 100% of the design is mine** (and this README), but **the code is 100% Claude's**. In fact, I never used TypeScript; I chose it because it's a language used in the Obsidian ecosystem... and to force myself to stay hands-off and trust Claude.
 
 ## Results
-One result is that it works: the harness finds different sequences of operations that trigger sync bugs in Obsidian.[^1]. Great!
 
-[^1]: (I had plans to make the sequence generator more interesting, but it already finds enough Obsidian Sync bugs as it is, which the devs are not even acking anyway. So no point in improving it 🤷‍♂️)
+One result is that the fuzzer works: the harness finds different sequences of operations that trigger sync bugs in Obsidian, measures their repeatability and even helps understand how the sequence failed. Yay!
 
-The other result is that Claude was increasingly bad at this. Full blog post at XXX
+The other result is that Claude was surprisingly, increasingly bad at this. Full experience report [here](https://hmijail.substack.com/p/building-a-semantic-fuzzer-for-obsidian-sync-in-spite-of-claude).
 
-The summary is that keeping Claude Code (from Opus 4.8 to 5) in a leash tight enough to stop it from doing silly stuff is consuming in multiple ways. It's like an intern that knows far too much for their own good, uses that knowledge to make bad choices... plus periodically forgets important points... but rarely lets go of pointless minutiae. Also, you're responsible for what it remembers, even though you only have coarse tools to control that. Also, those tools keep changing, no one knows how to best use them, and even Anthropic contradict themselves. But everyone has anecdotes and opinions, and something to sell you!
+The summary is that keeping Claude Code in a leash tight enough to stop it from doing silly stuff is consuming in multiple ways. It's like an intern that knows far too much for their own good, uses that knowledge to make bad choices... plus periodically forgets important points... but rarely lets go of pointless minutiae. Also, you're responsible for what it remembers, even though you only have coarse tools to control that. Also, those tools keep changing, no one knows how to best use them, and even Anthropic's instructions are too clear.
 
 So that's a blurry mess. OK, but what did *I* learn from this project? Only things about Claude itself, the stuff that keeps changing. But nothing about the matter at hand. In fact, it's the opposite: I had to teach Claude how to build this.
 
-**If Claude was an intern, I could expect that they learnt something, and if this was a work project maybe even that they'd take over and keep the project moving forward. But Claude doesn't learn.** The wordy, knows-too-much, unwise intern is replaced by a clone every morning, who quickly goes through the code to get an idea of what is what, and looks competent... until you have to do anything serious.
+**If Claude was an intern, I could expect that they learnt something, and if this was a work project maybe even that they'd take over and keep the project moving forward. But Claude doesn't learn.** The wordy, knows-too-much, unwise intern is replaced by a clone every morning, who quickly goes through the code to get an idea of what is what, and then fumbles onward.
 
-In short: this is an **insta-legacy project**, that **ties you to LLMs**, and **requires experience, but doesn't create it**.
+In a nutshell: this is an **insta-legacy project**, that **ties you to LLMs**, and **requires experience, but doesn't create it**.
 
+# Motivating example: let's lose some data
+
+This is one sequence of operations found by the fuzzer. It causes data loss ~100% of the time in Obsidian 1.12 and 1.13.7 (latest as of this writing). Reported 2 months ago,  still not acknowledged nor fixed as of this writing.
+
+Let’s assume you use Obsidian with Sync in your phone and your laptop. Both should set their Sync settings to “Conflict file” mode, which is the [devs’ recommendation hoping to minimize data loss](https://forum.obsidian.md/t/obsidian-sync-on-iphone-overwrites-newer-data-causing-data-loss/85214/33).
+
+Note that this particular bug needs you to finish all the steps within 60 seconds! Later we’ll see why.
+
+1. Set your iPhone on airplane mode; ensure Wifi is also disconnected.
+2. In your laptop, created the note “buggy” (or whatever you want)
+3. In that note, type “laptop”
+4. Wait until Obsidian syncs up and shows the green sync icon (few seconds)
+5. On your phone, create the same note “buggy”
+6. In that note, type “phone”
+7. Disable airplane mode on the phone and wait for sync.
+
+After sync finishes, only the line “laptop” remains in the “buggy” note. That’s to be expected, since there was a conflict; the problem is that a Conflict File should have been created with the “phone” line, but it didn’t. So the line is gone everywhere. And you didn’t dream it: looking at the Sync version history, you’ll see that the line did indeed reach the server.
+
+## Play-by-play timeline view
+
+The fuzzer not only finds the sequence, but allows you to see what exactly happened in each Obsidian instance. For example, for this sequence, the fuzzer would show you a timeline like this:
+
+XXX
+
+'m' means that the expected note exists but is `m`issing a token. The seequence ended in that state (including a grace period), therefore we have a confirmed data loss. The fuzzer confirms this by running many repetitions to calculate how repeatable this scenario is.
+
+## **See** how timings change Sync behavior and hide the bug
+
+I said this example sequence needs all steps happening within 60 seconds. But why? Let's compare what happens if you wait e.g. 60 seconds just before disabling Airplane mode on the phone at step 7 (therefore ensuring that the whole sequence lasts longer than 60 seconds):
+
+XXX
+Look at what happened at second XXX: Obsidian noticed that the network is down and reported that the Sync status was bad. When the network came back up, Obsidian eventually reconnected to Sync, exercising some error recovery path that didn't trigger this particular bug: the conflict file exists now! Even further: since the error condition appeared at second XXX, we can infer that from that moment on this particular bug won't be triggered.
+
+And that is how we know that the original sequence needs to last less than 60 seconds.
 
 # Fuzzer features
 - Sets up multiple Obsidian instances running in containers, prepared to use Obsidian Sync (requires an Obsidian Sync subscription)
@@ -52,17 +81,26 @@ In short: this is an **insta-legacy project**, that **ties you to LLMs**, and **
 - Semi-automatic upgradeability to new Obsidian versions, with self-checks to confirm whether the harness can still deal with the new version or requires modifications.
 
 
-# Requirements
-* Obsidian Sync subscription
+# Prerequisites
+
+* Obsidian Sync subscription (if you want one just to test this project, know that it seems refundable during the first week)
 * Podman or Docker (in macOS, 2 vCPUs / 4GB RAM in the VM is enough for 2 Obsidian containers).
-* Optionally a local (non-containerized) Obsidian instance, to test bugs in the macOS Obsidian version.
+* Node >= 22
+* Python 3
+* A VNC client to make the containerized Obsidian log in to your Sync account (and optionally to watch how Obsidian runs histories)
+* Curl
+* Optional:
+  - Coreutils (for gtimeout)
+  - Fnm (to pin down Node versions)
+  - A local (non-containerized) Obsidian instance, mainly useful to find and test bugs in the macOS Obsidian version. (Needs its CLI activated)
+
+On macOS you can install all the prerequisites with brew, and you can use the standard `Screen Sharing.app` for the VNC connection.
 
 **No LLM is used in the harness. Bugs found can't be hallucinations.**
 
 # Quick start
 
 The test harness will be creating and editing lots of notes on your Sync vault. It will try to keep the vault safe, by only ever acting on notes inside a folder ("bughunt") in your vault. (In any case you should backup your vault; personally, until bugs are fixed I moved my vault out of Sync and into iCloud Drive)
-
 
 `make` is the easy entry point to the project, which maps to other tools as needed. `make help` lists every available command.
 
@@ -72,10 +110,11 @@ Common flow:
 make install && make check        # install (npm ci) + typecheck + unit tests
 
 # Create node and prepare it for Obsidian Sync's login:
-make build-image && make login
-# Connect through VNC to the container (localhost:5900). A pristine Obsidian is waiting. Configure it to Sync to a vault and set it to "create conflict file". Enable the Obsidian CLI.
+make login
+# Connect through VNC to the container (localhost:5901). A pristine Obsidian is waiting. Configure it to Sync to a vault and set it to "Create conflict file". Enable the Obsidian CLI.
 make capture-login                # extracts the settings and login credentials into ./secrets
 make containers-up                # launch n1 + n2 fresh with the captured credentials
+make unpause-sync                 # let the nodes start syncing
 make check-assumptions            # does everything look as expected? (run after updates, etc)
 make clean-data                   # OPTIONAL clean slate: empty the vault + wipe runs/
 
@@ -324,6 +363,7 @@ For our experiments to make sense, we depend on quite a few things that could ch
 
 ```sh
 make containers-up
+make unpause-sync
 make check-assumptions     # when coming back to the project after a long break, a software update, etc
 ```
 
@@ -331,7 +371,7 @@ make check-assumptions     # when coming back to the project after a long break,
 
 `make timeline-rep REP=...` plots the rep's timeline from the data in the given log.
 
-`make probe-propagation` runs histories with the goal of measuring the timings imposed by Obsidian: when is an edited note synced to the server? Are writes batched? How long until the other clients download it? As of 0.13.7, syncs happen immediately on first write, but subsequent ones are spaced to happen once every 10s per note.
+`make probe-propagation` runs histories with the goal of measuring the timings imposed by Obsidian: when is an edited note synced to the server? Are writes batched? How long until the other clients download it? As of 1.13.7, syncs happen immediately on first write, but subsequent ones are spaced to happen once every 10s per note.
 
 `make bench-cli` measures the speed of running various Obsidian sampling commands in a container, sequentially or in parallel, batched or not. It helps ensure that the sampling mechanisms being used are still the fastest available.
 
@@ -381,15 +421,6 @@ Histories are generated by drawing ops randomly, one at a time. There's paramete
 | `OPEN_NOTES` | `--open-notes` | off | make Obsidian open the note being edited in the GUI, allowing the history to be watched as it happens. |
 | `LOSS_GRACE_SEC` | `--loss-grace-sec` | 60 | when `W` detects that Sync is finished but a token is missing, it waits for this long before recording a case of data loss |
 
-
-
-## Tooling
-
-Node is pinned in `.nvmrc`, enforced by `engines` + `engine-strict`; use `npm ci` for lockfile-exact installs.
-
-Podman and Docker on macOS. The images are built with a view to be easy to run on Linux and AWS-EC2, but didn't try.
-
-Developed using Claude Code, with models Opus 4.8 and Opus 5, on a Pro subscription and no extra credits.
 
 ## Project files layout
 

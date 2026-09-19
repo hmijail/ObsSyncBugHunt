@@ -28,6 +28,8 @@
 # every rep's `history` event (see run.ts) — that, not this file, is the authoritative record of
 # what a given run tested.
 VERSION_FILE := obsidian-version
+# The Node pin, read only for the advisory in `tools-advice` — nothing here enforces it (fnm/nvm do).
+VERSION_FILE_NODE := .nvmrc
 ifndef OBSIDIAN_VERSION
 OBSIDIAN_VERSION := $(shell tr -d '[:space:]' < $(VERSION_FILE) 2>/dev/null)
 endif
@@ -191,6 +193,27 @@ help: ## Show this help
 
 install: ## Reproducible install from the lockfile (npm ci)
 	npm ci
+	@$(MAKE) --no-print-directory tools-advice
+
+# Neither tool is required — everything here runs without both — so this only ever prints advice and
+# never fails. Said once, at install, because both are the kind of thing you otherwise discover
+# indirectly: a hang with no diagnosis, or a run on a Node nobody chose.
+.PHONY: tools-advice
+tools-advice:
+	@$(if $(TIMEOUT_BIN),,\
+	  echo "[optional] no 'timeout' on PATH — the engine-hang guard is a no-op, so a wedged Docker/Podman"; \
+	  echo "           hangs instead of failing fast.  brew install coreutils")
+	@want=$$(tr -d '[:space:]' < $(VERSION_FILE_NODE) 2>/dev/null); have=$$(node -v 2>/dev/null | sed 's/^v//'); \
+	  if ! command -v fnm >/dev/null 2>&1; then \
+	    echo "[optional] no 'fnm' on PATH — .nvmrc ($$want) is not enforced, so this project runs on whatever"; \
+	    echo "           node is installed ($$have). engines only requires >=22.  brew install fnm"; \
+	    echo "           then: echo 'eval \"\$$(fnm env --use-on-cd)\"' >> ~/.zshrc  (new shell, then: fnm install)"; \
+	  elif [ -n "$$want" ] && [ "$$want" != "$$have" ]; then \
+	    echo "[optional] fnm is installed but this shell is on node $$have, not .nvmrc's $$want."; \
+	    echo "           Check your shell is set up for fnm (see its installation instructions), then:"; \
+	    echo "           fnm install   and open a new terminal"; \
+	  fi
+
 
 typecheck: ## Type-check the project
 	npm run typecheck
