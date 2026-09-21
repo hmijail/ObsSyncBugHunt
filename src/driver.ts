@@ -402,16 +402,30 @@ export class ObsidianDriver {
   private async batchRecognized<T extends readonly unknown[]>(
     cmds: string[][],
     recognizers: { [K in keyof T]: (stdout: string) => T[K] | Unrecognized },
-  ): Promise<T> {
+    opts?: {
+      /** Per-command caps, as `Executor.execBatch` takes them. Unset entries keep
+       *  `recognizeCallTimeoutMs`, so the oracle-grade commands are unaffected. */
+      perCmdMs?: (number | undefined)[];
+      /** Commands whose non-answer must NOT force a retry or fail the batch. A best-effort slot
+       *  comes back as `UNRECOGNIZED` for the caller to interpret — which is why the returned
+       *  `killed` matters: it is the only thing that tells "blocked" (the node is busy syncing,
+       *  itself a reading) apart from "said something we do not parse". */
+      bestEffort?: boolean[];
+    },
+  ): Promise<{ values: T; killed: boolean[] }> {
+    const required = (i: number): boolean => !(opts?.bestEffort?.[i] ?? false);
     for (let attempt = 0; ; attempt++) {
-      const r = await this.batch(cmds, this.recognizeCallTimeoutMs);
+      const r = await this.batch(cmds, this.recognizeCallTimeoutMs, opts?.perCmdMs);
       // A command killed at its own cap is UNRECOGNIZED here regardless of what it managed to emit:
       // a truncated reply must never be parsed as if it were a complete one. The oracle path retries
       // it; only the bounded sampler is allowed to record "I ran out of time" as an answer.
       const parsed = r.ok
         ? recognizers.map((rec, i) => (r.killed[i] ? UNRECOGNIZED : rec(r.outputs[i])))
         : [UNRECOGNIZED];
-      if (r.ok && !parsed.includes(UNRECOGNIZED)) return parsed as unknown as T;
+      // Only the REQUIRED slots gate the batch. A best-effort slot that did not answer is a gap in
+      // an extra, not a batch that "has not produced a trustworthy picture of that node".
+      const missing = r.ok ? parsed.some((pv, i) => pv === UNRECOGNIZED && required(i)) : true;
+      if (r.ok && !missing) return { values: parsed as unknown as T, killed: r.killed };
       if (attempt >= RECOGNIZE_MAX_RETRIES) {
         // `batch` hands back only ok+outputs, so synthesise the ExecResult the error wants. The
         // joined stdout is what a reader needs to see: which part of the batch was unreadable.
@@ -427,7 +441,7 @@ export class ObsidianDriver {
         // WHICH command was unreadable and what it actually said. "One of these five did not parse"
         // is not something anyone can act on; the offending bytes are.
         unrecognized: r.ok
-          ? parsed.flatMap((pv, i) => pv === UNRECOGNIZED
+          ? parsed.flatMap((pv, i) => pv === UNRECOGNIZED && required(i)
             ? [{ command: cmds[i][0], killed: r.killed[i], stdout: r.outputs[i] }] : [])
           : [],
         // A batch that could not be split has no per-command outputs, so the whole reply is the
@@ -440,21 +454,63 @@ export class ObsidianDriver {
 
   /** The oracle-grade read of one note plus the folder listing, in ONE round trip. Both are
    *  retried-until-recognized together; the caller does the CLI-vs-listing cross-check. */
-  async readWithListing(note: string, folder?: string): Promise<{ canonical: string | null; files: string[] }> {
+  async readWithListing(note: string, folder?: string, versionsMs?: number): Promise<{
+    canonical: string | null;
+    files: string[];
+    /** Only when `versionsMs` was asked for. Same shape `snapshotVersionsTotal` returns, so a
+     *  caller can treat the two interchangeably. */
+    versions?: { status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string };
+  }> {
     const vp = this.vaultParams();
-    const [rd, files] = await this.batchRecognized<[ReturnType<typeof parseRead>, string[]]>(
-      [["read", `file=${note}`, ...vp], ["files", ...(folder ? [`folder=${folder}`] : []), ...vp]],
-      [parseRead, parseFilesList] as never,
+    // The server counter RIDES ALONG in the same exec rather than costing a call of its own. This
+    // runs on every settle poll of every rep, so a second round trip here would be the single most
+    // expensive thing the harness does — see docs/DESIGN.md: the exec round trip is the whole cost,
+    // and a command added to a batch pays only its own work.
+    //
+    // It goes at the HEAD for the same reason the write path puts it there: it is the call most
+    // likely to block (bounded, and on a node with no network it blocks until its cap), so it is
+    // the one that must be capped and the one whose cap must not eat into anything else.
+    //
+    // BEST-EFFORT, and that is load-bearing. `sync:history` blocks on a disconnected node, and `D`
+    // is an ordinary op — letting a blocked counter make this batch "unrecognized" would retry the
+    // oracle-grade read on every settle poll of every history containing a D, and then throw. The
+    // read and the listing keep their old contract exactly; the counter is an extra that may be
+    // absent.
+    const wantVersions = versionsMs !== undefined;
+    const cmds = [
+      ...(wantVersions ? [["sync:history", `file=${note}`, "total", ...vp]] : []),
+      ["read", `file=${note}`, ...vp],
+      ["files", ...(folder ? [`folder=${folder}`] : []), ...vp],
+    ];
+    const recognizers = [...(wantVersions ? [parseTotal] : []), parseRead, parseFilesList];
+    const { values, killed } = await this.batchRecognized<readonly unknown[]>(
+      cmds, recognizers as never,
+      wantVersions
+        ? { perCmdMs: [versionsMs, undefined, undefined], bestEffort: [true, false, false] }
+        : undefined,
     );
-    const r = rd as Exclude<ReturnType<typeof parseRead>, Unrecognized>;
-    return { canonical: r.present ? (r.content ?? null) : null, files };
+    const off = wantVersions ? 1 : 0;
+    const r = values[off] as Exclude<ReturnType<typeof parseRead>, Unrecognized>;
+    const files = values[off + 1] as string[];
+    // Parsed exactly as `editAndConfirm` parses its own baseline, so the two are interchangeable:
+    // killed is a timeout (the node is busy — itself a reading), unparseable is `unrecognized`, and
+    // neither is allowed to affect the read or the listing.
+    const versions = wantVersions
+      ? ((): { status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string } => {
+        if (killed[0]) return { status: "timeout" };
+        const t = values[0] as ReturnType<typeof parseTotal>;
+        if (t === UNRECOGNIZED) return { status: "unrecognized" };
+        return t === "absent" ? { status: "absent" } : { status: "ok", total: t };
+      })()
+      : undefined;
+    return { canonical: r.present ? (r.content ?? null) : null, files, ...(versions ? { versions } : {}) };
   }
 
   /** Oracle-grade reads of several exact vault paths, in one round trip. */
   async readPathsRecognized(paths: string[]): Promise<string[]> {
     if (paths.length === 0) return [];
     const vp = this.vaultParams();
-    const out = await this.batchRecognized<unknown[]>(
+    const { values: out } = await this.batchRecognized<unknown[]>(
       paths.map((p) => ["read", `path=${p}`, ...vp]),
       paths.map(() => parseRead) as never,
     );

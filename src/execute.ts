@@ -371,7 +371,11 @@ export async function waitForSynced(
     if (everySynced) {
       const tGather = Date.now();
       if (baseline === null) baseline = await readTotals(drivers, notes); // synced now → fast
-      obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n))));
+      // The counter is asked for ONLY in strategic mode (`noteObserved` set). In the `everything`
+      // modes `sampleAll` already reads it for every node and note, and asking here too would pay
+      // for the same reading twice and draw two marks in one slot.
+      const versionsMs = noteObserved ? SAMPLE_CAP_MS : undefined;
+      obs = await Promise.all(drivers.flatMap((d) => notes.map((n) => gatherObservation(d, n, versionsMs))));
       assert.equal(obs.length, drivers.length * notes.length, "settle samples every (node, note)");
       // Free: `obs` is already in hand, so dating an arrival costs no read and perturbs no timing.
       arrivals?.observe(obs, logger);
@@ -721,7 +725,7 @@ async function waitOnNode(
       // Only read content from a SYNCED node: the read blocks on one that is still syncing, and
       // returns mid-flux content, which has fabricated a divergence before now.
       const tGather = Date.now();
-      const o = await gatherObservation(d, note);
+      const o = await gatherObservation(d, note, noteObserved ? SAMPLE_CAP_MS : undefined);
       const gatherWallMs = Date.now() - tGather;
       const texts = [o.canonical ?? "", ...o.conflicts.map((c) => c.content)];
       missing = expected.filter((t) => !texts.some((x) => x.includes(t)));
@@ -1071,6 +1075,14 @@ export async function runHistory(
   const noteObserved = sampleAll !== undefined ? undefined : (o: NodeObservation, ms: number): void => {
     logger.log({
       kind: "sample", node: o.node, note: o.note, sync: "synced", ms,
+      // The counter that rode along in the gather's own exec (see gatherObservation). Without it
+      // the vers lane was blank for the whole of a strategic run — the default `make run` — and
+      // "the server has this version" is half of what a timeline is read for. Omitted entirely
+      // when the gather did not get one, so `foldEvents` leaves the lane alone rather than
+      // drawing a reading nobody took.
+      ...(o.versions
+        ? { vers: o.versions.status === "ok" ? (o.versions.total ?? null) : null, versStatus: o.versions.status }
+        : {}),
       ...fileFacts(
         o.node, o.note,
         o.canonical === null ? "absent" : "present",

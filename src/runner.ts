@@ -102,12 +102,19 @@ async function waitForQuiescence(
   }
 }
 
-export async function gatherObservation(d: ObsidianDriver, note: string): Promise<NodeObservation> {
+export async function gatherObservation(
+  d: ObsidianDriver,
+  note: string,
+  /** Cap for the server-counter read that rides along in the same exec. Omit and no counter is
+   *  asked for at all, which is the old behaviour exactly. Bounded and best-effort: it can never
+   *  delay, retry or fail the read and listing this function exists to produce. */
+  versionsMs?: number,
+): Promise<NodeObservation> {
   // Read and listing in ONE round trip, retried together until both parse. The round trip is the
   // whole cost of a CLI call here (an empty container exec measures the same as a `read`, see
   // docs/DESIGN.md), and this runs on every settle poll of every rep — the default path, not just
   // the instrumented modes.
-  const { canonical, files } = await d.readWithListing(note);
+  const { canonical, files, versions } = await d.readWithListing(note, undefined, versionsMs);
   // Anchor (positive identification of the listing): if the note reads as PRESENT, the
   // folder listing MUST contain it. A listing that omits a note we just read is self-
   // inconsistent and can fabricate a false "loss" (see docs/cli-trust.md's founding incident) —
@@ -121,7 +128,7 @@ export async function gatherObservation(d: ObsidianDriver, note: string): Promis
   const mine = ObsidianDriver.conflictsOf(files, note);
   const bodies = await d.readPathsRecognized(mine); // one more round trip, and only when there are any
   const conflicts: ConflictFile[] = mine.map((file, i) => ({ file, content: bodies[i] }));
-  return { node: d.node, note, canonical, conflicts };
+  return { node: d.node, note, canonical, conflicts, ...(versions ? { versions } : {}) };
 }
 
 export async function runDivergenceRound(

@@ -28,6 +28,11 @@ export interface NodeObservation {
   note: string;
   canonical: string | null; // null => the note is absent on this node
   conflicts: ConflictFile[];
+  /** The server's version counter for this note, when the gatherer was asked to pick it up along
+   *  the way. Never part of a VERDICT — the oracle judges content, not counters — it exists so a
+   *  strategic run's `sample` events can carry a `vers` reading and the timeline's vers lane is not
+   *  blank outside the `everything` modes. Absent when it was not asked for or did not answer. */
+  versions?: { status: "ok" | "absent" | "unrecognized" | "timeout"; total?: number; raw?: string };
 }
 
 export interface NoteVerdict {

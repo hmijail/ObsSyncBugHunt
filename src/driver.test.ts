@@ -370,3 +370,83 @@ test("conflictsOf / listingContradictsRead: one implementation, both read paths"
   // An unreadable listing has NO OPINION. Treating it as a contradiction would invent evidence.
   assert.equal(contradicts(true, false, [], "bughunt/a"), false);
 });
+
+// --- the server counter riding along in the observation batch -----------------------------------
+//
+// `readWithListing` is the oracle-grade read on every settle poll of every rep. It optionally picks
+// up `sync:history total` in the SAME exec, so a strategic run's timeline has a vers lane at all.
+// What these pin down is that the extra can never cost the read anything.
+
+/** Answers per COMMAND rather than per call index, so a test can say "sync:history is the one that
+ *  blocks" without counting calls — which is what the interesting case is actually about. */
+class ByCommandExecutor implements Executor {
+  id = "n1";
+  readonly seen: { cmd: string; timeoutMs?: number }[] = [];
+  constructor(private readonly answers: Record<string, string | typeof KILLED>) {}
+  async exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+    this.seen.push({ cmd: args[0], timeoutMs: opts?.timeoutMs });
+    const out = this.answers[args[0]] ?? "";
+    const killed = out === KILLED;
+    return { argv: ["podman", "exec", "n1", "obs", ...args], code: 0, stdout: killed ? "" : out, stderr: "", startedAt: "", durationMs: 0, killed };
+  }
+  async shell(argv: string[]): Promise<ExecResult> {
+    return { argv, code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  }
+}
+
+const READ_A = "(tok)\n";
+const LISTING_A = "bughunt/a.md\n";
+
+test("readWithListing: no versionsMs asks for no counter at all — the old call, unchanged", async () => {
+  const exec = new ByCommandExecutor({ read: READ_A, files: LISTING_A, "sync:history": "9" });
+  const r = await new ObsidianDriver(exec).readWithListing("bughunt/a", "bughunt");
+  assert.equal(r.versions, undefined, "not asked for, so not reported");
+  assert.ok(!exec.seen.some((s) => s.cmd === "sync:history"), "and not even issued");
+});
+
+test("readWithListing: with versionsMs the counter comes back alongside the read", async () => {
+  const exec = new ByCommandExecutor({ read: READ_A, files: LISTING_A, "sync:history": "7" });
+  const r = await new ObsidianDriver(exec).readWithListing("bughunt/a", "bughunt", 500);
+  assert.deepEqual(r.versions, { status: "ok", total: 7 });
+  assert.equal(r.canonical, "(tok)", "the read is unaffected");
+  assert.deepEqual(r.files, ["bughunt/a.md"]);
+});
+
+test("readWithListing: the counter is bounded by versionsMs, the read and listing are not", async () => {
+  // The cap exists because `sync:history` BLOCKS on a node with no network (check-assumptions
+  // step 7). Capping the read too would put the oracle's own call on a clock.
+  const exec = new ByCommandExecutor({ read: READ_A, files: LISTING_A, "sync:history": "7" });
+  await new ObsidianDriver(exec).readWithListing("bughunt/a", "bughunt", 250);
+  const at = (cmd: string) => exec.seen.find((s) => s.cmd === cmd)?.timeoutMs;
+  assert.equal(at("sync:history"), 250, "the counter carries its own cap");
+  assert.notEqual(at("read"), 250, "the read keeps the recognize timeout, not the counter's");
+});
+
+test("readWithListing: a BLOCKED counter is reported as a timeout and costs the read nothing", async () => {
+  // THE case this is all for. `D` is an ordinary op, and a disconnected node blocks `sync:history`.
+  // Before the counter was made best-effort, a blocked one would have made the whole batch
+  // unrecognized: the oracle-grade read retried on every settle poll of every history with a D in
+  // it, and then threw.
+  const exec = new ByCommandExecutor({ read: READ_A, files: LISTING_A, "sync:history": KILLED });
+  const r = await new ObsidianDriver(exec).readWithListing("bughunt/a", "bughunt", 500);
+  assert.deepEqual(r.versions, { status: "timeout" }, "blocked is a reading, not a failure");
+  assert.equal(r.canonical, "(tok)", "the read still answered");
+  assert.deepEqual(r.files, ["bughunt/a.md"]);
+  // `timeout` and `unrecognized` must stay distinct: one says the node is busy syncing, which is
+  // information, and the other says the CLI said something we cannot parse.
+  const garbled = new ByCommandExecutor({ read: READ_A, files: LISTING_A, "sync:history": "not a number\n" });
+  const g = await new ObsidianDriver(garbled).readWithListing("bughunt/a", "bughunt", 500);
+  assert.deepEqual(g.versions, { status: "unrecognized" });
+  assert.equal(g.canonical, "(tok)", "still costs the read nothing");
+});
+
+test("readWithListing: an unanswered READ still fails, counter or no counter", async () => {
+  // The best-effort slot must not have relaxed the required ones. This is the contract the settle
+  // depends on: a read it could not identify is never returned as if it were one. A KILLED read,
+  // not a garbled one — `read` hands back the note's body, so almost any text is a valid reply and
+  // there is nothing to garble.
+  const exec = new ByCommandExecutor({ read: KILLED, files: LISTING_A, "sync:history": "7" });
+  const d = new ObsidianDriver(exec);
+  d.recognizeBackoffMs = 0; // no real waiting in the test
+  await assert.rejects(() => d.readWithListing("bughunt/a", "bughunt", 500), CliUnrecognizedOutput);
+});
