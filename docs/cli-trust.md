@@ -6,6 +6,14 @@ errors), and under load (a wedged container engine, a busy app) a call can retur
 On 2026-06-26 a `files folder=bughunt` came back empty while the conflict files were on disk the whole
 time — read as "no conflicts" → a fabricated "data loss". Never again.
 
+The always-exits-0 half of that keeps catching things outside the parsers, where nobody is looking
+for it. `containers/healthcheck.sh` wrote `if files_out=$(cli files); then ...; else notes=ERR; fi`
+— so its ERR branch was unreachable, the refusal "Command line interface is not enabled" counted as
+one line of output, i.e. one note, and a node whose CLI did nothing reported healthy. `wait-node.sh`
+passed it and `containers-up` announced "nodes ready" for nodes that would sync nothing. Classify
+obsidian-cli by its REPLY, never by its status, even in a shell one-liner that is not parsing
+anything.
+
 ## The rule
 **An output is used only if it can be POSITIVELY identified as a valid answer to the exact question
 asked — otherwise the rep ends inconclusive (`-UNKNOWN`), never on a guess.** "Doesn't look like an
@@ -18,7 +26,10 @@ error" is not enough; it must affirmatively match a known answer shape.
   - **The settle POLLS sync-state, it doesn't block on it.** `sync:status` *blocks until the node is
     synced* (it returns immediately only when synced), so the settle loop (`execute.ts`) reads it via a
     **bounded probe** (`driver.ts`'s `syncStateProbe`, `--probe-sec`, default 5s): a quick reply is the
-    real status word, a timeout means "still syncing". This is essential for correctness, not just
+    real status word, a timeout means "still syncing". That blocking behaviour is obsidian-cli's,
+    not ours, so it is re-checked rather than assumed: `npm run probe-sync-versions -- --check`
+    (`make check-assumptions`, step 8) fails if `sync:status` stops blocking, because then a probe
+    timeout would no longer mean "not synced yet" and every settle would be reading noise. This is essential for correctness, not just
     speed — a single long blocking `sync:status` call straddling the quiescence window once made the
     settle judge a *single pre-convergence sample* (fabricating `-SYNCBAD`). Polling re-samples the
     content signature every cycle, so the verdict is built from the genuinely-settled state.
@@ -51,6 +62,12 @@ error" is not enough; it must affirmatively match a known answer shape.
 - **Absent** is positive **only** via the exact `Error: File "<name>" not found.` form.
 
 ## Known answer shapes (captured 2026-06-26, obsidian-cli 1.12.x)
+
+Re-check with `npm run check-cli -- --nodes n1,n2` (or `make check-assumptions`, step 7, which runs
+it and fails the pass on drift). It exercises every command below against a live node and reports
+which recognizer no longer matches — so this list is a convenience, not the authority. The dates
+and version above are when it was last written down by hand; the checker is what knows today.
+
 - `read` → content; absent = `Error: File "…" not found.`; empty/other-error → UNRECOGNIZED.
 - `files [folder=]` → lines of `*.md` paths; any `Error:` line → UNRECOGNIZED; **empty is ambiguous**
   (see below).
@@ -62,10 +79,67 @@ error" is not enough; it must affirmatively match a known answer shape.
 - `sync:read file= version=` → `<name> (version N, <date>)` then `---` then content; bad version =
   `Error: Failed to retrieve version: …`.
 - mutations (`create/append/prepend/open/delete`) → `Created:|Appended to:|Prepended to:|Opened:|Deleted( permanently)?:|Moved to trash:` …
+- `vault info=name` → a single bare line naming the **active** vault; empty/`Error:` → UNRECOGNIZED.
+  Note this is the one call that reads back what every other call is operating on — see the
+  ignored-parameter section below.
+- `vaults verbose` (added 2026-09-21, obsidian-cli 1.13.7) → one `<name>\t<path>` per known vault,
+  open or not. Split on the FIRST tab: names cannot contain one, paths can contain spaces. Without
+  `verbose` the paths are absent, which `parseVaultList` treats as UNRECOGNIZED rather than as a
+  path-less half-answer — the paths are the whole reason it is parsed.
+
+## A parameter the CLI ACCEPTS is not a parameter it HONOURS
+
+Everything above is about not trusting what obsidian-cli *says*. This is the mirror image: not
+trusting that it *did what it was told*. The rule above has a hidden assumption — that the answer
+coming back is an answer to the question we asked — and a silently-ignored argument breaks exactly
+that, without ever producing an output shape to be suspicious of.
+
+`vault=<name>` is the case that proved it. It is documented (`obsidian help`: "Target a specific
+vault by name"), it is accepted, it exits 0 — and it reaches only the vault Obsidian currently has
+FOCUSED. Any other name, whether a closed vault, a vault open in another window, or not a vault at
+all, is discarded in silence. `make probe-vault-param` re-derives this live rather than quoting a
+reading taken once; `make check-assumptions` (step 10) fails if it ever stops being true.
+
+Note what makes this invisible to every defence in this document. The output was a perfectly
+well-formed, positively-recognizable vault name. `parseVaultName` was right to accept it. There
+was no drift, no empty reply, no unknown `Error:` — the parser's entire contract was satisfied.
+The answer was simply *about a different vault than the one asked about*, and no amount of
+paranoia about output shapes can detect that.
+
+**So a parameter that selects WHAT a call acts on needs its own confirmation, separately from the
+recognizer.** The pattern that works is to stop treating the parameter as an instruction and treat
+it as an assertion: ask the CLI what it is actually acting on, compare, and refuse on a mismatch
+(`src/local-vault.ts`; the reasoning is in docs/DESIGN.md, "Targeting the local vault"). Fail
+closed, because an unanswered probe leaves the same ignorance as a wrong answer.
+
+A second-order trap, found the hard way in this same investigation. The first measurement of
+`vault=` compared a *focused* vault against a *closed* one, concluded "it only reaches vaults open
+as their own window", and that conclusion sat in `driver.ts` as "confirmed live" for months. It was
+untestable-by-that-experiment: a closed vault is also a non-focused one, so the data could not tell
+"reaches open windows" from "reaches only the focused vault". Opening the second vault in its own
+window settled it in one command — `vault=` follows focus alone. **A measurement that cannot
+distinguish two hypotheses has not chosen between them**, and writing it down as though it had is
+how a harness ends up resting on the more convenient one. `probe-vault-param` exists partly to keep
+that distinction in front of whoever re-checks this: its section 3 names both hypotheses and says
+which one the run they just did can actually rule out.
+
+The generalisation worth carrying: **a parameter is only trustworthy if some call reads it back.**
+`vault=` can be read back (`vault info=name`), which is what makes the guard possible at all. Where
+a future parameter cannot be read back, it should be treated as advisory and the harness arranged
+so that nothing depends on it — not assumed to have worked because nothing complained.
+
+And the corollary for tests of this kind: when a check compares two calls and expects them to
+agree, make sure the baseline is *a real answer* first. A CLI that is refusing everything (e.g.
+"Command line interface is not enabled.", the state a fresh container is in) returns the identical
+refusal to both calls, and a naive equality test reports a confident pass. `check-assumptions`
+step 10 validates the baseline looks like a vault name before comparing.
 
 ## The inherently-inconclusive case: `files` empty
 `files folder=X` returns the **same empty string** for an empty folder, a *missing* folder, and a
-*failed* call — there is no positive signal to tell them apart. So an empty listing is **not** an
+*failed* call — there is no positive signal to tell them apart. (That `files` still parses at all
+is re-checked by `npm run check-cli`; that the two independent sources still agree is re-checked on
+every run by the cross-checks below, each of which logs a `cross-check` line whether or not it
+finds a disagreement.) So an empty listing is **not** an
 answer on its own; it must be confirmed by an independent source:
 
 - **Anchor (the verdict path, implemented).** At the final observation, the rep's own canonical notes

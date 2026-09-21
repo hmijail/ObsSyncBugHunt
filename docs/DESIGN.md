@@ -11,6 +11,16 @@ Where a conclusion here is load-bearing enough that its silent expiry would corr
 rather than merely break something, it gets an executable check instead of a paragraph — see
 `make check-net` under "Network identity" below.
 
+**So every section that rests on a measurement opens with how to re-take it**, naming the command
+(`make check-assumptions` and its step, `make bench-cli`, `make probe-propagation`,
+`make probe-vault-param`, `npm run probe-sync-versions -- --check`, `npm run check-cli`). Where a
+number appears in the prose it is there to show the shape of a result, never as the current
+reading — the command is the current reading. Sections with no pointer are the ones with nothing to
+expire: historical notes kept to explain a redesign, alternatives considered and rejected, and
+descriptions of this project's own code, which the type checker and unit tests already hold to
+account. If you add a section here and cannot name the command that re-derives it, that is worth
+noticing before the section is written: it usually means the check should exist first.
+
 ## Network identity: pinning the same IP across reconnects
 
 `isolate.ts`'s `nodeIp()` derives a fixed IP per node (`n1` → `10.89.0.101`, etc.) and re-applies
@@ -341,6 +351,12 @@ pinning down.
 
 ### Taking the baseline must not widen the gap it measures
 
+Re-check with `make check-assumptions` (step 13): it runs `N1AaN2Aa` four times and demands 2+
+conflict files, which is exactly the property a too-wide gap destroys — that step failing is the
+symptom this section describes. The timings below are from one machine and are not re-measured
+here; `make bench-cli` prints what a round trip costs today, and any rep's own log carries the
+per-append `sample` events and their `ms`.
+
 `W` compares the counter against a pre-write baseline, and the first version of that read it on
 **every** node before **every** append. On `N1AaN2Aa` — two appends that are supposed to race — that
 put a `sync:history` round on each node squarely between them: the two writes went out ~300ms apart
@@ -380,14 +396,15 @@ to be free, or ride along with something already being sent.
 
 Two appends to a note that does not exist yet, one per node, back to back. The project's cheapest
 real divergence: no partition, nothing forced, just two clients creating the same path before either
-has heard of the other. Re-check with `make check-assumptions` (step 11), which runs it three times.
+has heard of the other. Re-check with `make check-assumptions` (step 13), which runs four reps and
+asserts 2+ conflict.
 
 **The assertion is the conflict file.** If it stops appearing, either the harness slowed down
 between the two appends or Obsidian's behaviour moved; both need looking at.
 
 `created` on the two appends is the discriminator that says which failure it is, not the assertion.
-It is not sufficient on its own: across 53 reps in `runs/`, `created: [true, true]` has produced all
-three of a conflict file, a clean merge, and a lost token.
+It is not sufficient on its own: `created: [true, true]` has been seen to produce all three of a
+conflict file, a clean merge, and a lost token.
 
 | what the rep shows | reading |
 |---|---|
@@ -396,32 +413,58 @@ three of a conflict file, a clean merge, and a lost token.
 | both created, no conflict file, a token missing | a divergence dropped data — possibly a real Obsidian bug rather than an apparatus fault |
 | both created, no conflict file, nothing missing | the two creates merged; see the conflict-file mode check |
 
-**The gap is diagnosis, not an assertion.** Over those 53 reps it conflicted at ≤369ms 33 times out
-of 34 and never at ≥388ms, so there is a boundary around 370–390ms — but near it the outcome is a
-distribution, because the gap competes with the propagation of a create rather than with a constant
-(`make probe-propagation` gives that distribution). Both exceptions inside the fast range were
-losses, not slow reps, which is the other reason not to assert a threshold: the interesting failure
-lives inside the range where the assertion would have passed.
+**The gap is diagnosis, not an assertion.** The time between the two appends competes with the
+propagation of a create, so the outcome shifts with it: a small gap means the second node has not
+heard of the note and creates its own (divergence, and a conflict file is what should follow),
+while a large one means it appends to a note that already arrived (no divergence, so the rep tested
+nothing). Between those the outcome is a distribution rather than a threshold, because the gap is
+racing a distribution rather than a constant — `make probe-propagation` gives that distribution.
+
+That is the first reason not to assert on the gap. The second is sharper: **the failure this
+project exists to find lives inside the range where such an assertion would have passed.** Reps
+that lost a token were fast reps, not slow ones — they sit where a conflict file was due. A
+threshold check would have gone green on every one of them. Hence step 13 asserts a RATE of
+conflict files, never a time.
+
+> ### TODO: this section needs a repeatable experiment, not the numbers it used to carry
+>
+> Until 2026-09-21 the two paragraphs above quoted specific readings — a rep count, a conflict
+> boundary in milliseconds, exception counts, round-trip and gap timings, and a conflict tally
+> under one sampling mode. They have been removed rather than refreshed. They were anecdotes from
+> particular afternoons on one machine: nothing re-took them, nothing would have noticed them going
+> stale, and at least one had already drifted out of agreement with the text around it.
+>
+> This is what `AGENTS.md` asks for — "do not record the benchmark results, but create a script
+> that can be re-run at will… and maybe wire that script to the check-assumptions Makefile target"
+> — and what this file's own header already claims to do: *where a number appears in the prose it
+> is there to show the shape of a result, never as the current reading — the command is the current
+> reading.* This section was the counter-example to its own document.
+>
+> **What the replacement has to produce**, for `N1AaN2Aa` with no partition: the outcome
+> (conflict / merge / loss / no-divergence) as a function of the measured append gap, over enough
+> reps to be worth reading, printed by something anyone can re-run. That single distribution
+> settles every claim above — where the boundary sits, how wide the transition is, and whether
+> losses really do concentrate at the narrow end.
+>
+> Note what it must NOT become: another `2+ of 4` gate. Step 12 already asserts the apparatus still
+> conflicts and is deliberately cheap; this is a measurement to be read, like `make bench-cli` or
+> `make probe-propagation`, and belongs beside them. Wiring it in as advisory (the way step 14 and
+> step 15 are) is the likely shape.
+>
+> Until it exists, the reasoning above stands but is **unquantified**: treat every "small",
+> "large" and "fast" here as a direction, not a number.
 
 What the harness controls is its own share of the gap, and only part of it. The second node's write
 is two round trips — `append` to find out whether the note has arrived, then `create` — and that is
 irreducible, because whether it arrived is exactly the question being asked. The rest is the round
-trip itself, which is not the harness's to fix: measured on the same machine hours apart, an empty
-`docker exec` moved from ~65ms to a median of 135ms, and the gap moved from ~150ms to ~350ms with
-the code unchanged. `make bench-cli` is the check that tells those two apart.
+trip itself, which is not the harness's to fix: the same machine hours apart has produced a
+materially different exec cost, and the gap moved with it while the code stood still. `make
+bench-cli` is the check that tells those two apart, and is where that number belongs.
 
 The sampling modes cannot affect this history: `sampleAll` is passed only to the `W` handler and the
-closing settle, and `N1AaN2Aa` has no `W`, so nothing samples between the two appends. Measured at
-4/4 conflict files under `SAMPLING=everything-no-sleep`. "The `everything` modes perturb what they
-measure" applies inside a wait.
-
-#### Open: two creates that merged
-
-Four reps diverged and then merged rather than conflicting — both nodes `created: true`, both tokens
-in the canonical (`"(n1-1-a)\n(n2-2-a)"`), no conflict file, verdict ok — while the conflict-file
-mode check passes. All four had wide gaps: `07T002643-N1AaN2Aa/07T002912` (488ms), `07T004304-N1AaN2Aa/07T004322`
-(495ms), `07T002643-N1AaN2Aa/07T002757` (583ms), `/07T002720` (597ms). Unexplained. Step 10 reports
-this case separately rather than folding it into "no conflict file".
+closing settle, and `N1AaN2Aa` has no `W`, so nothing samples between the two appends. That is a
+structural argument, not a measured one, which is why it survives the removal above. "The
+`everything` modes perturb what they measure" applies inside a wait.
 
 ## Creating a note and editing one are not the same operation
 
@@ -529,6 +572,180 @@ performs; a host-internet blip gets a chance to recover first (see the settle lo
 host-outage handling), but a genuinely off Sync state aborts the whole run (not just the rep),
 since it invalidates every subsequent rep until a human notices and fixes it.
 
+## Targeting the local vault: `--vault` is an assertion, not an instruction
+
+The container nodes have exactly one vault each, so "which vault am I writing to" is only a
+question for the local instance — and the answer was wrong for a long time, in the way that
+matters most: silently, and on the write path.
+
+**`vault=<name>` does not select a vault. It follows the FOCUSED window.** No error, no non-zero
+exit; an unreachable name is simply discarded. Re-derive with `make probe-vault-param`, which
+prints what the CLI actually does on the machine in front of you — the numbers are deliberately not
+copied in here, because a table of file counts from one afternoon is exactly the kind of thing that
+goes stale in silence. `make check-assumptions` (step 10) asserts the same property and fails if it
+changes.
+
+The claim was reached twice, and the first attempt is the instructive part. Measured against a
+FOCUSED vault versus a CLOSED one, `vault=` was concluded to reach any vault "already open as its
+own separate Obsidian window" — and `driver.ts` carried that as "confirmed live" for months. But a
+closed vault is also a non-focused one, so that experiment could not distinguish:
+
+- **(A)** `vault=` reaches any OPEN vault — the weaker, more convenient reading, and the one that
+  a feature was then built on
+- **(B)** `vault=` reaches only the FOCUSED vault — what actually happens
+
+Settling it needed a second vault open in its own window while a different one was focused. It
+still answered with the focused vault. The probe's section 3 walks through this, since arranging
+the second window is a human action a script cannot take.
+
+The general lesson is worth more than the specific finding: **a measurement that cannot
+distinguish two hypotheses has not chosen between them** — and writing the convenient one down as
+"confirmed live" is how a harness ends up resting on it. Checking the other cost one extra
+Obsidian window.
+
+### Dead end: pinning the vault
+
+A `--local-vault-pin` flag (driver field `pinnedVault`) used to append `vault=<name>` to every
+content command, so that — per the weaker reading above — a human could keep working in another
+Obsidian window while a soak ran. It was removed once the measurement above showed `vault=` follows
+focus: the pin is redundant while its vault is focused and ignored the moment it is not. Git
+history has the code.
+
+It is the MAC pin's story again, and for the same reasons, which is why both are recorded here.
+
+**It was never load-bearing, and its promise was false in the user-facing README** — two passages
+told the reader it would "try to force Obsidian to use the Sync vault even if the GUI is working in
+a different one". It cannot try. There is no effort being made.
+
+**"It costs nothing" was not true.** It was fifteen call sites threading `vaultParams()` through
+every content method, six unit tests asserting the argument was present, a flag with its own
+validation branch, and Makefile wiring — to send an argument the CLI discards.
+
+**And it was not inert in the logs, which is the part that decided it.** Every content call's
+`argv` carried `vault=X`, and those argv strings are not internal: they are written into generated
+`make repro` scripts and into the deliberately copy-paste-runnable lines in `runs/OBSFAIL.log` and
+`runs/UNKNOWN.log`. A reader pasting one would reasonably conclude the call had targeted that
+vault. Under this project's own rules that is the worst kind of defect — not a wrong result, but a
+correct-looking artefact that teaches the reader something false.
+
+**The "keep it in case `vault=` is honoured one day" argument does not survive contact either.** It
+would not resume working; it would silently begin *redirecting* calls, on semantics nobody had
+tested. And that day is already covered: `check-assumptions` step 10 fails loudly the moment `vault=`
+stops being ignored, and names `local-vault.ts`. A tripwire that reports a change beats a dormant
+feature that quietly acts on it. `driver.test.ts` now asserts the opposite invariant — that no
+command ever sends `vault=` — so re-adding one is a deliberate act rather than a plausible-looking
+patch.
+
+What replaces it is not a smaller pin. It is `requireActiveVault` before the first write and
+`assertLocalVaultUnchanged` during the run: check, then keep checking. Neither tries to steer
+Obsidian, because nothing available can.
+
+**What went wrong was upstream of that, in the two local-only entry points.** `smoke.ts` and
+`run-local.ts` take `--vault <name>`, and their comments promised it named a throwaway vault
+("never a real one"). The flag was parsed, checked for presence — and then never used again.
+`smoke.ts` did not even hand it to the driver. So `make smoke` ran `create`, two `append`s and a
+`delete permanent` against whatever vault happened to be open, which on a developer's machine is
+their real one. Confined to `bughunt/` and self-cleaning, so the damage was bounded and left no
+trace beyond an empty `bughunt/` folder in a real vault — which is exactly why it survived: the
+blast radius was small enough that nothing ever complained.
+
+The interesting part is that `run-local.ts`'s own header had the truth in it the whole time ("the
+local CLI acts on whichever vault Obsidian currently has open, so `--vault` is only a safety
+acknowledgment"), while `smoke.ts`'s claimed the opposite. A correct comment is not a control. The
+two files disagreed for as long as they both existed, and nothing could notice because nothing
+executed either claim.
+
+**The fix is to stop passing the name and start asserting it.** `src/local-vault.ts` asks the CLI
+which vault it is on (`vault info=name`), resolves the requested name against `vaults verbose`, and
+refuses to run on a mismatch — the user switches vaults in the GUI, the harness only ever verifies.
+Three properties, each of which is the point:
+
+- **Fail closed.** A probe that times out or answers unrecognizably aborts, exactly like a
+  mismatch. Not knowing which vault we are on is the same danger as being on the wrong one, because
+  the next call is a write. This is the same rule as `docs/cli-trust.md`'s — positively recognized
+  or nothing — applied before a run rather than during one.
+- **The listing is advisory, the name probe is not.** Losing `vaults verbose` costs the error
+  message its list of real vault names; it must never cost the guard its refusal. Degrading to
+  "allow" on a parse failure would reintroduce the bug on the day that output drifts.
+- **Case-insensitive resolution, exact pinning.** `TEST_VAULT` shipped as `Throwaway` against a
+  vault named `throwaway` — a mismatch that was invisible precisely because nothing compared them.
+  Resolution folds case for the human's benefit; what gets pinned afterwards is the CLI's own
+  spelling, because `vault=` compares exactly.
+
+**And it is checked, because it is an assumption about someone else's software.**
+`make check-assumptions` step 10 is the only step here that passes by confirming a behaviour still
+*fails*: it asserts `vault=<unknown>` is still silently ignored. If obsidian-cli ever starts
+erroring on an unknown vault, that is an improvement — and this document, and the guard, go stale
+the same day. Step 11 pins the `vaults verbose` shape the guard resolves names against.
+
+Writing that check surfaced its own trap, worth recording because it is the generic failure of
+"compare two calls" tests: on a node whose CLI is not enabled, *both* calls return the identical
+refusal string, and an equality test reports a cheerful pass. The step now validates the baseline
+looks like a vault name before comparing anything.
+
+### `L` names its vault too, and must
+
+Re-check: `npm test` covers every way the guard is allowed to refuse (`local-vault.test.ts`), and
+running any `L` history without `--local-vault` should abort before the first rep — e.g.
+`npm run start -- --history LAa --nodes l --network obsidian-net`, which must exit 2 and explain
+itself rather than start. `make probe-vault-param` shows why a check is the only option available.
+
+The same hole existed one level up, in `run.ts`, and was easier to miss because there was no
+decorative flag to notice: the local node simply used whatever vault was focused, captured that
+name as `assertLocalVaultUnchanged`'s baseline, and proceeded. The drift check then worked
+perfectly — against a baseline nobody had chosen. A soak started with the wrong window in front
+was internally consistent all the way down, and wrote to real notes.
+
+So `--local-vault <name>` (make: `LOCAL_VAULT=`) is **required** whenever `L` participates, and is
+checked by the same `requireActiveVault`. Three deliberate choices:
+
+- **Required, not optional-with-a-warning.** This is the only place the harness asks a user for a
+  flag they did not previously pass, and it is worth it: every container node is disposable, this
+  one is somebody's laptop. A warning nobody reads is not a guard.
+- **No default.** Any default would be this project guessing which of someone's vaults is
+  expendable. The operator says it or the run does not start.
+- **The guard REPLACES the bare probe rather than sitting next to it.** `capturedLocalVaultName`
+  now comes from `requireActiveVault`, so the drift baseline and the safety check are the same
+  value, established once. Keeping both would have left two ways to learn the vault, one of which
+  cannot say no — and that is how the one that cannot say no gets used.
+
+Note the division of labour, because the two halves look like duplicates and are not:
+`requireActiveVault` answers "is this the right vault to begin with", once, before the first
+write; `assertLocalVaultUnchanged` answers "is it still the same one", continuously, during the
+run. The second was implemented long before the first, which is the whole story of this section —
+guarding the drift from a starting point nobody had checked.
+
+### The local binary is `obsidian` on PATH, and it is the CLI, not the app
+
+Re-check by hand, since it needs Obsidian to be UNREACHABLE and nothing should quit the app on the
+operator's behalf. Quit Obsidian, then time both binaries:
+
+```sh
+time timeout 20 "$(dirname "$(readlink -f "$(command -v obsidian)")")/obsidian-cli" version   # expect: exit 1, at once
+time timeout 20 "$(dirname "$(readlink -f "$(command -v obsidian)")")/Obsidian"     version   # expect: still running at 20s
+```
+
+The asymmetry below is the whole reason for the default; if it ever disappears, the default stops
+mattering and this section can go.
+
+Two adjacent mistakes lived in the same two lines, and are worth keeping apart.
+
+**An absolute path with a username in it.** Both entry points defaulted to
+`/Users/<the author>/Applications/Obsidian.app/Contents/MacOS/Obsidian` — broken on every machine
+but one. `run.ts` and `repro.ts` had always defaulted to the bare name `obsidian`, and `repro.ts`
+even carries a comment warning against exactly this ("one carrying `/Users/<whoever>/...` is broken
+everywhere"). The rule existed and was written down; it just was not applied here. All four now
+share `DEFAULT_LOCAL_BIN` (`types.ts`), which is the same decision the Makefile's `LOCAL_BIN`
+spells for make.
+
+**The wrong executable.** `Obsidian.app/Contents/MacOS/` holds two binaries, `Obsidian` (Electron)
+and `obsidian-cli`. Both dispatch CLI subcommands, so they look interchangeable — until Obsidian is
+unreachable, which is when a harness most needs a straight answer. Then `obsidian-cli` exits 1
+immediately with "The CLI is unable to find Obsidian", while the GUI binary **blocks**, riding out
+`runProcess`'s 120s cap and producing nothing at all. The default was the blocking one, so the
+failure mode of a misconfigured local run was a silent two-minute stall with no output. Prefer the
+binary whose failure is legible; a harness whose errors look like hangs is a harness nobody debugs.
+
 ## A loss has two severities, and the milder one is still invisible to the user
 
 When the oracle declares a token `lost`, `lostForensics` (execute.ts) asks a second question: is it
@@ -556,6 +773,11 @@ at all and `analyze` reports them under "Could not be read" rather than guessing
 no-back-compat rule in that file's header.
 
 ## Conflict-file attribution: the title names the device that produced the file
+
+Re-check with `make check-assumptions` (step 12), which forces a real divergence and asserts a
+conflict file appears — that is the operational half of this model, and the half that silently
+stops holding if a node is brought up without Sync's "create conflict file" setting. The
+attribution rule itself is Obsidian's published behaviour rather than a measurement of ours.
 
 Per Obsidian's docs (`obsidian.md/help/sync/troubleshoot`, Conflict resolution): one device detects
 the conflict, puts its own local contents into the conflict file, puts the remote contents into the
@@ -673,7 +895,7 @@ directly on every run rather than argued about.
 **Both are measurements of one environment** — Obsidian 1.13.7, Docker on macOS — and not properties
 of Obsidian. They hold because the exec round trip dominates everything else; an engine or a CLI that
 changed what an exec costs would move the whole ranking. So the choice is re-checked rather than
-remembered: `make check-assumptions` (step 13) runs `BENCH_CHECK=1 scripts/bench-cli.sh`, which
+remembered: `make check-assumptions` (step 15) runs `BENCH_CHECK=1 scripts/bench-cli.sh`, which
 re-measures the matrix and reports whether the two cells the code uses are still within twice the
 run's own noise floor of the fastest cell. It is advisory — a cell going slow does not invalidate a
 result, it means this section has gone stale and the design should probably be revised. The methods

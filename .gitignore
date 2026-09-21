@@ -18,5 +18,5 @@ secrets/
 # Queued README edits (the README is hand-written; these are notes toward it)
 README_pending.md
 
-# check-assumptions step 10 keeps its rep logs here when a rep fails
+# check-assumptions' N1AaN2Aa race step keeps its rep logs here when the step fails
 check-assumptions-runs/

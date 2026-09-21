@@ -10,14 +10,14 @@
 #
 # NOT a fast pre-flight, and deliberately not wired into `make run`/`containers-up`. It is meant
 # to be run rarely and to be thorough; most of its wall-clock is real waiting — check-net's 10s
-# outages, step 10's full partition/heal round trip, and step 11's three real reps of the harness.
+# outages, step 12's full partition/heal round trip, and step 13's four real reps of the harness.
 #
 # WHAT IT DOES *NOT* COVER, on purpose: anything the runtime already checks per-run. Node
 # reachability, every node `synced`, nodes agreeing on note count (run.ts's preflight), and the
 # local vault not drifting mid-run are all DYNAMIC — they have to be true now, per run, and are
 # verified there. Duplicating them here would rot. What lives here is the slow-changing stuff,
 # plus one case (step 7) that the runtime only ever discovers reactively, mid-soak, and one
-# (steps 10 and 11) the runtime cannot discover at all because their failure mode is a passing run.
+# (steps 12 and 13) the runtime cannot discover at all because their failure mode is a passing run.
 #
 # Usage: scripts/check-assumptions.sh
 #        make check-assumptions            [ROUNDS=n] [NODES=n1,n2]
@@ -60,7 +60,7 @@ step=0
 # here must stay copy-pasteable.
 say()  {
   step=$((step + 1))
-  printf '\n[%d/13] %s\n' "$step" "$1"
+  printf '\n[%d/15] %s\n' "$step" "$1"
   shift
   for _c in "$@"; do printf '        $ %s\n' "$_c"; done
   return 0
@@ -87,7 +87,7 @@ fi
 #    harness — every `$NPM run` step below goes through it — so it belongs beside step 1 rather
 #    than at the end, and it costs milliseconds.
 #
-#    This is the Obsidian version check (step 13) applied to the other pinned thing. `obsidian-version`
+#    This is the Obsidian version check (step 15) applied to the other pinned thing. `obsidian-version`
 #    has always been declared in a file, enforced by the Makefile (IMAGE_TAG) and verified here;
 #    `.nvmrc` was declared and nothing else, which is exactly why a harness running on a Node nobody
 #    chose was invisible for so long. Asked through $NPM rather than by running `node` directly,
@@ -171,7 +171,7 @@ fi
 
 # And is Sync actually RUNNING on them? A fresh container boots paused, and nothing in
 # `containers-up` changes that. Paused, this script does not fail — it answers. Step 7's blocking
-# claims, step 9's write path, step 10's divergence and step 11's race all read differently against a
+# claims, step 9's write path, step 12's divergence and step 13's race all read differently against a
 # node whose Sync was never started, and the verdict at the end would say the apparatus is sound.
 #
 # A STOP rather than a `sync on`: resuming here would make the script the thing that set the world
@@ -396,7 +396,80 @@ fi
 cli delete "file=$probe" >/dev/null 2>&1 || true
 cli delete "file=$probe 1" >/dev/null 2>&1 || true
 
-# 9. Conflict files are still what a real divergence produces — i.e. every node is still in
+# 9. `vault=` is still a REQUEST THE CLI MAY IGNORE, not an instruction it obeys.
+#
+#    This is the only step here that checks an assumption by hoping it still FAILS. `vault=<name>`
+#    reaches a vault only if that vault is already open as its own window; for anything else — a
+#    real but closed vault, or a name that is not a vault at all — obsidian-cli silently falls back
+#    to whatever is active. No error, no warning, exit 0 as always.
+#
+#    WHY IT IS WORTH A STEP. The local entry points (`make smoke`, `make check-local`) take a
+#    `--vault` naming a throwaway vault. For a long time that flag was parsed, checked for
+#    presence, and then never used — so `make smoke` would create, append to and PERMANENTLY
+#    DELETE notes in whatever real vault happened to be focused, while every comment in sight
+#    promised a throwaway one. The fix was to stop passing the name as an instruction and start
+#    ASSERTING it (src/local-vault.ts: ask the CLI which vault it is on, refuse to run on a
+#    mismatch). That guard is only NECESSARY because of the behaviour below, and only SUFFICIENT
+#    while the behaviour stays exactly this shape — so it is pinned here.
+#
+#    Either direction of change matters and both are reported:
+#      - it starts ERRORING on an unknown vault  -> an improvement, and the guard's premise is
+#        stale; the docs and local-vault.ts should be revisited rather than left claiming a
+#        silence that no longer happens.
+#      - it starts SWITCHING vaults              -> `vault=` became real; the whole "the user
+#        opens the vault, we only verify" design could be reconsidered.
+#    Run in a container because the CLI's behaviour is a property of the BINARY (the same argument
+#    check-cli.ts makes about output formats), and a node is what this script has. The container
+#    has exactly one vault, which is what makes the test clean: anything other than that one name
+#    coming back is a change.
+#
+#    For the fuller picture on a machine with SEVERAL vaults — including the case that needs a
+#    second Obsidian window open, which nothing here can arrange — see `make probe-vault-param`.
+#    That one demonstrates and explains; this one asserts and fails.
+# >>> vault-premise-check  (sentinels: scripts/check-assumptions-selftest.sh extracts exactly
+# this block and runs it against fake CLI replies, because two of its branches only ever fire
+# on a day obsidian-cli has changed — i.e. never, until the one time they have to be right.)
+bogus="definitely-not-a-vault-$$"
+say "obsidian-cli still IGNORES vault= for a vault that isn't open (the local-vault guard's premise)" \
+    "$CONTAINER_ENGINE exec $live $CLI vault info=name                      # the real active vault" \
+    "$CONTAINER_ENGINE exec $live $CLI vault info=name vault=$bogus   # expect: the SAME name"
+active_vault=$(cli vault info=name | tr -d '\r' | head -1)
+bogus_vault=$(cli vault info=name "vault=$bogus" | tr -d '\r' | head -1)
+# The baseline must be a real vault NAME before the comparison below means anything. A CLI that is
+# refusing everything ("Command line interface is not enabled…", the state a fresh container is in
+# until the login step turns it on) answers BOTH calls with the identical refusal — which would
+# sail through an equality test as a cheerful "still ignored". Found exactly that way; this check
+# would otherwise have been the kind of green that covers nothing.
+if [ -z "$active_vault" ] || printf '%s' "$active_vault" | grep -qiE 'error|not enabled|usage:'; then
+  bad "\`vault info=name\` did not name a vault (said: '$active_vault') — cannot tell what vault= does;
+           src/local-vault.ts's guard is unverified. Is the CLI enabled on this node?"
+elif [ "$bogus_vault" = "$active_vault" ]; then
+  ok "vault=<unknown> is still silently ignored (still reports '$active_vault') — the guard is still required"
+elif printf '%s' "$bogus_vault" | grep -qi 'error'; then
+  bad "vault=<unknown> now ERRORS ('$bogus_vault') instead of being ignored — an improvement, but
+           src/local-vault.ts and docs/cli-trust.md still document the silent fallback. Re-check
+           whether the local-vault guard can now lean on the CLI instead of on its own probe."
+else
+  bad "vault= now reports a DIFFERENT vault ('$bogus_vault' vs active '$active_vault') — it may
+           actually switch vaults now. src/local-vault.ts assumes it cannot; re-read that file
+           before trusting any local run."
+fi
+# `vaults verbose` is the listing the guard resolves names against and builds its error out of.
+# check-cli.ts already parses it (so format drift fails step 7); what matters HERE is the weaker,
+# structural claim the guard needs even when parsing succeeds: it enumerates vaults with paths.
+say "\`vaults verbose\` still lists vaults with their paths (the guard resolves names against it)" \
+    "$CONTAINER_ENGINE exec $live $CLI vaults verbose"
+vaults_out=$(cli vaults verbose | tr -d '\r')
+if printf '%s' "$vaults_out" | grep -q "$(printf '\t')/"; then
+  ok "still <name>TAB</path> rows ($(printf '%s' "$vaults_out" | grep -c .) vault(s) known to this node)"
+else
+  bad "\`vaults verbose\` is no longer <name>TAB<path> rows — parseVaultList (src/cli-parse.ts) needs
+           updating, and the local-vault guard loses the vault names from its error message:
+           $(printf '%s' "$vaults_out" | head -2)"
+fi
+# <<< vault-premise-check
+
+# 11. Conflict files are still what a real divergence produces — i.e. every node is still in
 #    Sync's "create conflict file" mode.
 #
 #    That mode is set BY HAND, per node, through VNC (README's setup step). Nothing in the harness
@@ -568,7 +641,7 @@ else
   cg_restore
 fi
 
-# 10. `N1AaN2Aa` still conflicts, with no partition to force it — in 2 reps of 4.
+# 12. `N1AaN2Aa` still conflicts, with no partition to force it — in 2 reps of 4.
 #
 #    Step 9 forces a divergence and asks whether Sync still conflicts it. This asks the other half:
 #    does the canonical race still race? `N1AaN2Aa` is two appends to a note that does not exist
@@ -596,11 +669,20 @@ fi
 #    the token is in the server's version history but in no node's note and no conflict copy. A user
 #    would see no conflict file and never know. The merges are entirely a wide-gap effect, which
 #    retires the "unexplained create-create merge" question DESIGN used to carry.
+#
+#    CAVEAT, and it applies to every figure in this comment: these are readings from one 90-rep soak
+#    on one machine, not a standing result. Nothing re-takes them and nothing would notice them
+#    going stale. The equivalent numbers were removed from docs/DESIGN.md on 2026-09-21 rather than
+#    refreshed, and that section now carries a TODO for the repeatable experiment that should
+#    replace them ("### `N1AaN2Aa` should produce a conflict file"). These are kept only because
+#    they are what the 2-of-4 threshold was CHOSEN from, which is a decision this comment has to
+#    explain — read them as the shape of the result, not as the current reading. They go the day
+#    that experiment exists.
 # Whether the checks above passed, read before this step adds to the count. Only used to say so in
 # the loss message — a reader deciding whether to trust this result wants to know.
 pre10_fails=$fails
 race_clean=0
-race_dir="./check-assumptions-runs/step10-$(date -u +%Y%m%dT%H%M%SZ)"
+race_dir="./check-assumptions-runs/race-$(date -u +%Y%m%dT%H%M%SZ)"
 say "N1AaN2Aa still conflicts: 2+ of 4 reps (no partition, timing only)" \
     "$NPM run start -- --history N1AaN2Aa --repeat 4 --runs-dir ${race_dir#./} --display off"
 rm -rf "$race_dir"
@@ -662,7 +744,7 @@ for f in sorted(pathlib.Path(sys.argv[1]).glob("*/*.jsonl")):
               " nor any conflict copy on either node" % (f.stem, gap, ", ".join(v["lost"])))
     else:
         print("MERGE %s: gap=%dms both nodes created and the two edits MERGED into one note with no"
-              " conflict file — see step 10. Measured: every merge in a 90-rep soak had a gap above"
+              " conflict file — see step 12. Measured: every merge in a 90-rep soak had a gap above"
               " 400ms, so a merge at a NARROW gap is the surprising one" % (f.stem, gap))
 print("%d of %d reps produced a conflict file (2 needed)" % (conflicts, reps))
 # `bad` is only ever a rep that could not be READ. An outcome is never itself a failure here; the
@@ -734,7 +816,7 @@ PY
   [ "${race_clean:-0}" = 1 ] && rm -rf "$race_dir"
 fi
 
-# 11. Advisory: how fast a change actually reaches the other node. NOT a showstopper check — these
+# 13. Advisory: how fast a change actually reaches the other node. NOT a showstopper check — these
 #    numbers can move without anything being broken — but they shape how every timing result here
 #    is read, and how patient a `W<n>` has to be, so a silent shift is exactly the kind of thing
 #    that leaves old conclusions standing on a floor that moved. It prints its own verdict; the exit
@@ -747,14 +829,14 @@ else
   bad "a change never arrived at the peer at all — that is not drift, something is broken"
 fi
 
-# 12. Advisory: are the two call arrangements the harness actually uses still among the fast ones?
+# 14. Advisory: are the two call arrangements the harness actually uses still among the fast ones?
 #
 #    The sampler issues its four calls unbatched + parallel; the write path, whose calls each depend
 #    on the last, goes batched + sequential. Those were the arguably best arrangements measured
 #    against the Obsidian and container engine of the day — measurements of one environment, not
 #    properties of Obsidian, and an engine that changed what an exec costs would move them.
 #
-#    Advisory, like step 12: a slower cell does not invalidate a result, it means a design choice
+#    Advisory, like step 14: a slower cell does not invalidate a result, it means a design choice
 #    has gone stale. The exit code is reserved for the benchmark failing to answer at all, which is
 #    breakage — a composed row that no longer runs, or a row label renamed out from under the check.
 #

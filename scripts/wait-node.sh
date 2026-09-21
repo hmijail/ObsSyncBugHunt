@@ -58,7 +58,19 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 1
 done
 if ! alive; then
-  log "Obsidian never became alive — likely stuck on a blank screen (last: shot_bytes=$shot_bytes windows=$windows notes=$notes)" >&2
+  log "Obsidian never became alive (last: shot_bytes=$shot_bytes windows=$windows notes=$notes)" >&2
+  # Two very different causes land here, and the report tells them apart — worth spelling out,
+  # because the rendering one used to be the only one named and the other is far more likely on a
+  # first run.
+  if [ "$notes" = ERR ] && [ "$shot_bytes" -ge "$shot_min" ] && [ "$windows" -ge 1 ]; then
+    log "  The GUI is up and rendering; it is the CLI that is not answering (notes=ERR)." >&2
+    log "  Most often this node was seeded from a ./secrets whose login was never completed —" >&2
+    log "  e.g. 'make capture-login' run before the CLI was enabled in the VNC session." >&2
+    log "  Check with:  $CONTAINER_ENGINE exec $node $cli files" >&2
+    log "  Re-do the login with:  make clean-secrets && make login   (then sign in, then capture)" >&2
+  else
+    log "  Likely stuck on a blank screen." >&2
+  fi
   log "  screenshot: $CONTAINER_ENGINE cp $node:/var/log/obsidian-shot.png ." >&2
   exit 2
 fi

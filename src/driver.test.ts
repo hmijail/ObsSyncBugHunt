@@ -275,58 +275,33 @@ test("snapshotFs: no vaultPath configured → 'unavailable', no call at all", as
   assert.equal(exec.shellCalls, 0);
 });
 
-// --- pinnedVault: opt-in vault= on content commands only ------------------------------------
-test("pinnedVault: read carries a trailing vault= param when set, absent when unset", async () => {
-  const withPin = new CountingExecutor({ stdout: "(n1-1-a)" });
-  const d1 = new ObsidianDriver(withPin);
-  d1.pinnedVault = "Throwaway";
-  const r1 = await d1.read("bughunt/x");
-  assert.ok(r1.raw.argv.includes("vault=Throwaway"), `expected vault= in argv: ${r1.raw.argv}`);
+// --- no command carries vault=, ever ---------------------------------------------------------
+// This replaces six tests that asserted the OPPOSITE: an opt-in `pinnedVault` used to append
+// `vault=<name>` to every content command. It was removed once `vault=` was measured to follow
+// the focused window and nothing else, making the pin inert (docs/DESIGN.md, "Dead end: pinning
+// the vault").
+//
+// The invariant is worth a test in its own right rather than just deleting the old ones. `vault=`
+// is documented, accepted and silently ignored, so re-adding it somewhere would look reasonable,
+// break nothing visibly, and quietly put a false claim into every logged `argv` — including the
+// copy-paste-runnable lines in runs/OBSFAIL.log and every generated repro script.
+test("no driver command passes vault= — it cannot select a vault, so it must never be sent", async () => {
+  const seen: string[][] = [];
+  const mk = (stdout: string) => {
+    const e = new CountingExecutor({ stdout });
+    return { e, d: new ObsidianDriver(e) };
+  };
 
-  const noPin = new CountingExecutor({ stdout: "(n1-1-a)" });
-  const d2 = new ObsidianDriver(noPin);
-  const r2 = await d2.read("bughunt/x");
-  assert.ok(!r2.raw.argv.some((a) => a.startsWith("vault=")), `expected no vault= in argv: ${r2.raw.argv}`);
-});
+  const a = mk("(n1-1-a)");      await a.d.read("bughunt/x");                    seen.push(a.e.lastExecArgv ?? []);
+  const b = mk("Appended to: bughunt/x"); await b.d.appendLine("bughunt/x", "(n1-1-a)"); seen.push(b.e.lastExecArgv ?? []);
+  const c = mk("Created: bughunt/x");     await c.d.createNote("bughunt/x", "(n1-1-a)");  seen.push(c.e.lastExecArgv ?? []);
+  const d = mk("");              await d.d.listFiles("bughunt");                 seen.push(d.e.lastExecArgv ?? []);
+  const e = mk("(n1-1-a)");      await e.d.snapshotRead("bughunt/x", 50);        seen.push(e.e.lastExecArgv ?? []);
+  const f = mk("status: synced"); await f.d.syncStatus();                        seen.push(f.e.lastExecArgv ?? []);
 
-test("pinnedVault: appendLine (a mutation) carries vault= when set", async () => {
-  const exec = new CountingExecutor({ stdout: "Appended to: bughunt/x" });
-  const d = new ObsidianDriver(exec);
-  d.pinnedVault = "Throwaway";
-  const r = await d.appendLine("bughunt/x", "(n1-1-a)");
-  assert.ok(r.raw.argv.includes("vault=Throwaway"));
-});
-
-test("pinnedVault: createNote carries vault= when set, for both the name= and path= shapes", async () => {
-  const exec = new CountingExecutor({ stdout: "Created: bughunt/x" });
-  const d = new ObsidianDriver(exec);
-  d.pinnedVault = "Throwaway";
-  const r = await d.createNote("bughunt/x", "(n1-1-a)");
-  assert.ok(r.raw.argv.includes("vault=Throwaway"));
-});
-
-test("pinnedVault: listFiles carries vault= when set, with or without a folder", async () => {
-  const exec = new CountingExecutor({ stdout: "" });
-  const d = new ObsidianDriver(exec);
-  d.pinnedVault = "Throwaway";
-  const r = await d.listFiles("bughunt");
-  assert.ok(r.raw.argv.includes("vault=Throwaway"));
-});
-
-test("pinnedVault: snapshotRead carries vault= when set", async () => {
-  const exec = new CountingExecutor({ stdout: "(n1-1-a)" });
-  const d = new ObsidianDriver(exec);
-  d.pinnedVault = "Throwaway";
-  await d.snapshotRead("bughunt/x", 50);
-  assert.ok(exec.lastExecArgv?.includes("vault=Throwaway"), `expected vault= in argv: ${exec.lastExecArgv}`);
-});
-
-test("pinnedVault: sync:* commands never carry vault=, even when pinnedVault is set", async () => {
-  const exec = new CountingExecutor({ stdout: "status: synced" });
-  const d = new ObsidianDriver(exec);
-  d.pinnedVault = "Throwaway";
-  await d.syncStatus();
-  assert.ok(!exec.lastExecArgv?.some((a) => a.startsWith("vault=")), `expected no vault= in argv: ${exec.lastExecArgv}`);
+  for (const argv of seen) {
+    assert.ok(!argv.some((x) => x.startsWith("vault=")), `vault= must never be sent, found in: ${argv.join(" ")}`);
+  }
 });
 
 test("sampleNotes: a note that reads present but is missing from the listing is flagged, not trusted", () => {

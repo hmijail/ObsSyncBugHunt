@@ -30,6 +30,10 @@
 //                    (default: obsidian, relying on the normal install/activation flow's PATH entry)
 //   --local-node-id  the local instance's own Sync-reported device name (default: OS `hostname`,
 //                    which is a guess, not verified to match — see run.ts's own comment on this)
+//   --local-vault    REQUIRED when the run includes L: the name of the vault the local Obsidian
+//                    must have focused. Checked against obsidian-cli's own report before the first
+//                    rep; the run aborts on a mismatch. A check, not a selector — `vault=` cannot
+//                    switch vaults, so open it in Obsidian first.
 //   --history        run a specific DSL string (else generate)
 //   --steps          with --history: run only its first N ops (prefix, for shrinking a finding)
 //   --ops            edit-count range "min-max" (or a single number for a fixed count) (default 6-12)
@@ -96,7 +100,8 @@ import { sleep } from "./runner.js";
 import { hostOnline } from "./net.js";
 import { CliUnrecognizedOutput } from "./cli-parse.js";
 import { CliInconsistencyError, describeInconsistency, recordInconsistency, formatInconsistency } from "./inconsistency.js";
-import { NOTE_DIR } from "./types.js";
+import { DEFAULT_LOCAL_BIN, NOTE_DIR } from "./types.js";
+import { LocalVaultMismatch, requireActiveVault } from "./local-vault.js";
 import { foldEvents, renderLanes, StatusBar } from "./timeline.js";
 
 // Correctness-assumption violations are thrown deep in the driver/oracle; they're handled
@@ -186,14 +191,14 @@ const { values } = parseArgs({
     "vault-path": { type: "string" },
     "runs-dir": { type: "string" },
     "skip-snapshot": { type: "boolean" },
-    "local-vault-pin": { type: "boolean" },
+    "local-vault": { type: "string" },
   },
 });
 
 const bin = values.bin ?? "/opt/obsidian/obsidian-cli";
 const network = values.network ?? "obsidian-net";
 const isolatorKind = values.isolator ?? "network";
-const localBin = values["local-bin"] ?? "obsidian"; // same PATH-lookup convenience Makefile's LOCAL_BIN already defaults to
+const localBin = values["local-bin"] ?? DEFAULT_LOCAL_BIN; // same PATH-lookup convenience Makefile's LOCAL_BIN already defaults to
 const histories = Number(values.histories ?? 1);
 const repeat = Number(values.repeat ?? 10);
 const durationMin = Number(values["duration-min"] ?? 0);
@@ -238,8 +243,27 @@ if (parsedHistory) {
   localRequested = rawNodes.includes("l");
   nodesList = rawNodes.filter((n) => n !== "l");
 }
-if (values["local-vault-pin"] && !localRequested) {
-  console.error(`--local-vault-pin was given but the local node isn't a participant in this run (history doesn't use L, or "l" isn't in --nodes/NODES) — add it or drop --local-vault-pin.`);
+// The local node writes to a REAL Obsidian on this machine, into whichever vault is focused right
+// now. Every container node is disposable; this one is someone's laptop. So naming the intended
+// vault is REQUIRED the moment L participates, and checked against the CLI's own report before any
+// rep runs (below) — the same contract smoke/check-local use.
+//
+// Required, not optional-with-a-warning, and this is the one place in the harness that costs a
+// user a flag they did not used to pass. The alternative is what was here before: run against
+// whatever happened to be focused, and record it as the baseline as if it had been chosen. A
+// warning nobody reads is not a guard, and the failure it guards against writes to real notes.
+if (localRequested && values["local-vault"] === undefined) {
+  console.error(
+    `this run includes the local node (L), which writes into the Obsidian vault currently FOCUSED on this machine.\n` +
+    `  Name the vault you mean:  --local-vault <name>   (make: LOCAL_VAULT=<name>)\n` +
+    `  It is checked against what obsidian-cli reports before the first rep, and the run aborts on a mismatch.\n` +
+    `  obsidian-cli's own \`vault=\` cannot select a vault (it follows the focused window), so this is a check, not a selector:\n` +
+    `  open that vault in Obsidian first.`,
+  );
+  process.exit(2);
+}
+if (values["local-vault"] !== undefined && !localRequested) {
+  console.error(`--local-vault was given but the local node isn't a participant in this run (history doesn't use L, or "l" isn't in --nodes/NODES) — add it or drop --local-vault.`);
   process.exit(2);
 }
 
@@ -313,15 +337,10 @@ async function localVaultPath(): Promise<string | undefined> {
   return r.stdout.trim() || undefined;
 }
 
-// The local instance's active vault NAME, captured once here (before any rep runs) as the
-// baseline execute.ts's assertLocalVaultUnchanged compares against on every subsequent op that
-// touches the local node — obsidian-cli acts on whatever vault is currently active in the GUI,
-// so this is the one place that establishes what "currently active" was supposed to mean.
-async function localVaultName(): Promise<string | undefined> {
-  if (!localRequested) return undefined;
-  const r = await runProcess(localBin!, ["vault", "info=name"]);
-  return r.stdout.trim() || undefined;
-}
+// (The bare "read whatever vault is active" helper that used to live here is gone. Its answer is
+// now produced by local-vault.ts's requireActiveVault, which asks the same question and then
+// CHECKS it against --local-vault instead of accepting it. Two ways to establish the same
+// baseline, one of which cannot say no, is how the wrong one gets used.)
 
 // Parent dir for the whole runs/ tree — lets a soak's artifacts live somewhere other than the
 // cwd (e.g. a bigger disk). Default (no flag) keeps today's behavior: plain "runs".
@@ -348,18 +367,27 @@ if (localRequested) {
   // reorders driver construction. Make that assumption loud instead.
   assert(drivers[drivers.length - 1].node === localNodeId, "local driver must be pushed last so localNode: drivers.length resolves to it");
 }
-// Captured once, reused both as the Round-11 drift-detection baseline (execBase.localVaultName
-// below) and, if --local-vault-pin is on, as the actual pin target — see ObsidianDriver.pinnedVault.
-const capturedLocalVaultName = await localVaultName();
-if (values["local-vault-pin"]) {
-  if (!capturedLocalVaultName) {
-    console.error(`--local-vault-pin was given but the local instance's active vault name couldn't be captured — pinning to an unknown name would be worse than not pinning at all. Check --local-bin and re-run.`);
-    process.exit(2);
+// Captured once, as the drift-detection baseline
+// (execBase.localVaultName below, which assertLocalVaultUnchanged compares against on every op
+// touching the local node).
+//
+// It comes from the GUARD, not from a bare probe. Those differ in exactly one way, and it is the
+// way that matters: a bare probe records whatever vault happened to be focused and treats it as
+// the intention, so a soak started with the wrong window in front is a soak writing to real notes
+// with a baseline that agrees with it all the way down. requireActiveVault instead checks the
+// observed vault against the one the operator NAMED, and aborts otherwise — so the baseline is a
+// confirmed choice rather than an accident, and everything downstream inherits that.
+let capturedLocalVaultName: string | undefined;
+if (localRequested) {
+  try {
+    capturedLocalVaultName = await requireActiveVault(drivers[drivers.length - 1], values["local-vault"]!);
+  } catch (e) {
+    if (e instanceof LocalVaultMismatch) {
+      console.error(`\nrun: refusing to start — ${e.message}\n`);
+      process.exit(2);
+    }
+    throw e;
   }
-  // Pin only reaches a vault that's already open as its OWN Obsidian window (confirmed live) —
-  // it does not open/switch to one by name. Keep that vault open as a window for the whole
-  // soak; any OTHER window is then free to use without disrupting these calls.
-  drivers[drivers.length - 1].pinnedVault = capturedLocalVaultName;
 }
 const byId = new Map(drivers.map((d) => [d.node, d]));
 const isolator: Isolator = isolatorKind === "sync" ? new SyncToggleIsolator(byId) : new NetworkIsolator(network);
@@ -524,7 +552,19 @@ function tagHistoryDir(strDir: string, groupName: string): void {
   if (reps.length === 0) return;
   const bad = reps.filter(isBadRep).length;
   const target = bad > 0 ? path.join(runsRoot, `${groupName}-BAD${Math.round((100 * bad) / reps.length)}`) : strDir;
-  if (target !== strDir) { try { renameSync(strDir, target); } catch { /* keep */ } }
+  if (target !== strDir) {
+    try {
+      renameSync(strDir, target);
+      // The tally's "failing reps:" list was collected while this directory still had its
+      // untagged name, and the tally is printed AFTER this rename — so every path in it named a
+      // directory that no longer existed by the time anyone read it. The one thing that list is
+      // for is opening the file it names, so re-point the entries this rename invalidated.
+      const from = strDir + path.sep;
+      for (let i = 0; i < failures.length; i++) {
+        if (failures[i].startsWith(from)) failures[i] = path.join(target, failures[i].slice(from.length));
+      }
+    } catch { /* keep */ }
+  }
 }
 
 /** An `-ENVFAIL` is treated as a TEMPORARY condition that will clear on its own — a load spike

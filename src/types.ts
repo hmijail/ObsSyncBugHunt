@@ -53,6 +53,29 @@ export function formatToken(t: EditToken): string {
  */
 export const NOTE_DIR = "bughunt";
 
+/**
+ * The host's own Obsidian CLI, for the local node (`L`) and the local-only entry points
+ * (smoke.ts, run-local.ts). A BARE COMMAND NAME, resolved on PATH — matching the Makefile's
+ * `LOCAL_BIN ?= obsidian`, which is the same decision spelled once for make and once for the
+ * TypeScript that make invokes.
+ *
+ * Two things this is deliberately NOT:
+ *
+ *  - Not an absolute path. Two entry points used to default to a literal
+ *    `/Users/<the author>/Applications/Obsidian.app/...`, which is broken on every machine but
+ *    one. src/repro.ts already carries a comment warning against exactly that; the rule existed,
+ *    it just wasn't applied here.
+ *  - Not the GUI binary. Inside Obsidian.app there are two executables, `Obsidian` (Electron) and
+ *    `obsidian-cli`. Both dispatch CLI subcommands, so the difference only shows when the app is
+ *    UNREACHABLE: `obsidian-cli` exits 1 immediately with "The CLI is unable to find Obsidian",
+ *    while the GUI binary BLOCKS — riding out runProcess's 120s cap and producing nothing at all.
+ *    A harness whose failure mode is a silent two-minute stall is a harness nobody debugs. The
+ *    normal install/activation flow puts `obsidian` (the CLI) on PATH on both macOS and Linux.
+ *
+ * Override with `--bin` (or make's `LOCAL_BIN=`) if it isn't on PATH.
+ */
+export const DEFAULT_LOCAL_BIN = "obsidian";
+
 /** A server-side sync version, as listed by `diff filter=sync` (newest = 1). */
 export interface SyncVersion {
   version: number;

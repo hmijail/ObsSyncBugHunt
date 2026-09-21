@@ -31,11 +31,24 @@ windows=$(timeout 8 xlsclients -display :99 2>/dev/null | grep -c .)
 case "$windows" in ""|*[!0-9]*) windows=0 ;; esac
 
 # 3. note count via a non-sync CLI command (app + vault liveness)
-if files_out=$(timeout 15 "$cli" files 2>/dev/null); then
-  notes=$(printf '%s\n' "$files_out" | grep -c .)
-else
-  notes=ERR
-fi
+# `notes` answers "is the CLI actually usable on this node", which is what wait-node.sh gates on.
+#
+# It must NOT be decided by the exit status. obsidian-cli ALWAYS EXITS 0, even when refusing — the
+# first line of docs/cli-trust.md — so `if files_out=$(...)` took the success branch every time and
+# the ERR case was unreachable. The refusal "Command line interface is not enabled..." then counted
+# as one line, i.e. one note, and a node whose CLI does nothing reported healthy: wait-node.sh
+# passed it, containers-up announced "nodes ready", and the run did nothing for reasons no message
+# ever connected to the missing login.
+#
+# So classify by the REPLY. Empty stays 0 (a fresh TestVault genuinely has no notes, and the
+# empty-vs-failed ambiguity cli-trust.md describes is not resolvable here); the known refusal
+# shapes are positively identified as ERR.
+files_out=$(timeout 15 "$cli" files 2>/dev/null) || files_out="__call_failed__"
+case "$files_out" in
+  __call_failed__|*"not enabled"*|*"Error:"*) notes=ERR ;;
+  "")                                         notes=0   ;;
+  *)                                          notes=$(printf '%s\n' "$files_out" | grep -c .) ;;
+esac
 
 report="shot_bytes=$shot_bytes windows=$windows notes=$notes"
 printf '%s\n' "$report"

@@ -81,6 +81,33 @@ export function parseVaultName(stdout: string): string | Unrecognized {
   return t;
 }
 
+// --- vaults verbose ----------------------------------------------------------
+// One `<name>\t<path>` per known vault (open or not). Used only by the local-vault guard
+// (src/local-vault.ts), to turn "that vault isn't the active one" into an error that can
+// name the vaults that DO exist — and to resolve the requested name case-insensitively.
+//
+// A vault name cannot contain a tab, so splitting on the FIRST tab is unambiguous; a path
+// can contain spaces, which is why this is tab-separated rather than whitespace-separated.
+// An entry with no tab (i.e. `vaults` without `verbose`, or a future format without paths)
+// is unrecognized rather than silently path-less: the guard's error message is the whole
+// reason this is parsed at all, and a half-parsed listing makes it worse, not better.
+export type VaultEntry = { name: string; path: string };
+export function parseVaultList(stdout: string): VaultEntry[] | Unrecognized {
+  const lines = stdout.split("\n").map((l) => l.trimEnd()).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return UNRECOGNIZED; // Obsidian always knows at least the open vault
+  const out: VaultEntry[] = [];
+  for (const l of lines) {
+    if (l.trim().startsWith("Error:")) return UNRECOGNIZED;
+    const tab = l.indexOf("\t");
+    if (tab <= 0) return UNRECOGNIZED; // no tab, or an empty name
+    const name = l.slice(0, tab).trim();
+    const path = l.slice(tab + 1).trim();
+    if (name === "" || path === "") return UNRECOGNIZED;
+    out.push({ name, path });
+  }
+  return out;
+}
+
 // --- sync:history file= (raw listing) ----------------------------------------
 // The non-empty server-side listing text, or positively absent. Empty / other `Error:`
 // (e.g. `Error: Sync is in error state.` while disconnected) is unrecognized → retried.

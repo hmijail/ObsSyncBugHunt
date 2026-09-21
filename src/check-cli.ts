@@ -30,7 +30,7 @@
 import { parseArgs } from "node:util";
 import { ContainerExecutor } from "./exec.js";
 import { ObsidianDriver } from "./driver.js";
-import { CliUnrecognizedOutput } from "./cli-parse.js";
+import { CliUnrecognizedOutput, type VaultEntry } from "./cli-parse.js";
 import { NOTE_DIR } from "./types.js";
 import type { OpResult } from "./types.js";
 
@@ -118,6 +118,10 @@ for (const node of nodes) {
   const results: Outcome[] = [];
   // Per node, read-only: which vault this Obsidian actually has open, and whether Sync answers.
   results.push(await probe("vault info=name", () => d.vaultNameProbe(15_000).then(toOp)));
+  // The local-vault guard (src/local-vault.ts) builds its error message out of this listing, and
+  // resolves the requested name against it. Read-only, so it rides along with the per-node probes
+  // even though the format itself is a property of the binary.
+  results.push(await probe("vaults verbose", () => d.vaultListProbe(15_000).then(toVaultListOp)));
   results.push(await probe("sync:status", () => d.syncStatus()));
 
   if (sweptOn === null) {
@@ -149,6 +153,14 @@ function toOp(p: { status: "ok"; name: string } | { status: "unrecognized" | "ti
   const raw = { argv: [], code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
   if (p.status === "ok") return { ok: true, value: p.name, raw };
   throw new CliUnrecognizedOutput({ ...raw, argv: ["vault", "info=name"], stdout: `<${p.status}>` }, "vaultNameProbe");
+}
+
+/** Same adaptation for the vault listing. Reported as the joined names: a drift here is most
+ *  likely a dropped path column, which is invisible in a count but obvious in the text. */
+function toVaultListOp(p: { status: "ok"; vaults: VaultEntry[] } | { status: "unrecognized" | "timeout"; raw?: string }): OpResult<string> {
+  const raw = { argv: [], code: 0, stdout: "", stderr: "", startedAt: "", durationMs: 0, killed: false };
+  if (p.status === "ok") return { ok: true, value: p.vaults.map((v) => v.name).join(", "), raw };
+  throw new CliUnrecognizedOutput({ ...raw, argv: ["vaults", "verbose"], stdout: p.raw ?? `<${p.status}>` }, "parseVaultList");
 }
 
 console.log();

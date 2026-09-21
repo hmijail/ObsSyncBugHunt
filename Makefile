@@ -145,14 +145,36 @@ override NODES := $(subst $(comma),$(space),$(NODES))
 # Screen Sharing, so default to 5901; override: make login VNC_PORT=5910
 VNC_PORT   ?= 5901
 SECRETS    := $(CURDIR)/secrets/obsidian
-# Local throwaway vault for `make smoke` / `make check-local` (override: make check-local TEST_VAULT=Foo)
-TEST_VAULT ?= Throwaway
+# Local throwaway vault for `make smoke` / `make check-local` (override: make check-local TEST_VAULT=Foo).
+#
+# This names the vault those targets ASSERT is open — it cannot select one. obsidian-cli's `vault=`
+# is silently ignored for any vault that isn't already open (see src/local-vault.ts), so both
+# targets verify the active vault against this name and refuse to run on a mismatch, rather than
+# writing into whatever real vault happened to be focused. Matching is case-insensitive, so the
+# spelling here need only be recognisable; it used to read `Throwaway` against a vault actually
+# named `throwaway`, and nothing noticed because nothing ever compared them.
+TEST_VAULT ?= throwaway
 # Node targeted by `make health` (override: make health NODE=n2)
 NODE       ?= n1
-# The host's own obsidian-cli, only used when "l" is in NODES (see above). Bare command name,
-# relying on the normal install/activation flow putting it on PATH (confirmed on both macOS and
-# Linux) — override to a full path if it isn't: make soak LOCAL_BIN=/other/path
+# The host's own obsidian-cli: used when "l" is in NODES (see above), and by `smoke`/`check-local`,
+# which are local-only. Bare command name, relying on the normal install/activation flow putting it
+# on PATH (confirmed on both macOS and Linux) — override to a full path if it isn't:
+# make soak LOCAL_BIN=/other/path
+#
+# It must be `obsidian-cli`, NOT the `Obsidian` GUI binary sitting next to it inside the .app.
+# Both accept CLI subcommands, so they look interchangeable until the app is unreachable: the CLI
+# exits 1 at once with a usable message, the GUI binary blocks until the harness's own 120s cap.
+# smoke/check-local used to hardcode an absolute path to the GUI one; see src/types.ts's
+# DEFAULT_LOCAL_BIN, which is this same default on the TypeScript side.
 LOCAL_BIN  ?= obsidian
+# The vault the local Obsidian must have FOCUSED, for any run that includes the local node ("l" in
+# NODES, or L in a HISTORY). REQUIRED there — run.ts refuses to start without it — because that
+# node writes into a real vault on this machine rather than a disposable container. Deliberately
+# has no default: the whole point is that the operator says which vault they mean, and any default
+# would be this file guessing on their behalf. It is checked, never applied: `vault=` cannot switch
+# vaults (see src/local-vault.ts), so open the vault in Obsidian first.
+#   make soak NODES="n1 n2 l" LOCAL_VAULT=throwaway
+LOCAL_VAULT ?=
 # The CLI inside a node container, as the image installs it. The host's equivalent is LOCAL_BIN
 # above; this one is a fixed path because the image is ours.
 NODE_CLI   ?= /opt/obsidian/obsidian-cli
@@ -209,7 +231,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(ISOLATOR),--isolator $(ISOLATOR)) \
   $(if $(LOCAL_BIN),--local-bin $(LOCAL_BIN)) \
   $(if $(LOCAL_NODE_ID),--local-node-id $(LOCAL_NODE_ID)) \
-  $(if $(LOCAL_VAULT_PIN),--local-vault-pin) \
+  $(if $(LOCAL_VAULT),--local-vault '$(LOCAL_VAULT)') \
   $(if $(HISTORY),--history $(HISTORY)) \
   $(if $(STEPS),--steps $(STEPS)) \
   $(if $(OPS),--ops $(OPS)) \
@@ -239,10 +261,10 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
   $(if $(DISPLAY),--display $(DISPLAY))
 
 .DEFAULT_GOAL := help
-.PHONY: help install typecheck test check smoke check-local \
+.PHONY: help install typecheck test test-scripts check smoke check-local \
         build-image net secrets-dir clean-secrets login capture-login node1 containers-up solo-check reconnect-nodes unpause-sync run campaign soak analyze generate-histories repro \
         clean-runs clean-notes clean-data clean-images trial containers-down ps logs health \
-        list-images obsidian-latest obsidian-upgrade check-net check-assumptions corpus probe-propagation timeline-rep bench-cli
+        list-images obsidian-latest obsidian-upgrade check-net check-assumptions corpus probe-propagation timeline-rep bench-cli probe-vault-param
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*## .*$$' $(MAKEFILE_LIST) \
@@ -278,19 +300,41 @@ tools-advice:
 	  fi
 
 
+# Each part of `check` names, ON FAILURE, the command that re-runs THAT part alone.
+#
+# `make check` runs three unrelated tools, and make's own last word for all three is the same
+# unhelpful "*** [check] Error 2". By then the actual error has usually scrolled off behind a few
+# hundred lines of passing tests, and the reader's next move is to open this file to work out
+# which of the three broke and how to run just it. That is a small tax, paid at the exact moment
+# someone is already annoyed — so each recipe pays it once, in advance.
+#
+# `|| { ...; false; }` rather than a trailing `|| true`: the hint is an addition to the failure,
+# never a replacement for it. `check` must still fail.
+FAIL_HINT = { echo; echo "  ^ $(1) failed. Re-run just this part:"; echo "      make $@"; echo; false; }
+
 typecheck: ## Type-check the project
-	$(NPM) run typecheck
+	@$(NPM) run typecheck || $(call FAIL_HINT,type-check)
 
 test: ## Run unit tests (the oracle)
-	$(NPM) test
+	@$(NPM) test || $(call FAIL_HINT,unit tests)
 
-check: typecheck test ## Type-check + unit tests
+# The shell half of the suite. scripts/ is otherwise untested, and the one check in it whose
+# branches never run in normal operation (check-assumptions' vault-premise step: three of its four
+# branches only fire on a day obsidian-cli has changed) is exactly the code most likely to have
+# rotted by the time it matters. Needs no engine, no Obsidian and no network — it drives the real
+# block against fake CLI replies — so it belongs in `check` with the unit tests rather than in the
+# slow, nodes-required `check-assumptions`.
+.PHONY: test-scripts
+test-scripts: ## Self-test the shell checks (no engine/Obsidian needed)
+	@scripts/check-assumptions-selftest.sh || $(call FAIL_HINT,shell self-tests)
+
+check: typecheck test test-scripts ## Type-check + unit tests + shell self-tests
 
 smoke: ## Probe the driver against a local throwaway vault (TEST_VAULT=...)
-	$(NPM) run smoke -- --vault $(TEST_VAULT)
+	$(NPM) run smoke -- --vault $(TEST_VAULT) --bin $(LOCAL_BIN)
 
 check-local: ## Single-node pipeline check against a local throwaway vault
-	$(NPM) run local -- --vault $(TEST_VAULT)
+	$(NPM) run local -- --vault $(TEST_VAULT) --bin $(LOCAL_BIN)
 
 # ---- containers ------------------------------------------------------------
 
@@ -324,7 +368,24 @@ secrets-dir:
 clean-secrets: containers-down ## Wipe the captured login (./secrets) + login container (then: make login -> capture-login)
 	-$(CONTAINER_ENGINE) rm -f $(LOGIN) 2>/dev/null || true
 	rm -rf $(SECRETS)
-	@echo "Wiped $(SECRETS) and the login container. Next: make login && make capture-login"
+	@echo "Wiped $(SECRETS) and the login container."
+	@echo "Next: make login     — then sign in through VNC, and only THEN: make capture-login"
+
+# The "there is no login yet" message, shared by containers-up and node1 (which is why it is a
+# target and not a copy-pasted echo). It is deliberately NOT `make login && make capture-login`:
+# that reads as one chain to paste, and pasting it captures a container nobody has signed into yet
+# — which succeeds, writes a credential-less ./secrets, and leaves you with nodes that come up and
+# do nothing. The two commands are separated by a human doing several minutes of GUI work, so the
+# message has to show that gap rather than an `&&`.
+.PHONY: no-login-help
+no-login-help:
+	@echo "No captured login in $(SECRETS)."
+	@echo
+	@echo "  1.  make login            starts a VNC container and prints what to do in it"
+	@echo "  2.  (you, in VNC)         enable the CLI, sign in, connect the vault, wait for sync"
+	@echo "  3.  make capture-login    copies that login out — only once step 2 is really done"
+	@echo
+	@echo "Step 3 checks step 2 actually happened, so running it early is refused, not silently wrong."
 
 login: build-image net secrets-dir ## Start a VNC container for the one-time Sync login
 	-$(CONTAINER_ENGINE) rm -f $(LOGIN) 2>/dev/null || true
@@ -336,13 +397,71 @@ login: build-image net secrets-dir ## Start a VNC container for the one-time Syn
 	@echo "  1. enable CLI: Settings > General > Advanced > Command line interface"
 	@echo "  2. Account: sign in to your Obsidian account"
 	@echo "  3. Sync: connect/create the TEST remote vault, set 'Create conflict file'"
-	@echo "  4. wait for full sync, then: make capture-login"
+	@echo "  4. wait for full sync"
+	@echo
+	@echo "Take as long as you need — this container just sits there. When step 4 is done, and"
+	@echo "not before, run:   make capture-login"
+	@echo "(it verifies 1-3 before copying anything, and refuses if they are not done)"
 
-capture-login: ## Copy the login out of the container into ./secrets, then stop it
+# CHECKS BEFORE IT COPIES, because the failure it prevents is silent. Nothing about the copy can
+# fail when the login has not happened: `cp -a` of a config directory succeeds whether or not that
+# config contains an account, so a too-early capture-login writes a credential-less ./secrets,
+# reports success, and hands you nodes that start, sit there, and sync nothing. You find out much
+# later and with no clue pointing back here.
+#
+# Both checks ask the container what it can DO rather than inspecting files, for the reason
+# docs/cli-trust.md gives about the CLI generally: the on-disk shape of a logged-in Obsidian is
+# undocumented and version-dependent, while "does the CLI answer" and "does Sync report a status"
+# are behavioural, stable, and exactly the two things the GUI steps are for.
+#
+#   - The CLI answering at all means step 1 (enable the CLI) is done — a fresh container replies
+#     "Command line interface is not enabled" to everything, which is precisely the state someone
+#     is in when they paste both commands at once.
+#   - `sync:status` yielding a status word means steps 2-3 (sign in, connect a vault) are done.
+#     `error`/`stopped` mean Sync is configured but unhappy, which is not a login worth cloning
+#     onto every node.
+capture-login: ## Copy the login out of the container into ./secrets, then stop it (checks you actually logged in)
+	@$(CONTAINER_ENGINE) inspect -f '{{.State.Running}}' $(LOGIN) 2>/dev/null | grep -q true || { \
+	  echo "The login container ($(LOGIN)) is not running — nothing to capture."; \
+	  echo "Start it with: make login"; exit 1; }
+	@out=$$($(CONTAINER_ENGINE) exec $(LOGIN) $(NODE_CLI) sync:status 2>&1); \
+	  case "$$out" in \
+	    *"not enabled"*) \
+	      echo "Refusing to capture: the Obsidian CLI is not enabled in the login container yet."; \
+	      echo "  It said: $$out"; \
+	      echo; \
+	      echo "  That is step 1 of the VNC login, so this looks like capture-login was run before"; \
+	      echo "  (or instead of) doing the sign-in. Connect to vnc://localhost:$(VNC_PORT) (password:"; \
+	      echo "  obsidian) and finish all four steps 'make login' printed, then re-run this."; \
+	      echo; \
+	      echo "  Nothing was copied, and the container is still running — no work has been lost."; \
+	      exit 1 ;; \
+	  esac; \
+	  st=$$(printf '%s' "$$out" | sed -n 's/^status:[[:space:]]*//p' | head -1); \
+	  case "$$st" in \
+	    synced) echo "login container reports Sync: synced" ;; \
+	    syncing|offline|paused) \
+	      echo "login container reports Sync: $$st — capturing anyway, but if the vault had not"; \
+	      echo "  finished its first sync you may prefer to wait and re-run." ;; \
+	    "") \
+	      echo "Refusing to capture: Sync did not report a status in the login container."; \
+	      echo "  It said: $$out"; \
+	      echo "  Sign in and connect the test vault (steps 2-3 of 'make login'), then re-run."; \
+	      echo "  Nothing was copied; the container is still running."; \
+	      exit 1 ;; \
+	    *) \
+	      echo "Refusing to capture: Sync reports '$$st' in the login container."; \
+	      echo "  A login in that state would be cloned onto every node. Fix it in the GUI"; \
+	      echo "  (vnc://localhost:$(VNC_PORT), password: obsidian), then re-run."; \
+	      echo "  Nothing was copied; the container is still running."; \
+	      exit 1 ;; \
+	  esac
 	$(CONTAINER_ENGINE) exec $(LOGIN) sh -c '\
 	  mkdir -p /secrets/config /secrets/vault && \
 	  cp -a /root/.config/obsidian/. /secrets/config/ && \
 	  cp -a /root/vaults/TestVault/.obsidian/. /secrets/vault/'
+	@date -u +'captured %Y-%m-%dT%H:%M:%SZ by make capture-login (CLI answering, Sync reporting a status)' \
+	  > $(SECRETS)/captured
 	$(CONTAINER_ENGINE) rm -f $(LOGIN)
 	@echo "Captured login into $(SECRETS) (git-ignored). Next: make containers-up"
 
@@ -355,7 +474,13 @@ capture-login: ## Copy the login out of the container into ./secrets, then stop 
 NODE_ADDR = num=$${n\#n}; addr=$$((100+num)); ip=10.89.0.$$addr
 
 node1: build-image net ## Run a single node (n1) with VNC published, for inspection/debugging
-	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture-login"; exit 1; }
+	@test -d $(SECRETS)/config || { $(MAKE) --no-print-directory no-login-help; exit 1; }
+	@test -f $(SECRETS)/captured || { \
+	  echo "note: $(SECRETS) has a config/ but no 'captured' stamp, so it did not come from a"; \
+	  echo "      verified 'make capture-login'. If it is a hand-made or half-finished login, the"; \
+	  echo "      nodes will start and then sync nothing. Re-do it with: make clean-secrets && make login"; \
+	  echo "      (a ./secrets captured before this check existed is fine — touch $(SECRETS)/captured to silence this)"; \
+	  echo; }
 	-$(CONTAINER_ENGINE) rm -f n1 2>/dev/null || true
 	@n=n1; $(NODE_ADDR); \
 	  $(CONTAINER_ENGINE) run -d --name n1 --hostname n1 --network $(NET) --ip $$ip \
@@ -364,7 +489,13 @@ node1: build-image net ## Run a single node (n1) with VNC published, for inspect
 	@echo "n1 ready. Inspect via VNC: vnc://localhost:$(VNC_PORT) (password: obsidian)."
 
 containers-up: build-image net ## Launch n1 + n2 (each seeds from ./secrets; VNC published per node)
-	@test -d $(SECRETS)/config || { echo "No captured login. Run: make login && make capture-login"; exit 1; }
+	@test -d $(SECRETS)/config || { $(MAKE) --no-print-directory no-login-help; exit 1; }
+	@test -f $(SECRETS)/captured || { \
+	  echo "note: $(SECRETS) has a config/ but no 'captured' stamp, so it did not come from a"; \
+	  echo "      verified 'make capture-login'. If it is a hand-made or half-finished login, the"; \
+	  echo "      nodes will start and then sync nothing. Re-do it with: make clean-secrets && make login"; \
+	  echo "      (a ./secrets captured before this check existed is fine — touch $(SECRETS)/captured to silence this)"; \
+	  echo; }
 	@port=$(VNC_PORT); for n in $(CONTAINER_NODES); do \
 	  $(CONTAINER_ENGINE) rm -f $$n 2>/dev/null || true; \
 	  $(NODE_ADDR); \
@@ -574,6 +705,12 @@ obsidian-upgrade: ## Rewrite ./obsidian-version to the newest upstream release
 	  echo "       make check-assumptions  # an upgrade is exactly when obsidian-cli output drifts"
 
 # ---- engine sanity ---------------------------------------------------------
+
+# Not wired into check-assumptions: that target asserts and FAILS, this one only demonstrates, and
+# its most interesting case needs a human to open a second Obsidian window (see the script). The
+# assertable half is check-assumptions step 10.
+probe-vault-param: ## Show what obsidian-cli's vault= really does on this machine (OTHER_VAULT=<name>)
+	@scripts/probe-vault-param.sh $(if $(LOCAL_BIN),--bin $(LOCAL_BIN)) $(if $(OTHER_VAULT),--other '$(OTHER_VAULT)')
 
 check-net: net ## Verify a D/C reconnect is a brief blip (<1s, pinned IP) on this engine — run after an engine change
 	@scripts/check-net.sh $(or $(ROUNDS),3) $(or $(OUTAGE),10) $(or $(BUDGET),1.0)

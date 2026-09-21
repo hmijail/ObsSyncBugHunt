@@ -32,7 +32,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { parse, serialize, normalize, usesLocal, requiredNodes, DEFAULT_PAUSE_SEC, type History } from "./dsl.js";
 import { nodeIp } from "./isolate.js";
-import { formatToken, NOTE_DIR } from "./types.js";
+import { DEFAULT_LOCAL_BIN, formatToken, NOTE_DIR } from "./types.js";
 import { runProcess } from "./exec.js";
 
 export interface ReproOpts {
@@ -250,7 +250,7 @@ if (isMain) {
   // sync with it). localBin gets a sane default like --bin already has, rather than being hard-
   // required — only actually used below if the history uses L.
   const req = requiredNodes(normalize(history));
-  const localBin = values["local-bin"] ?? "obsidian";
+  const localBin = values["local-bin"] ?? DEFAULT_LOCAL_BIN;
   // Only worth a subprocess call when the local instance is actually requested — mirrors run.ts's
   // own hostname auto-detect (same caveat: a guess, not verified to match what Sync itself calls it).
   const localNodeId = req.local ? (values["local-node-id"] ?? (await runProcess("hostname", [])).stdout.trim()) : undefined;
