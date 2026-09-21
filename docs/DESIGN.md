@@ -380,7 +380,7 @@ to be free, or ride along with something already being sent.
 
 Two appends to a note that does not exist yet, one per node, back to back. The project's cheapest
 real divergence: no partition, nothing forced, just two clients creating the same path before either
-has heard of the other. Re-check with `make check-assumptions` (step 10), which runs it three times.
+has heard of the other. Re-check with `make check-assumptions` (step 11), which runs it three times.
 
 **The assertion is the conflict file.** If it stops appearing, either the harness slowed down
 between the two appends or Obsidian's behaviour moved; both need looking at.
@@ -673,7 +673,7 @@ directly on every run rather than argued about.
 **Both are measurements of one environment** — Obsidian 1.13.7, Docker on macOS — and not properties
 of Obsidian. They hold because the exec round trip dominates everything else; an engine or a CLI that
 changed what an exec costs would move the whole ranking. So the choice is re-checked rather than
-remembered: `make check-assumptions` (step 12) runs `BENCH_CHECK=1 scripts/bench-cli.sh`, which
+remembered: `make check-assumptions` (step 13) runs `BENCH_CHECK=1 scripts/bench-cli.sh`, which
 re-measures the matrix and reports whether the two cells the code uses are still within twice the
 run's own noise floor of the fastest cell. It is advisory — a cell going slow does not invalidate a
 result, it means this section has gone stale and the design should probably be revised. The methods
@@ -703,7 +703,7 @@ note has arrived yet is the question being asked. Doing it as `append || create`
 shell was considered and rejected: deciding "not found" would mean reimplementing a CLI-output parser
 in `sh`, and a skipped command leaves no output to split the batch on, both of which
 `docs/cli-trust.md` exists to prevent. Both are checked by
-`make check-assumptions` (step 8), because an upgrade could change either without warning: if
+`make check-assumptions` (step 9), because an upgrade could change either without warning: if
 `append` ever auto-created, the fallback would stop firing, every creation would be logged
 `created: false`, and the create-create conflict-genesis signal would quietly become worthless
 without a single test failing.

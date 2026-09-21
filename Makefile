@@ -81,7 +81,7 @@ VERSION_FILE_NODE := .nvmrc
 # message quotes fnm instead of paraphrasing it.
 FNM_WHY := $(shell fnm exec -- true 2>&1 >/dev/null | head -1)
 FNM_OK  := $(if $(FNM_WHY),,yes)
-NPM     := $(if $(FNM_OK),fnm exec --,) npm
+NPM     := $(strip $(if $(FNM_OK),fnm exec --,) npm)
 export NPM
 ifeq ($(FNM_OK),)
 ifneq ($(shell command -v fnm 2>/dev/null),)

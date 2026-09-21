@@ -414,7 +414,7 @@ test("readWithListing: with versionsMs the counter comes back alongside the read
 
 test("readWithListing: the counter is bounded by versionsMs, the read and listing are not", async () => {
   // The cap exists because `sync:history` BLOCKS on a node with no network (check-assumptions
-  // step 7). Capping the read too would put the oracle's own call on a clock.
+  // step 8). Capping the read too would put the oracle's own call on a clock.
   const exec = new ByCommandExecutor({ read: READ_A, files: LISTING_A, "sync:history": "7" });
   await new ObsidianDriver(exec).readWithListing("bughunt/a", "bughunt", 250);
   const at = (cmd: string) => exec.seen.find((s) => s.cmd === cmd)?.timeoutMs;

@@ -10,14 +10,14 @@
 #
 # NOT a fast pre-flight, and deliberately not wired into `make run`/`containers-up`. It is meant
 # to be run rarely and to be thorough; most of its wall-clock is real waiting — check-net's 10s
-# outages, step 9's full partition/heal round trip, and step 10's three real reps of the harness.
+# outages, step 10's full partition/heal round trip, and step 11's three real reps of the harness.
 #
 # WHAT IT DOES *NOT* COVER, on purpose: anything the runtime already checks per-run. Node
 # reachability, every node `synced`, nodes agreeing on note count (run.ts's preflight), and the
 # local vault not drifting mid-run are all DYNAMIC — they have to be true now, per run, and are
 # verified there. Duplicating them here would rot. What lives here is the slow-changing stuff,
-# plus one case (step 6) that the runtime only ever discovers reactively, mid-soak, and one
-# (steps 9 and 10) the runtime cannot discover at all because their failure mode is a passing run.
+# plus one case (step 7) that the runtime only ever discovers reactively, mid-soak, and one
+# (steps 10 and 11) the runtime cannot discover at all because their failure mode is a passing run.
 #
 # Usage: scripts/check-assumptions.sh
 #        make check-assumptions            [ROUNDS=n] [NODES=n1,n2]
@@ -60,7 +60,7 @@ step=0
 # here must stay copy-pasteable.
 say()  {
   step=$((step + 1))
-  printf '\n[%d/12] %s\n' "$step" "$1"
+  printf '\n[%d/13] %s\n' "$step" "$1"
   shift
   for _c in "$@"; do printf '        $ %s\n' "$_c"; done
   return 0
@@ -83,6 +83,75 @@ else
   exit 1
 fi
 
+# 2. The OTHER interpreter everything here rests on. The engine runs the nodes; Node runs the
+#    harness — every `$NPM run` step below goes through it — so it belongs beside step 1 rather
+#    than at the end, and it costs milliseconds.
+#
+#    This is the Obsidian version check (step 13) applied to the other pinned thing. `obsidian-version`
+#    has always been declared in a file, enforced by the Makefile (IMAGE_TAG) and verified here;
+#    `.nvmrc` was declared and nothing else, which is exactly why a harness running on a Node nobody
+#    chose was invisible for so long. Asked through $NPM rather than by running `node` directly,
+#    because what matters is the interpreter the HARNESS will get, not the one this shell has.
+#
+#    THE MISMATCH IS NOT AUTOMATICALLY A FAILURE, and that distinction is the whole point:
+#      - below `engines` (>=22)  a hard fail. package.json says the code needs it; nothing excuses
+#                                running under it, and no version manager is required to notice.
+#      - off .nvmrc, no fnm      an advisory. fnm is OPTIONAL here (README lists it so), so an
+#                                unenforced pin is a documented state, not a broken one. Said out
+#                                loud every time so it is never silent.
+#      - off .nvmrc WITH fnm     a fail. Enforcement was available and did not hold, which means
+#                                something is wrong with it rather than merely absent.
+say "the harness runs on the Node .nvmrc pins" "$NPM exec -- node -v" "cat .nvmrc"
+# Leading `v` stripped, because `.nvmrc` may legally carry one and `node -v` always does. Comparing
+# the two raw forms made `v26.9.0` — a perfectly ordinary way to write this file — read as a
+# mismatch against the 26.9.0 fnm correctly ran.
+node_want=$(tr -d '[:space:]' < "$here/../.nvmrc" 2>/dev/null | sed 's/^v//')
+node_have=$($NPM exec -- node -v 2>/dev/null | tr -d '[:space:]' | sed 's/^v//')
+node_major=${node_have%%.*}
+# Did mediation actually engage? Read off $NPM itself, which the Makefile built (or this script
+# fell back to). This is the question that matters below — "is fnm installed" is not, because an
+# fnm nobody is using has no bearing on which interpreter the harness gets.
+case "$NPM" in *"fnm exec"*) node_mediated=yes ;; *) node_mediated="" ;; esac
+if [ -z "$node_have" ]; then
+  bad "could not ask node for its version through '$NPM' — the harness may not run at all"
+elif [ -n "$node_major" ] && [ "$node_major" -lt 22 ] 2>/dev/null; then
+  bad "node $node_have is below package.json's engines (>=22) — the harness is not supported here"
+elif [ -z "$node_want" ]; then
+  note "node $node_have; no .nvmrc to compare it against"
+elif [ "$node_want" = "$node_have" ] || [ "${node_have#"$node_want".}" != "$node_have" ]; then
+  # Exact, or `.nvmrc` naming a PREFIX of it: `26` and `26.9` are both legal ways to pin, and fnm
+  # resolves them to a full version the same way nvm does. Demanding an exact string would fail
+  # every repo that pins loosely on purpose, while saying nothing about the apparatus.
+  ok "node $node_have satisfies .nvmrc's $node_want"
+elif [ -n "$node_mediated" ]; then
+  # Mediation RAN and still produced a version .nvmrc does not name. A narrow branch on purpose,
+  # and worth being honest about how narrow: fnm has no reason to disobey the file it just read, so
+  # this is not "fnm is broken".
+  #
+  # What it catches is fnm and this check reading DIFFERENT FILES. fnm resolves from the CURRENT
+  # directory; this check reads `$here/../.nvmrc`, the repo's. Invoke make from a directory carrying
+  # its own `.nvmrc` (`make -f /path/to/repo/Makefile` rather than `make -C /path/to/repo`) and the
+  # harness is pinned by one file while the repo declares another, with nothing else to say so.
+  #
+  # NOT the `.node-version` case, though it looks like it should be: with both files present and
+  # disagreeing, fnm used `.nvmrc` and this check agreed with it. Measured, not assumed — the
+  # earlier version of this comment claimed the opposite.
+  bad "node $node_have through '$NPM', but .nvmrc names $node_want — they disagree, so fnm resolved a different file; is make running outside the repo?"
+else
+  # Nothing mediated, so the pin is simply unenforced — the documented optional state. Note that
+  # this branch does NOT ask whether fnm is installed: the apparatus is identical either way, and a
+  # script that answers "is the apparatus what this project thinks it is?" must not return a
+  # different verdict because of a tool that is sitting unused on PATH. Having fnm changes only the
+  # HINT below, never the verdict.
+  note "node $node_have, .nvmrc pins $node_want — nothing enforced it here (fnm is optional)"
+  if command -v fnm >/dev/null 2>&1; then
+    note "  fnm is installed but could not serve the pin — one command fixes it: fnm install"
+  else
+    note "  to make the pin hold for every caller: brew install fnm && fnm install"
+  fi
+  note "  every npm step below therefore runs on $node_have, not the version this project declares"
+fi
+
 # Are the nodes up? Probed here, before any of the slow checks, and a hard STOP if they aren't.
 # This pass only means something as a whole: three of its checks can only be answered by a running
 # Obsidian, so without nodes it cannot deliver its one verdict ("are results trustworthy?"). Better
@@ -102,14 +171,14 @@ fi
 
 # And is Sync actually RUNNING on them? A fresh container boots paused, and nothing in
 # `containers-up` changes that. Paused, this script does not fail — it answers. Step 7's blocking
-# claims, step 8's write path, step 9's divergence and step 10's race all read differently against a
+# claims, step 9's write path, step 10's divergence and step 11's race all read differently against a
 # node whose Sync was never started, and the verdict at the end would say the apparatus is sound.
 #
 # A STOP rather than a `sync on`: resuming here would make the script the thing that set the world
 # up, and a `paused` nobody noticed would go on being unnoticed everywhere else.
 #
 # Only positively-reported off-states count. A node that does not answer is not a paused node, and
-# is step 6's business, not this one's.
+# is step 7's business, not this one's.
 paused=""
 for n in $(echo "$NODES" | tr ',' ' '); do
   st=$("$CONTAINER_ENGINE" exec "$n" "$CLI" sync:status 2>/dev/null | sed -n 's/^status:[[:space:]]*//p' | head -1)
@@ -169,7 +238,7 @@ in_cidr() {   # in_cidr <ip> <cidr> -> 0 when <ip> falls inside <cidr>
 
 # The addresses the harness will really assign. NODE_IPS comes from make (built with the same
 # NODE_ADDR the `run`/`network connect` lines use); the fallback keeps this script runnable by
-# hand. The probe address is check-net.sh's own, so step 5 can't fail for a reason step 2 missed.
+# hand. The probe address is check-net.sh's own, so step 6 can't fail for a reason step 3 missed.
 if [ -z "${NODE_IPS:-}" ]; then
   NODE_IPS=""
   for n in $(echo "$NODES" | tr ',' ' '); do
@@ -222,7 +291,7 @@ fi
 #    Only its PRESENCE can be checked here. obsidian-cli is an IPC client to a running Obsidian,
 #    not a standalone binary, so `obsidian-cli version` in a bare container answers "The CLI is
 #    unable to find Obsidian" — there is no headless mode. The version comparison therefore needs
-#    a live node, and happens in step 6 with the rest of the live-node checks.
+#    a live node, and happens in step 7 with the rest of the live-node checks.
 say "node image $IMAGE:$OBSIDIAN_VERSION is present and ships the CLI" \
     "$CONTAINER_ENGINE image inspect $IMAGE:$OBSIDIAN_VERSION" \
     "$CONTAINER_ENGINE run --rm --entrypoint /bin/sh $IMAGE:$OBSIDIAN_VERSION -c 'test -x $CLI && echo present'"
@@ -420,7 +489,7 @@ else
   cg_attempt() {
     cli_on "$cgA" delete "file=$cgnote" >/dev/null 2>&1 || true
     cli_on "$cgA" create "path=$cgnote.md" "content=(base)" >/dev/null 2>&1 || true
-    # The note must EXIST on B before the partition. Append to a missing note errors (step 8), so
+    # The note must EXIST on B before the partition. Append to a missing note errors (step 9), so
     # without this both sides would take the create-create path — a different genesis entirely.
     _i=0
     while [ "$_i" -lt 30 ]; do
@@ -593,7 +662,7 @@ for f in sorted(pathlib.Path(sys.argv[1]).glob("*/*.jsonl")):
               " nor any conflict copy on either node" % (f.stem, gap, ", ".join(v["lost"])))
     else:
         print("MERGE %s: gap=%dms both nodes created and the two edits MERGED into one note with no"
-              " conflict file — see step 9. Measured: every merge in a 90-rep soak had a gap above"
+              " conflict file — see step 10. Measured: every merge in a 90-rep soak had a gap above"
               " 400ms, so a merge at a NARROW gap is the surprising one" % (f.stem, gap))
 print("%d of %d reps produced a conflict file (2 needed)" % (conflicts, reps))
 # `bad` is only ever a rep that could not be READ. An outcome is never itself a failure here; the
@@ -685,7 +754,7 @@ fi
 #    against the Obsidian and container engine of the day — measurements of one environment, not
 #    properties of Obsidian, and an engine that changed what an exec costs would move them.
 #
-#    Advisory, like step 11: a slower cell does not invalidate a result, it means a design choice
+#    Advisory, like step 12: a slower cell does not invalidate a result, it means a design choice
 #    has gone stale. The exit code is reserved for the benchmark failing to answer at all, which is
 #    breakage — a composed row that no longer runs, or a row label renamed out from under the check.
 #
@@ -700,9 +769,9 @@ case $? in
   *) bad "bench-cli could not answer — a command it depends on broke, or a row it checks was renamed" ;;
 esac
 
-# The deferred half of step 3: does the Obsidian actually running in a node self-report the version
+# The deferred half of step 4: does the Obsidian actually running in a node self-report the version
 # its image is tagged with? An image that drifted from its tag would mislabel every run's results.
-# Needs a live node for the reason given in step 3, so it rides along here (`live` was resolved up
+# Needs a live node for the reason given in step 4, so it rides along here (`live` was resolved up
 # front — the script would have stopped already if there were none).
 reported=$("$CONTAINER_ENGINE" exec "$live" "$CLI" version 2>&1 | head -1)
 case "$reported" in
