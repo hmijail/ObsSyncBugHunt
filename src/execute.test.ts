@@ -9,6 +9,7 @@ import { CliInconsistencyError } from "./inconsistency.js";
 import { sameConflictSet } from "./oracle.js";
 import { parse } from "./dsl.js";
 import { NoopIsolator } from "./isolate.js";
+import { hostOnline } from "./net.js";
 import type { RunLogger } from "./history.js";
 import type { Executor } from "./exec.js";
 import type { ExecResult } from "./types.js";
@@ -615,7 +616,31 @@ test("assertLocalSyncOn: an inconclusive probe (syncing / timed-out / unreadable
 // hostCheck is left ON (not false) for both of these — the exact path that had zero coverage
 // before this fix, since waitForHostReconnect returns false immediately when hostOnline() is
 // already true (the real, uncontrolled case in a test environment with real internet access).
+//
+// That "real internet access" is a genuine PRECONDITION of these two tests, not an incidental
+// detail, and it is the only one in the suite: every other test here is hermetic. Without it,
+// waitForHostReconnect's retry loop (execute.ts) is deliberately UNBOUNDED — correct for a real
+// soak, which should wait out a real outage, but in a test it means `make test` hangs forever
+// with no output and no clue which of 15 files is stuck. Checked up front so the precondition
+// fails LOUDLY and in ~ms instead. The runtime's own answer to this state is `--skip-host-check`
+// (see run.ts, which aborts with the same diagnosis rather than wedging); this is its equivalent
+// for the test suite.
+//
+// Short timeoutMs on purpose: the default 4s is the right budget for a mid-soak probe deciding
+// whether to blame Sync, but here we only want a fast verdict. A network that DROPS (rather than
+// refuses) packets pays this timeout once per test; a refused connect answers in ~1ms.
+const requireHostOnline = async () => {
+  if (await hostOnline(undefined, undefined, 2000)) return;
+  assert.fail(
+    "this test needs real outbound TCP to 8.8.8.8:53 and the host cannot reach it — it exercises " +
+    "waitForHostReconnect's grace-retry path with hostCheck ON, whose retry loop is unbounded by " +
+    "design. Skipped-by-failing rather than hung. Re-run with connectivity (the rest of the suite " +
+    "is hermetic and passes offline).",
+  );
+};
+
 test("assertLocalSyncOn: an off-state that recovers within the grace window does NOT abort, and flags hostOutage", async () => {
+  await requireHostOnline();
   const vault = new Map<string, string>();
   // startSynced:false — off from the very first read (as a real broken-from-rep-start local
   // instance would be); then recovers after two reads, well within localSyncGraceAttempts below.
@@ -630,6 +655,7 @@ test("assertLocalSyncOn: an off-state that recovers within the grace window does
 });
 
 test("assertLocalSyncOn: an off-state that persists through every grace attempt still aborts", async () => {
+  await requireHostOnline();
   const vault = new Map<string, string>();
   const local = new ObsidianDriver(new SharedVaultExecutor("MyLocal", vault, "error", false));
   const noLog = stubLogger();

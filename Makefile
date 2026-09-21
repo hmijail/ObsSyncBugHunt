@@ -431,8 +431,16 @@ clean-data: clean-notes ## Fresh slate for a soak: clear the harness's notes (bu
 
 trial: containers-up run ## Clean-slate run: recreate + gate the nodes, then run one history from cold
 
-containers-down: ## Stop + remove n1/n2
+# $(LOGIN) is removed here too, not just the nodes. The happy path never needs it — capture-login
+# already rm -f's the login container on its way out — but an ABANDONED login (make login, then
+# never captured) leaves it running on $(NET), where solo-check correctly refuses to run against
+# it as a stray and tells you to "make containers-down". That hint was a dead end while this
+# target only knew about $(CONTAINER_NODES): the one command named as the fix could not clear the
+# one container that was blocking you. Everything this target removes is recreatable from
+# ./secrets (nodes) or by re-running make login, so widening it costs nothing.
+containers-down: ## Stop + remove n1/n2 + an abandoned login container
 	-@for n in $(CONTAINER_NODES); do $(CONTAINER_ENGINE) rm -f $$n 2>/dev/null || true; done
+	-@$(CONTAINER_ENGINE) rm -f $(LOGIN) 2>/dev/null || true
 
 ps: ## List containers on the test network
 	$(CONTAINER_ENGINE) ps --filter network=$(NET)
