@@ -241,6 +241,15 @@ interface Change {
    *  `synced` for the trivial reason that the write has not happened yet — timing the upload from
    *  before this point records ~0s for a push never issued. */
   writtenMs: number | null;
+  /** Why the write call itself did not succeed, or null if it did. A THIRD state alongside
+   *  "never attempted" (`issuedMs === 0`) and "attempted and landed": attempted, and the CLI
+   *  refused or was killed. The distinction matters for the same reason `unissued` exists — a
+   *  write that never reached disk is not evidence about propagation, and reporting it as a
+   *  change that "never arrived at the peer" accuses Sync of losing something that was never
+   *  written. Kept as the message, not a bare flag, because the failure is the only record: the
+   *  raw primitives used below (`appendLine`/`createNote`) do NOT read back what they wrote, so
+   *  unlike the run path's `editAndConfirm` there is no second chance to notice. */
+  writeError: string | null;
   uploadSec: number | null;
   arriveSec: number | null;
 }
@@ -309,7 +318,7 @@ async function runAll(steps: Step[]): Promise<{ changes: Change[]; render: strin
       // indistinguishable from one whose measurement is genuinely unavailable, which is correct —
       // neither has a number to show.
       sinceSynced: Infinity, expected: NaN,
-      issuedMs: 0, writtenMs: null, uploadSec: null, arriveSec: null, partitioned: false,
+      issuedMs: 0, writtenMs: null, writeError: null, uploadSec: null, arriveSec: null, partitioned: false,
     }];
   });
   let writeIdx = 0; // which planned row the next write step fills in
@@ -430,8 +439,29 @@ async function runAll(steps: Step[]): Promise<{ changes: Change[]; render: strin
         c.issuedMs = Date.now();
         // Fire and forget: awaiting here would stall the sampler, which is the whole point of the
         // rewrite. A rejected write still resolves the guard so the loop cannot wedge on it.
+        //
+        // Not awaiting is fine; DISCARDING THE REJECTION was not. Both handlers used to be the
+        // same `c.writtenMs = Date.now()`, which made a write that threw indistinguishable from
+        // one that landed — and since `issuedMs` is stamped above, before the call is even fired,
+        // such a row then counted as ISSUED and so as "never arrived at the peer", i.e. as data
+        // loss. Recording the error costs nothing and needs no await.
         void (c.created ? d.createNote(full, `${c.token}\n`) : d.appendLine(full, c.token))
-          .then(() => { c.writtenMs = Date.now(); }, () => { c.writtenMs = Date.now(); });
+          .then(
+            () => { c.writtenMs = Date.now(); },
+            (e: unknown) => {
+              c.writtenMs = Date.now();
+              // `CliUnrecognizedOutput`'s message is built from argv + STDOUT only, so an empty
+              // reply reads as `: ""` and says nothing about WHICH layer produced it — the engine
+              // exec failing to reach the container, or obsidian-cli running and printing nothing,
+              // are indistinguishable there. The exit code and stderr are the two fields that tell
+              // them apart, and they are already on the carried `raw`; pull them out.
+              const raw = (e as { raw?: { code?: number; stderr?: string; killed?: boolean } }).raw;
+              const detail = raw
+                ? ` [exit=${raw.code ?? "?"} killed=${raw.killed ?? "?"} stderr=${JSON.stringify(raw.stderr ?? "")}]`
+                : "";
+              c.writeError = (e instanceof Error ? e.message : String(e)) + detail;
+            },
+          );
         pending.push(c);
         // The note's own letter, so a history touching several notes says WHICH one moved. Note
         // letters are lowercase and the fault marks uppercase, so `d` and `D` never collide.
@@ -663,6 +693,8 @@ async function main(): Promise<void> {
   let bad = 0;
   let lost = 0;
   let unissued = 0;
+  let unwritten = 0;
+  const writeErrors: string[] = [];
   for (let r = 1; r <= repeat; r++) {
     console.log(`\n  ${historyOf(steps)}${repeat > 1 ? `   (run ${r}/${repeat})` : ""}\n`);
     if (r === 1) { for (const line of COLUMN_KEY) console.log(line); console.log(""); }
@@ -674,8 +706,16 @@ async function main(): Promise<void> {
     // Only ISSUED writes can be lost. Now that the table is planned up front, a run that hits
     // GIVE_UP_MS mid-history leaves later rows never attempted — counting those as "never arrived"
     // would report a write that was never made as a data loss.
-    lost += changes.filter((c: Change) => c.issuedMs !== 0 && c.arriveSec === null).length;
+    // …and by the same argument one step further: a write that WAS attempted but whose call
+    // failed never reached disk either, so it is not a lost change. These rows are reported
+    // separately below rather than silently dropped — a probe that cannot write is itself a
+    // finding, just not a finding about Sync.
+    lost += changes.filter((c: Change) => c.issuedMs !== 0 && c.writeError === null && c.arriveSec === null).length;
     unissued += changes.filter((c: Change) => c.issuedMs === 0).length;
+    unwritten += changes.filter((c: Change) => c.issuedMs !== 0 && c.writeError !== null).length;
+    for (const c of changes) {
+      if (c.writeError !== null) writeErrors.push(`${c.op}: ${c.writeError}`);
+    }
     // Only UNDERSHOOT counts against the model: a write going out sooner than the note's own window
     // allows means the throttle shortened or went. Overshoot is normal — the uploader is shared, so
     // a write can queue behind another note's upload — and shows in the table without comment.
@@ -694,10 +734,19 @@ async function main(): Promise<void> {
     // out before the history did.
     console.error(`\n  --  ${unissued} step(s) never ran: the history outlasts the ${GIVE_UP_MS / 1000}s budget`);
   }
+  if (unwritten > 0) {
+    // A hard failure, like `lost` — but of the APPARATUS, not of Sync, and the wording has to say
+    // so. These rows measure nothing: the token never reached the writer's own disk, so its
+    // absence on the peer is arithmetic, not evidence.
+    console.error(`\n  FAIL ${unwritten} write(s) never landed on the writing node — the probe could not write, so this run measures nothing about propagation`);
+    for (const e of writeErrors) console.error(`        ${e}`);
+    console.error(`        (unlike the run path, this probe writes via appendLine/createNote, which do NOT read back —`);
+    console.error(`         so a write that fails here is only ever visible as the error above.)`);
+  }
   if (lost > 0) {
     console.error(`\n  FAIL ${lost} issued change(s) never arrived within ${GIVE_UP_MS / 1000}s`);
-    process.exit(1);
   }
+  if (lost > 0 || unwritten > 0) process.exit(1);
   // The only line that is a judgement rather than data: whether anything beat the modelled floor.
   // check-assumptions reads it. Overshoot and blank rows are visible in the table and need no prose.
   console.log(bad === 0 ? `\n  ok  no change beat the ${CYCLE_SEC}s per-note floor` : `\n  --  ${bad} change(s) beat the ${CYCLE_SEC}s per-note floor`);
