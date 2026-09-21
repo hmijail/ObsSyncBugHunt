@@ -1,73 +1,62 @@
 # Obsidian Sync Bug Hunter
 
 This is a semantic fuzzer for a simple distributed system (Obsidian Sync and its clients).
-In other words, a test harness that hunts for **data loss in Obsidian Sync** when the
+In other words, a test harness that hunts for data loss in Obsidian Sync when the
 same note(s) are edited alternatively on multiple Obsidian instances.
 
 Inspired by [Jepsen](https://jepsen.io/), which would be overkill for something like Obsidian Sync.
 
-**I wrote this README personally. Everything else, including the docs/ dir, are Claude artifacts.**
+**I wrote this README personally. Everything else, including the docs/ directory, are Claude artifacts.**
 
-# Some background: data loss in Obsidian Sync
+Reproduce a data loss example on your own Obsidian Sync [here](#lets-lose-some-data).  
+See that example as a timeline [here](#timelines), as reported by the fuzzer.
+
+# Some background: data loss in Obsidian Sync!?
 
 Obsidian is a nice note-taking app. It's closed-source but free. It has a sync service, Obsidian Sync, which is subscription-based. This service has data-losing bugs. A [thread in the Obsidian forums](https://forum.obsidian.md/t/obsidian-sync-on-iphone-overwrites-newer-data-causing-data-loss/85214?u=hmijail) has been running for 2 years now gathering complaints, but the devs seem unable to find the problem. They proposed workarounds, but they fail too.
 
-I lost data to Obsidian Sync and found that thread. I proposed using e.g. Jepsen to find bugs in a systematic way. There was no response.
+I lost data to Obsidian Sync too, and found that thread. I proposed using e.g. Jepsen to find bugs in a systematic way. There was no response.
 
-I was looking for some test project to use Claude Code on, so I asked it to apply Jepsen to Obsidian. Claude jumped to make things happen; unfortunately those were pretty silly things. It quickly became clear that Jepsen is far too serious a tool for this purpose, and that Claude needs its tasks to have much, *much* tighter scope.
+I wanted some test project to use Claude Code on, so I told it I wanted to apply Jepsen to Obsidian. Claude jumped to make things happen; unfortunately those were [pretty silly things](https://hmijail.substack.com/p/building-a-semantic-fuzzer-for-obsidian-sync-in-spite-of-claude). It quickly became clear that Claude needs its tasks to have much, *much* tighter scope.
 
-So I started guiding the design, following the adversarial/paranoiac themes from [DARUM](https://hmijailblog.blogspot.com/2025/04/Introducing-DARUM-DAfny-Resource-Usage-Measurement.html), which (in its own way) also plays with randomness and repetitions to force an uncollaborative black box to reveal a bit of its inner workings. Plus containers and network control.
+Long story short, I started guiding the design of a semantic fuzzer, following the adversarial/paranoiac themes from my own [DARUM](https://hmijailblog.blogspot.com/2025/04/Introducing-DARUM-DAfny-Resource-Usage-Measurement.html), which (in its own way) also plays with randomness and repetitions to force an uncollaborative black box to reveal a bit of its inner workings. Plus containers and network control.
 
-**So 100% of the design is mine** (and this README), but **the code is 100% Claude's**. In fact, I never used TypeScript; I chose it because it's a language used in the Obsidian ecosystem... and to force myself to stay hands-off and trust Claude.
+**So 100% of the design is mine** (and this README), but **the code is 100% Claude's**. In fact, I never used TypeScript; I chose it because it's a language used in the Obsidian ecosystem... and to force myself to stay hands-off and trust Claude. (I won't be repeating that)
 
 ## Results
 
-One result is that the fuzzer works: the harness finds different sequences of operations that trigger sync bugs in Obsidian, measures their repeatability and even helps understand how the sequence failed. Yay!
+One result is that **the fuzzer works**: the harness finds different sequences of operations that trigger sync bugs in Obsidian, measures their repeatability and even helps understand how the sequence failed. Yay!
 
-The other result is that Claude was surprisingly, increasingly bad at this. Full experience report [here](https://hmijail.substack.com/p/building-a-semantic-fuzzer-for-obsidian-sync-in-spite-of-claude).
+The other result is that **Claude is "interesting" for coding, but a surprisingly, increasingly incompetent assistant**. Full experience report [here](https://hmijail.substack.com/p/building-a-semantic-fuzzer-for-obsidian-sync-in-spite-of-claude), plus some posible remediations.
 
-The summary is that keeping Claude Code in a leash tight enough to stop it from doing silly stuff is consuming in multiple ways. It's like an intern that knows far too much for their own good, uses that knowledge to make bad choices... plus periodically forgets important points... but rarely lets go of pointless minutiae. Also, you're responsible for what it remembers, even though you only have coarse tools to control that. Also, those tools keep changing, no one knows how to best use them, and even Anthropic's instructions are too clear.
+The summary is that keeping Claude in a leash tight enough to stop it from doing silly stuff is hard work. Claude is like an intern that knows far too much for their own good, uses that knowledge to make bad choices... plus periodically forgets instructions... but rarely lets go of pointless minutiae. Also, you're responsible for what it remembers, even though you only have coarse tools to control that. Also, those tools keep changing, no one knows how to best use them, and even Anthropic's instructions aren't very consistent.
 
 So that's a blurry mess. OK, but what did *I* learn from this project? Only things about Claude itself, the stuff that keeps changing. But nothing about the matter at hand. In fact, it's the opposite: I had to teach Claude how to build this.
 
-**If Claude was an intern, I could expect that they learnt something, and if this was a work project maybe even that they'd take over and keep the project moving forward. But Claude doesn't learn.** The wordy, knows-too-much, unwise intern is replaced by a clone every morning, who quickly goes through the code to get an idea of what is what, and then fumbles onward.
+**If Claude was an intern, I could expect that they learnt something, and maybe even that they'd take over and keep the project moving forward. But Claude doesn't learn.** The wordy, knows-too-much, unwise intern is memory-wiped every morning, who quickly goes through the code to get an idea of what is what, and then fumbles onward one more day at a time.
 
 In a nutshell: this is an **insta-legacy project**, that **ties you to LLMs**, and **requires experience, but doesn't create it**.
 
-# Motivating example: let's lose some data
+# Let's lose some data
 
-This is one sequence of operations found by the fuzzer. It causes data loss ~100% of the time in Obsidian 1.12 and 1.13.7 (latest as of this writing). Reported 2 months ago,  still not acknowledged nor fixed as of this writing.
+As a motivating example, this is one sequence of operations found by the fuzzer that causes data loss ~100% of the time in Obsidian 1.12 and 1.13.7 (latest as of this writing). Reported 2 months ago,  still not acknowledged nor fixed as of this writing.
 
-Let’s assume you use Obsidian with Sync in your phone and your laptop. Both should set their Sync settings to “Conflict file” mode, which is the [devs’ recommendation hoping to minimize data loss](https://forum.obsidian.md/t/obsidian-sync-on-iphone-overwrites-newer-data-causing-data-loss/85214/33).
+Let’s assume you use Obsidian with Sync in your phone and your laptop. Both should set their Sync settings to “Conflict file” mode, which is the [devs’ recommendation](https://forum.obsidian.md/t/obsidian-sync-on-iphone-overwrites-newer-data-causing-data-loss/85214/33)  hoping to minimize data loss.
 
-Note that this particular bug needs you to finish all the steps within 60 seconds! Later we’ll see why.
+Note that this particular bug needs you to finish all the steps within 60 seconds! [Later we’ll see why.](#see-how-timings-change-sync-behavior-and-hide-the-bug)
 
 1. Set your iPhone on airplane mode; ensure Wifi is also disconnected.
 2. In your laptop, created the note “buggy” (or whatever you want)
 3. In that note, type “laptop”
-4. Wait until Obsidian syncs up and shows the green sync icon (few seconds)
+4. Wait until Obsidian syncs up and shows the green sync icon (a couple of seconds)
 5. On your phone, create the same note “buggy”
 6. In that note, type “phone”
 7. Disable airplane mode on the phone and wait for sync.
 
-After sync finishes, only the line “laptop” remains in the “buggy” note. That’s to be expected, since there was a conflict; the problem is that a Conflict File should have been created with the “phone” line, but it didn’t. So the line is gone everywhere. And you didn’t dream it: looking at the Sync version history, you’ll see that the line did indeed reach the server.
+After sync finishes, only the line “laptop” remains in the “buggy” note. That’s to be expected, since there was a conflict; the problem is that a Conflict File should have been created to save the “phone” line, but it didn’t. So that line is gone everywhere. And you didn’t dream it: looking at the Sync version history, you’ll see that the line did indeed reach the server.
 
-## Play-by-play timeline view
+The fuzzer shows how the bug happens with an [ASCII timeline](#timelines).
 
-The fuzzer not only finds the sequence, but allows you to see what exactly happened in each Obsidian instance. For example, for this sequence, the fuzzer would show you a timeline like this:
-
-XXX
-
-'m' means that the expected note exists but is `m`issing a token. The seequence ended in that state (including a grace period), therefore we have a confirmed data loss. The fuzzer confirms this by running many repetitions to calculate how repeatable this scenario is.
-
-## **See** how timings change Sync behavior and hide the bug
-
-I said this example sequence needs all steps happening within 60 seconds. But why? Let's compare what happens if you wait e.g. 60 seconds just before disabling Airplane mode on the phone at step 7 (therefore ensuring that the whole sequence lasts longer than 60 seconds):
-
-XXX
-Look at what happened at second XXX: Obsidian noticed that the network is down and reported that the Sync status was bad. When the network came back up, Obsidian eventually reconnected to Sync, exercising some error recovery path that didn't trigger this particular bug: the conflict file exists now! Even further: since the error condition appeared at second XXX, we can infer that from that moment on this particular bug won't be triggered.
-
-And that is how we know that the original sequence needs to last less than 60 seconds.
 
 # Fuzzer features
 - Sets up multiple Obsidian instances running in containers, prepared to use Obsidian Sync (requires an Obsidian Sync subscription)
@@ -84,7 +73,7 @@ And that is how we know that the original sequence needs to last less than 60 se
 # Prerequisites
 
 * Obsidian Sync subscription (if you want one just to test this project, know that it seems refundable during the first week)
-* Podman or Docker (in macOS, 2 vCPUs / 4GB RAM in the VM is enough for 2 Obsidian containers).
+* Docker (in macOS, 2 vCPUs / 4GB RAM in the VM is enough for 2 Obsidian containers). Podman also works but seems to make sampling slower; prefer Apple Hypervisor to krunkit.
 * Node >= 22
 * Python 3
 * A VNC client to make the containerized Obsidian log in to your Sync account (and optionally to watch how Obsidian runs histories)
@@ -169,16 +158,15 @@ Edits to notes are append-only (for now?), since that is a case supported by the
 
 ### One key difficulty: `W` formalizes (somewhat) the synced status
 
-Syncing is hard. It can happen that the user is editing stuff while changes are coming in or out of Obsidian. It can even happen that something is wrong with the network and syncing gets delayed, accumulating conflicting changes at different points of the process, while you, the user, might not know or even care that this is happening; you count on Obsidian to deal with that for you.
+Syncing is hard. It can happen that the user is editing stuff while changes are coming in or out of Obsidian. It can even happen that something is wrong with the network and syncing gets delayed, accumulating conflicting changes at different points of the process, while you, the user, might not know or even care that this is happening.
 
-While this is perfectly reasonable for a normal user (after all that's the premise of many sync solutions like Obsidian Sync), for the fuzzer to do its job better we need to try to formalize the different underlying scenarios. Hence, `W` doesn't only trust the Sync status reported by Obsidian (which corresponds to the Sync icon in the GUI), but also checks metadata from the Sync server and content of modified notes; it will only let the history continue when the synced status does seem correct (and will otherwise record a data loss bug if it looks wrong after a configurable grace period).
+The user can (in theory) count on Obsidian to deal with this. But for the fuzzer to do its job better we need to try to formalize the different underlying scenarios. Hence, `W` doesn't just trust the Sync status reported by Obsidian (which corresponds to the Sync icon in the GUI), but also checks metadata from the Sync server and content of modified notes; it will only let the history continue when the synced status does seem correct (and will otherwise record a data loss bug if it looks wrong after a configurable grace period).
 
-On the other hand, Obsidian Sync bugs might also get triggered by an impatient user who tries editing notes while the Sync status is not settled. This case is covered by `W<n>`. For example, `W10` simulates a user who waits for 10 seconds for the GUI Sync icon to show activity; after that, they just go ahead and edit a note.
-
+On the other hand, Obsidian Sync bugs might also get triggered by an impatient user who tries editing notes while the Sync status is not settled. This case is covered by `W<n>`. For example, `W10` simulates a user who waits for a maximum of 10 seconds for the GUI Sync icon to get green; after that, they just go ahead and edit a note anyway. (Which makes sense, because sometimes the icon changes are hard to see).
 
 ## Practical example
 
-The [motivating example](#motivating-example) at the beginning of this README was found by the fuzzer as this history: **N2DN1AaWN2AaCW**
+The [motivating example](#lets-lose-some-data) at the beginning of this README was found by the fuzzer as this history: **N2DN1AaWN2AaCW**
 
 (Found in Obsidian 1.12.7, still there in 1.13.7)
 
@@ -192,16 +180,26 @@ The [motivating example](#motivating-example) at the beginning of this README wa
 - C : connect the current node
 - W : wait for sync
 
-Interestingly, this history results in data loss only when D/C is implemented by the network disconnecting and reconnecting (`ISOLATOR=network`, default), but not when implemented by Obsidian Sync being turned off and on through the CLI (`ISOLATOR=sync`).
-XXX
-* when it's 2 Linux containers syncing, but it seems to fail less consistenly when it's 1 Linux vs 1 Mac instance (i.e., **N2DLAaWN2AaCW**)
-
-Conversely, other bugs only happen between a Mac and a Linux instance, but not between 2 Linux instances. E.g. **N1DAaCLP9Aa**, reproducible in about 20% of repetitions (maybe dependent on CPU load?).
-
 ## Timelines
 Running a history creates long logs. For easier inspection, these are summarized into an ASCII timeline that shows what happened, where and when.
 
-TImelines consist of lanes (rows), with each lane dedicated to one type of sample, with various letters representing events.
+For example, this is the timeline generated by the motivating example:
+
+**make run HISTORY=N2DN1AaWN2AaCW SAMPLING=everything**
+```
+seconds    0    1      2  3 4   5    7            60
+n1 ops     |   a|  W   |  | |   ||   |            |   |   ||    |
+n1 sync    |    |x .   |x | |.  ||.  |            |.  |.  ||x   |.
+n1 vers a  | -  |x     |1 | |2  ||.  |            |.  |x  ||.   |.
+n1 file a  |    |x .   |M | |M  ||m  |            |m  |m  ||m   |m
+n2 ops     |D   |    aC|  |W|   ||   |    ...     |   |   ||    |
+n2 sync    |    | x    | x|s| ..|| ..|            | x.| x.|| x. | x
+n2 vers a  |  - | x -  | x| | 2 || . |            | . | . || .  | .
+n2 file a  |    | x    | M| | m || m |            | m | m || m L| m
+```
+
+### How to read that?
+TImelines consist of lanes (rows), with each lane dedicated to one type of data we sample. In each lane, various letters represent events.
 Samples that are taken at the same time are plotted in the same column. For ease of reference, seconds are separated by columns of |.
 
 Letter meanings:
@@ -212,7 +210,34 @@ Letter meanings:
   `.` sampled but unchanged · `-` no server history yet
 - **file** (per node per note) — `.` file is complete and unchanged · `u` file changed here, is complete · `m` missing a token · `M` changed here, missing a token · `c` changed here and a conflict file appeared · `C` same, but some token is missing · `-` no file · `L` loss declared · `!` readings that do not add up
 
-A column where nothing was sampled will be empty. If full of dots, sampling happened but there was nothing interesting.
+A column where nothing was sampled will be empty (`||`). In general, dots mean "we sampled here but wasn't interesting".
+
+### Data loss, play by play
+Can you see now what happened in that example history?
+* The operations actually finished on second 3: Node 2 waited for sync to happen, and at that moment, Obsidian reported it was in the process of syncing. But actually, we can see that in second 2, Node 2's note `a` had already been modified, and it was `M`issing a token. This shows that there's some time skew between the moment that the note is written to the moment that Obsidian reports sync is actually finished.
+* To track the note history across nodes, we take advantage of the note version counter in the Sync server. Version 1 of the note was reported by Node 1 on second 2. Then, on second 4, version 2 appears in both nodes, just after we allowed Node 2 to sync. Interestingly, we never catch a glimpse of version 1 in Node 2.
+* When the history operations finish on second 3 and sync status and version counter stabilize on second 4, everything looks finished. Only, the notes in both nodes are `m`issing a token. The fuzzer then waits a grace period of 60 seconds, before judging data `L`oss on second 63.
+
+### **See** how timings change Sync behavior and hide the bug
+
+I mentioned that this history needs all steps happening within 60 seconds. But why? Let's compare what happens if you wait e.g. 70 seconds just before disabling Airplane mode on the phone at step 7:
+
+**make run HISTORY=N2DN1AaWN2AaP70CW SAMPLING=everything**
+```
+seconds    0      1      2   4             60           65         70
+n1 ops     |   a  |W     ||  |             |  |  ||  |  | | |  |  ||  | |   ||
+n1 sync    |    x |.   s ||. |             |. | .|| .| .| |.| .| .|| .| |.  ||.
+n1 vers a  | -  1 |    . ||. |             |. | .|| .| .| |.| .| .|| .| |x  ||.
+n1 file a  |    u |.   m ||m |             |m | m|| m| m| |m| m| m|| m| |m  ||.
+n2 ops     |D     |  aP  ||  |     ...     |  |  ||  |  | | |  |  ||  |C|  W||
+n2 sync    |     x|     x|| x|             | x|e ||e |e |e| |e |e ||e | | xe|| ss
+n2 vers a  |  -  -| -   x|| x|             | x|? ||? |? |?| |? |? ||? | | ? || 1
+n2 file a  |     -|     M|| m|             | m|m ||m |m |m| |m |m ||m | | m || c
+```
+* The newly introduced `P`ause starts on second 1. This pushes the `C`onnection of Node 2 to second 71.
+* The interesting part is what happens at second 61. Until 60, Obsidian was taking too long to respond to our sync status and version counter probes, so we were timing them out early (`x`) to avoid blocking . But at second 61, suddenly Obsidian started reporting sync `e`rror! That's when it noticed that the network is down.
+* When the network `C`onnected again at 71, Obsidian eventually reconnected to Sync, exercising some error recovery path that didn't trigger this particular bug: the conflict file exists now, see the `c` at second 74; plus now version 1 is reported in Node 2!
+* Since the error happened at second 61, we can infer that from that moment on this particular bug won't be triggered. Hence the 60 second limit.
 
 
 ## Pacing between cross-node edits to the same note
@@ -237,7 +262,7 @@ The exact way in which nodes go offline is selected via `ISOLATOR`:
 
 Containers virtualize Obsidian clients that run on Linux. But what if we want to introduce a Mac client? Bugs might be different, so confirming reproducibility would be nice.
 
-A possible future improvement could be to use a Mac VM (or even an iPhone simulator). But for now, if you are in a Mac, then you don't need to virtualize it! You can have the harness talk to your local Obsidian: just open the Sync vault and use `L` in your histories, or use e.g. `make soak NODES=n1,l` so that generated histories include the local node.
+A possible future improvement could be to use a Mac VM (or even an iPhone simulator). But for now, if you are in a Mac, then you don't need to virtualize it! You can have the harness talk to your local Obsidian: just open the Sync vault, configure it to create Conflict files, and enable the CLI. Then you can use `L` in your histories, or use e.g. `make soak NODES=n1,l` so that generated histories include the local node.
 
 Of course this means that while the histories are being run, your Obsidian client will be doing stuff to this vault. You should not disturb it (e.g. by changing the note in focus), so it's best to do this when you will not be using Obsidian yourself, e.g. during the night.
 
@@ -249,7 +274,7 @@ That said, if you have multiple vaults, you could keep the Sync vault in its own
 
 `make analyze` aggregates all the runs' results into tables in a file `runs/analysis.md`, to ease eyeballing of failure patterns across many histories and repetitions.
 
-It also surfaces timing distributions, which might end up hinting at the reason why some history reps were successful while others lost data.
+It also surfaces timing distributions, which might end up hinting at the reason why some history reps were OK while others lost data.
 
 One can also comb manually through the logs. Read on for the gory details.
 
@@ -326,7 +351,7 @@ So here's is a dump of ideas that may, or may not, be interesting or cool to wor
 - In fact, the very Obsidian driver could be made generic to work on other programs, like Logseq. That'd be kinda funny, given that I left Logseq because of how *data-lossy* it was.
 - The local node's purpose is to allow a Mac Obsidian client into the otherwise Linux mix. But since the local node works directly on the host's own Obsidian instance, this limits what can be done with it: e.g., no network faults (because it would also kill the containers' network). So it could be interesting to remove that local corner case and instead use `tart` to have a macOS VM, just as another ~container.
 - Another alternative would be to use macOS' `pfctl` to selectively block Obsidian Sync connections. But that gets into another can of worms with sudo, etc.
-- Conflict files are only supposed to appear in concrete Sync scenarios. The bugs found until now are pretty clearly about conflict files failing to be created by the Obsidian client. Tuning the pause lengths is an easy way to bias towards *which* client should create a conflict file. Therefore, could the pause time be enough to pinpoint a bug in the code?
+- Conflict files are only supposed to appear in concrete Sync scenarios. The bugs found until now are pretty clearly about conflict files failing to be created by the Obsidian client. Tuning the pause lengths is an easy way to bias towards *which* client should create a conflict file. Therefore, could the pause time be enough to point to different bugs in the code?
 - Looks like there's some correlation between container CPU availability and some bugs' reproducibility. Could this reduce to pause length again?
 - Relatedly, given that Obsidian is closed-source, could the exact failure mode be reconstructed / reverse-engineered with DTrace / eBPF? or maybe something Electron-specific?
 
