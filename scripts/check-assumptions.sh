@@ -34,6 +34,11 @@
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# The same mediated npm the Makefile builds and exports, so a step run from `make` and the same
+# step run by hand use the identical Node. Detected here too rather than only inherited, because
+# this script is meant to be runnable standalone (see Usage above) and a bare `npm` there would
+# quietly be a different interpreter than the one `make check-assumptions` just used.
+NPM="${NPM:-$(command -v fnm >/dev/null 2>&1 && echo "fnm exec -- npm" || echo npm)}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)}"
 NET="${NET:-obsidian-net}"
 SUBNET="${SUBNET:-10.89.0.0/24}"
@@ -265,8 +270,8 @@ fi
 #    this script gets run — check it up front. Needs live nodes, so it goes last; with them down
 #    it FAILS rather than skipping (see the header: an unanswered check must never read as PASS).
 say "obsidian-cli output still parses (nodes: $NODES)" \
-    "npm run check-cli -- --nodes $NODES"
-npm run --silent check-cli -- --nodes "$NODES"
+    "$NPM run check-cli -- --nodes $NODES"
+$NPM run --silent check-cli -- --nodes "$NODES"
 case $? in
   0) ok "every command the harness depends on is still recognized" ;;
   3) bad "check-cli found no running node (did one go away mid-run?) — nothing was verified" ;;
@@ -280,8 +285,8 @@ esac
 #    synced yet" and every settle would be reading noise. Per-attempt capping likewise assumes sync
 #    reads can hang. Measured, not asserted: see docs/DESIGN.md.
 say "sync:status / sync:history still block the way the settle assumes" \
-    "npm run probe-sync-versions -- --check"
-if npm run --silent probe-sync-versions -- --check; then
+    "$NPM run probe-sync-versions -- --check"
+if $NPM run --silent probe-sync-versions -- --check; then
   ok "the bounded-probe design still rests on true behaviour"
 else
   bad "sync CLI blocking behaviour changed — src/driver.ts's syncStateProbe may be reading noise"
@@ -528,7 +533,7 @@ pre10_fails=$fails
 race_clean=0
 race_dir="./check-assumptions-runs/step10-$(date -u +%Y%m%dT%H%M%SZ)"
 say "N1AaN2Aa still conflicts: 2+ of 4 reps (no partition, timing only)" \
-    "npm run start -- --history N1AaN2Aa --repeat 4 --runs-dir ${race_dir#./} --display off"
+    "$NPM run start -- --history N1AaN2Aa --repeat 4 --runs-dir ${race_dir#./} --display off"
 rm -rf "$race_dir"
 # Not runs/: corpus.ts parses a run directory as `<ts>-<history>` and analyze.ts groups by the
 # directory name, so a telltale name there would enter the corpus tables as a bogus history.
@@ -538,7 +543,7 @@ rm -rf "$race_dir"
 # than dismiss. Whether the run happened is decided by whether it left rep logs.
 #
 # `cd` because this script runs from any directory but `npm run` does not.
-(cd "$here/.." && npm run --silent start -- --history N1AaN2Aa --repeat 4 \
+(cd "$here/.." && $NPM run --silent start -- --history N1AaN2Aa --repeat 4 \
    --runs-dir "$here/../${race_dir#./}" --display off) >/dev/null 2>&1 || true
 race_dir="$here/../${race_dir#./}"
 if [ -z "$(find "$race_dir" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
@@ -666,8 +671,8 @@ fi
 #    that leaves old conclusions standing on a floor that moved. It prints its own verdict; the exit
 #    code is reserved for a change that never arrived at all, which is breakage rather than drift.
 say "sync propagation is still as fast as recorded (advisory)" \
-    "npm run probe-propagation"
-if npm run --silent probe-propagation; then
+    "$NPM run probe-propagation"
+if $NPM run --silent probe-propagation; then
   :
 else
   bad "a change never arrived at the peer at all — that is not drift, something is broken"

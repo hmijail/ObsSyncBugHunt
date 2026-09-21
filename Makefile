@@ -28,8 +28,67 @@
 # every rep's `history` event (see run.ts) — that, not this file, is the authoritative record of
 # what a given run tested.
 VERSION_FILE := obsidian-version
-# The Node pin, read only for the advisory in `tools-advice` — nothing here enforces it (fnm/nvm do).
 VERSION_FILE_NODE := .nvmrc
+
+# ---- the Node the project actually runs on ---------------------------------
+#
+# `.nvmrc` is an inert text file: something has to read it. fnm's usual `fnm env --use-on-cd` reads
+# it by hooking `cd`, which only fires in an INTERACTIVE shell that has sourced the hook. Every
+# other caller — a make recipe, CI, a cron job, an editor's task runner, an agent driving the repo
+# through a non-interactive bash — silently gets whatever `node` happens to be first on PATH. That
+# is precisely the "running on a Node nobody chose" this project already warns about, and an
+# advisory cannot prevent it.
+#
+# `fnm exec` needs no hook: it reads .nvmrc itself and runs the command under that version. Routing
+# every npm invocation through it makes the pin hold for EVERY caller, which is the property
+# .nvmrc always appeared to have and never did. Verified on both sides of the divide: in a plain
+# non-interactive shell `node -v` reports 23.6.0 while `fnm exec -- node -v` reports .nvmrc's
+# 26.9.0. (It also works where `fnm env` does not — the latter wants a writable multishell dir.)
+#
+# Exported so scripts/ inherits the same mediated npm rather than reaching for a bare one; each
+# script keeps a `:-npm` fallback so running it by hand still works.
+#
+# THE PROBE ASKS WHETHER fnm CAN ACTUALLY SERVE THE PIN, not merely whether fnm exists. "fnm is
+# installed but .nvmrc's version is not" is a real and ordinary state — fnm is commonly installed
+# for some other project — and testing only for the binary turned that state into a hard failure of
+# every target here. fnm is listed as OPTIONAL in the README and was optional before this mediation
+# existed; making it conditionally mandatory would be this change quietly growing a second, unasked
+# purpose. So an unusable fnm falls back to plain `npm`, exactly as if it were absent.
+#
+# ~21ms per make invocation, measured, against ~7ms for a bare `command -v`. Worth it: the cheap
+# probe answers the wrong question.
+#
+# What it must NOT do is fall back SILENTLY, which would be the "running on a Node nobody chose"
+# this exists to stop. Absent fnm is the documented optional state and says nothing; fnm that
+# cannot serve the pin is a narrow, genuinely-wrong state and warns every time, until one
+# `fnm install` fixes it for good.
+# fnm's OWN stderr, so the warning names the actual reason rather than guessing at one. It is empty
+# on success (verified), which is what lets a single probe be both the test and the explanation.
+# The failures are not one condition with one fix — they are at least two, wanting different things:
+#
+#   "Requested version vX is not currently installed"    the ordinary one. A fresh clone with fnm
+#                                                        already installed for some OTHER project,
+#                                                        or a pull that moved .nvmrc (this repo did
+#                                                        exactly that, 23.6.0 -> 26.9.0) leaving an
+#                                                        fnm that has the old version and not the
+#                                                        new.            Fix: fnm install
+#   "Can't find version in dotfiles"                     no .nvmrc where fnm looked, i.e. make was
+#                                                        invoked with CWD outside the repo (`make
+#                                                        -f /path/Makefile` rather than `make -C
+#                                                        /path`).        Fix: run make from the repo
+#
+# Calling both "the pin is missing" would have been wrong about the second one, which is why the
+# message quotes fnm instead of paraphrasing it.
+FNM_WHY := $(shell fnm exec -- true 2>&1 >/dev/null | head -1)
+FNM_OK  := $(if $(FNM_WHY),,yes)
+NPM     := $(if $(FNM_OK),fnm exec --,) npm
+export NPM
+ifeq ($(FNM_OK),)
+ifneq ($(shell command -v fnm 2>/dev/null),)
+$(warning fnm is on PATH but cannot run under this directory's pin, so every target here falls back \
+to PATH's node ($(shell node -v 2>/dev/null)) — fnm says: $(FNM_WHY))
+endif
+endif
 ifndef OBSIDIAN_VERSION
 OBSIDIAN_VERSION := $(shell tr -d '[:space:]' < $(VERSION_FILE) 2>/dev/null)
 endif
@@ -192,7 +251,7 @@ help: ## Show this help
 # ---- dev -------------------------------------------------------------------
 
 install: ## Reproducible install from the lockfile (npm ci)
-	npm ci
+	$(NPM) ci
 	@$(MAKE) --no-print-directory tools-advice
 
 # Neither tool is required — everything here runs without both — so this only ever prints advice and
@@ -203,31 +262,35 @@ tools-advice:
 	@$(if $(TIMEOUT_BIN),,\
 	  echo "[optional] no 'timeout' on PATH — the engine-hang guard is a no-op, so a wedged Docker/Podman"; \
 	  echo "           hangs instead of failing fast.  brew install coreutils")
+	@# What this checks changed with NPM above. It used to compare .nvmrc against THIS SHELL's node,
+	@# which was the wrong question twice over: a shell on the wrong version is harmless now that
+	@# every recipe goes through `fnm exec`, and a shell on the RIGHT version said nothing about
+	@# what a cron job or an editor would get. The question that survives is whether the pinned
+	@# version is installed at all, because that is the one fnm cannot paper over.
 	@want=$$(tr -d '[:space:]' < $(VERSION_FILE_NODE) 2>/dev/null); have=$$(node -v 2>/dev/null | sed 's/^v//'); \
 	  if ! command -v fnm >/dev/null 2>&1; then \
-	    echo "[optional] no 'fnm' on PATH — .nvmrc ($$want) is not enforced, so this project runs on whatever"; \
-	    echo "           node is installed ($$have). engines only requires >=22.  brew install fnm"; \
-	    echo "           then: echo 'eval \"\$$(fnm env --use-on-cd)\"' >> ~/.zshrc  (new shell, then: fnm install)"; \
-	  elif [ -n "$$want" ] && [ "$$want" != "$$have" ]; then \
-	    echo "[optional] fnm is installed but this shell is on node $$have, not .nvmrc's $$want."; \
-	    echo "           Check your shell is set up for fnm (see its installation instructions), then:"; \
-	    echo "           fnm install   and open a new terminal"; \
+	    echo "[optional] no 'fnm' on PATH — .nvmrc ($$want) cannot be enforced, so every target here runs on"; \
+	    echo "           whatever node is first on PATH ($$have). engines only requires >=22, so nothing"; \
+	    echo "           will complain.  brew install fnm   then: fnm install"; \
+	  elif [ -n "$$want" ] && ! fnm exec -- true >/dev/null 2>&1; then \
+	    echo "[optional] fnm is on PATH but cannot serve .nvmrc's $$want, so targets here fall back to"; \
+	    echo "           PATH's node ($$have) and say so every time:  fnm install"; \
 	  fi
 
 
 typecheck: ## Type-check the project
-	npm run typecheck
+	$(NPM) run typecheck
 
 test: ## Run unit tests (the oracle)
-	npm test
+	$(NPM) test
 
 check: typecheck test ## Type-check + unit tests
 
 smoke: ## Probe the driver against a local throwaway vault (TEST_VAULT=...)
-	npm run smoke -- --vault $(TEST_VAULT)
+	$(NPM) run smoke -- --vault $(TEST_VAULT)
 
 check-local: ## Single-node pipeline check against a local throwaway vault
-	npm run local -- --vault $(TEST_VAULT)
+	$(NPM) run local -- --vault $(TEST_VAULT)
 
 # ---- containers ------------------------------------------------------------
 
@@ -370,13 +433,13 @@ unpause-sync: ## Resume Obsidian Sync on all CONTAINER_NODES (a fresh container 
 # with no matching `C`), and partitions are always per-rep, so every node should be attached
 # at the start of a run. (Not folded into `net`: that runs before containers exist.)
 run: solo-check reconnect-nodes ## Run ONE history: generated, or HISTORY=<dsl> (REPEAT=N; STEPS=K runs only its first K ops)
-	npm run start -- $(RUN_FLAGS)
+	$(NPM) run start -- $(RUN_FLAGS)
 
 campaign: solo-check reconnect-nodes ## Run HISTORIES histories and tally the error rate (HISTORIES=N FORCED_TURNS=... OPS=...)
-	npm run start -- --histories $(or $(HISTORIES),20) $(RUN_FLAGS)
+	$(NPM) run start -- --histories $(or $(HISTORIES),20) $(RUN_FLAGS)
 
 soak: solo-check reconnect-nodes ## Run until stopped (Ctrl-C); DURATION_MIN=N for a fixed span. HISTORY=<dsl> soaks that one history
-	npm run start -- --histories 0 $(RUN_FLAGS)
+	$(NPM) run start -- --histories 0 $(RUN_FLAGS)
 
 # Where run results live. One variable, and its value IS the directory — it used to be RUNS_PREFIX,
 # a PARENT to which "runs" was appended, which needed a second derived variable to say one thing.
@@ -384,12 +447,12 @@ soak: solo-check reconnect-nodes ## Run until stopped (Ctrl-C); DURATION_MIN=N f
 RUNS_DIR ?= runs
 
 analyze: ## Aggregate runs/ into runs/analysis.md (state tables by outcome, sync latency, corpus overview)
-	npm run analyze -- $(RUNS_DIR)
+	$(NPM) run analyze -- $(RUNS_DIR)
 
 # `make analyze` already writes these same sections into runs/analysis.md — this target just prints
 # them on their own, for when that is all you want to look at.
 corpus: ## Print just the cross-history sections of the analysis (loss rate by hand-off shape; is the generator still finding new behaviour)
-	npm run corpus -- $(RUNS_DIR)
+	$(NPM) run corpus -- $(RUNS_DIR)
 
 bench-cli: ## Time obsidian-cli calls vs an empty exec and vs the FS (BENCH_NODE/BENCH_N/BENCH_GAP/BENCH_INTERLEAVED/BENCH_BIN_MS; BENCH_SHOW=1 prints the commands, BENCH_CHECK=1 just the verdict)
 	@$(if $(BENCH_N),BENCH_N=$(BENCH_N)) $(if $(BENCH_SHOW),BENCH_SHOW=$(BENCH_SHOW)) \
@@ -398,13 +461,13 @@ bench-cli: ## Time obsidian-cli calls vs an empty exec and vs the FS (BENCH_NODE
 
 timeline-rep: ## Redraw one rep's timeline from its log (REP=runs/<history>/<rep>.jsonl)
 	@test -n "$(REP)" || (echo "usage: make timeline-rep REP=runs/<history>/<rep>.jsonl" && exit 2)
-	@npm run --silent timeline-rep -- $(REP)
+	@$(NPM) run --silent timeline-rep -- $(REP)
 
 probe-propagation: ## Measure where a change's time goes, n1 -> n2 (needs nodes up; HISTORY= to probe a different pattern)
-	npm run probe-propagation -- $(if $(REPEAT),--repeat $(REPEAT)) $(if $(HISTORY),--history '$(HISTORY)') $(if $(NO_SLEEP),--no-sleep)
+	$(NPM) run probe-propagation -- $(if $(REPEAT),--repeat $(REPEAT)) $(if $(HISTORY),--history '$(HISTORY)') $(if $(NO_SLEEP),--no-sleep)
 
 generate-histories: ## Print N generated histories without running them (N=20; honours FORCED_TURNS/OPS/NOTES/CD_PROB)
-	npm run start -- --generate $(or $(N),20) $(RUN_FLAGS)
+	$(NPM) run start -- --generate $(or $(N),20) $(RUN_FLAGS)
 
 # Most of RUN_FLAGS (turns/ops/notes/pause-prob/isolator/...) doesn't apply to an already-concrete
 # HISTORY, hence its own smaller flags var.
@@ -418,10 +481,10 @@ REPRO_FLAGS = --network $(NET) \
   $(if $(OUT),--out $(OUT))
 
 repro: ## Generate a standalone bash script reproducing HISTORY=<dsl> by hand (does not touch nodes)
-	npm run repro -- --history "$(HISTORY)" $(REPRO_FLAGS)
+	$(NPM) run repro -- --history "$(HISTORY)" $(REPRO_FLAGS)
 
 clean-notes: solo-check ## Delete the harness's notes (the bughunt/ folder only) on all container nodes (nodes must be up)
-	npm run clean-notes -- --nodes $(CONTAINER_NODES_CSV)
+	$(NPM) run clean-notes -- --nodes $(CONTAINER_NODES_CSV)
 
 clean-runs: ## Wipe local run results/logs (rm -rf runs/)
 	rm -rf $(RUNS_DIR)
