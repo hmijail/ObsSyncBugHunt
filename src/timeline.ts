@@ -16,9 +16,12 @@
 // and not otherwise — so most lanes are mostly empty, and drawing a `.` there would claim an
 // observation that never happened. `.` means "looked, nothing changed"; ` ` means "did not look".
 //
-// SECONDS. A `|` is a wallclock second boundary, and the `seconds` lane above them carries the
-// second numbers, every RULER_STEP_SEC, each label's first digit in the same column as the bar that
-// opens it. A second containing no slot at all contributes a
+// SECONDS. A `|` is a wallclock second boundary, INCLUDING one at column 0 opening the first second
+// — every second on the lane is delimited the same way, rather than the first one starting wherever
+// the lane happens to begin. The `seconds` lane above carries the second numbers, each label's first
+// digit in the same column as the bar that opens it: every second through RULER_DENSE_BEFORE_SEC
+// (the opening seconds, where a reader is counting single seconds off the lanes), and every
+// RULER_STEP_SEC after that. A second containing no slot at all contributes a
 // bar with nothing after it, so an idle stretch reads as `||` — the gaps in our own instrument,
 // visible rather than implied.
 import type { NodeId } from "./types.js";
@@ -219,9 +222,25 @@ export const slot = (t: number): Slot => ({ t, marks: new Map() });
  * how the ops row ended up one column out of step with the three below it, and with `L` in play and
  * note letters in the label there is no constant that stays right.
  */
-/** How often the ruler is labelled, in seconds. Every second would not fit: a second is only about
- *  three columns wide at the default slot, and one column wide across a pause nobody sampled. */
+/** How often the ruler is labelled, in seconds, once past the dense head below. Every second would
+ *  not fit across a whole timeline: a second is only about three columns wide at the default slot,
+ *  and one column wide across a pause nobody sampled. */
 export const RULER_STEP_SEC = 5;
+/**
+ * Below this second, the ruler labels EVERY second, not just the multiples — the opening seconds
+ * are where the writes land and where propagation is read, so that is where a reader is counting
+ * single seconds off the lanes.
+ *
+ * An ABSOLUTE second, not an offset from wherever the timeline starts: the ruler's numbers are real
+ * run seconds everywhere else, and a dense head that moved with the window would label 1000-1009 of
+ * a reconstruction that merely began there. A timeline starting mid-run simply has no dense head,
+ * which is correct — those are not the first seconds of anything.
+ *
+ * Dense labels are placed only where they keep a clear column either side (see `ruler`), so this is
+ * a request rather than a guarantee: at one column per second they mostly do not fit, and the ruler
+ * quietly falls back to the multiples.
+ */
+export const RULER_DENSE_BEFORE_SEC = 10;
 /** The ruler's lane label. Named like the others so it pads to the same width. */
 export const RULER_LANE = "seconds";
 
@@ -233,23 +252,39 @@ export const RULER_LANE = "seconds";
  * `bars` is (column, the second that bar opens), collected while the grid is built rather than
  * recomputed, so the ruler cannot drift from the bars it labels.
  *
- * Second 0 has no bar — nothing precedes it — so it is labelled at column 0 when the timeline starts
- * on a multiple of the step, which anchors the left edge.
+ * The first second shown now has its own bar at column 0 (see `renderLanes`), so it is labelled by
+ * the same rule as every other second rather than by a special case for the left edge.
  *
  * A label is dropped rather than allowed to overwrite one already placed. At one column per second a
  * four-digit number exactly fills the step, and beyond that the honest thing is a gap in the ruler
  * instead of two numbers merged into an unreadable one.
+ *
+ * TWO PASSES, and the order is the point. The RULER_STEP_SEC multiples are the anchors a reader
+ * navigates by, so they are placed first and can never be displaced by a dense-head label that
+ * happened to come earlier in the scan. The dense labels then fill in only where they fit, which
+ * makes the dense head purely additive: removing it reproduces the old ruler exactly.
+ *
+ * The passes also differ in how strict they are. An anchor only has to not OVERLAP what is already
+ * there (the long-standing rule). A dense label additionally needs a blank column on each side —
+ * `1 2 3` is readable, `123` is three labels pretending to be one. Left-to-right within the pass is
+ * enough to get that on both sides: a later dense label checks its own left gap against this one.
  */
-function ruler(bars: { col: number; second: number }[], firstSecond: number, len: number): string {
+function ruler(bars: { col: number; second: number }[], len: number): string {
   const out = new Array<string>(len).fill(" ");
-  const place = (col: number, second: number): void => {
+  const place = (col: number, second: number, needsGap: boolean): void => {
     const label = String(second);
-    if (col + label.length > len) return;
+    if (col < 0 || col + label.length > len) return;
+    // A clear column either side, where there IS a side — a label flush against the end of the
+    // ruler has no right-hand neighbour to crowd.
+    if (needsGap && col > 0 && out[col - 1] !== " ") return;
+    if (needsGap && col + label.length < len && out[col + label.length] !== " ") return;
     for (let i = 0; i < label.length; i++) if (out[col + i] !== " ") return; // would collide
     for (let i = 0; i < label.length; i++) out[col + i] = label[i];
   };
-  if (firstSecond % RULER_STEP_SEC === 0) place(0, firstSecond);
-  for (const b of bars) if (b.second % RULER_STEP_SEC === 0) place(b.col, b.second);
+  for (const b of bars) if (b.second % RULER_STEP_SEC === 0) place(b.col, b.second, false);
+  for (const b of bars) {
+    if (b.second < RULER_DENSE_BEFORE_SEC && b.second % RULER_STEP_SEC !== 0) place(b.col, b.second, true);
+  }
   return out.join("");
 }
 
@@ -264,6 +299,15 @@ export function renderLanes(slots: Slot[], lanes: LaneId[]): string[] {
   const firstSecond = slots.length > 0 ? Math.floor(slots[0].t) : 0;
   let second = firstSecond;
   let col = 0;
+  // The first second gets an opening bar too, so EVERY second on the lane is delimited the same way
+  // — `|a.|b.|` rather than `a.|b.|`, where the first second was the only one you had to take on
+  // trust. It also gives the first label a bar to sit on, which is what retired the special case
+  // for the left edge in `ruler`. No slots means no seconds, so nothing to open.
+  if (slots.length > 0) {
+    for (const cs of chars.values()) cs.push(MARK.second);
+    bars.push({ col, second: firstSecond });
+    col++;
+  }
   for (const s of slots) {
     const sec = Math.floor(s.t);
     for (let i = 0; i < sec - second; i++) {
@@ -276,7 +320,7 @@ export function renderLanes(slots: Slot[], lanes: LaneId[]): string[] {
     col++;
   }
   return [
-    `      ${RULER_LANE.padEnd(width)}${ruler(bars, firstSecond, col)}`,
+    `      ${RULER_LANE.padEnd(width)}${ruler(bars, col)}`,
     ...lanes.map((l) => `      ${l.padEnd(width)}${chars.get(l)!.join("")}`),
   ];
 }

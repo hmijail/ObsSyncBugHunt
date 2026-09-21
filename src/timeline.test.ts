@@ -32,8 +32,8 @@ test("renderLanes: a lane that was never sampled renders spaces, not dots", () =
     [0.6, { "n1 sync": ".", "n2 sync": "x" }],
   ]);
   const lanes = ["n1 sync", "n2 sync"];
-  assert.equal(lane(slots, lanes, lanes[0]), "...");
-  assert.equal(lane(slots, lanes, lanes[1]), ". x");
+  assert.equal(lane(slots, lanes, lanes[0]), "|...");
+  assert.equal(lane(slots, lanes, lanes[1]), "|. x");
 });
 
 test("renderLanes: a second containing no slot renders as ||", () => {
@@ -41,12 +41,25 @@ test("renderLanes: a second containing no slot renders as ||", () => {
     [0.5, { "n1 ops": "a" }],
     [3.5, { "n1 ops": "b" }], // seconds 1 and 2 had no sampling at all
   ]);
-  assert.equal(lane(slots, ["n1 ops"], "n1 ops"), "a|||b");
+  assert.equal(lane(slots, ["n1 ops"], "n1 ops"), "|a|||b");
 });
 
-test("renderLanes: one bar per second boundary, and none before the first slot", () => {
+test("renderLanes: one bar per second boundary, INCLUDING one opening the first second", () => {
+  // The leading bar is not decoration: without it the first second was the only one whose start
+  // you had to take on trust, and the first ruler label had no bar to sit on.
   const slots = build([[0.1, { x: "1" }], [0.9, { x: "2" }], [1.1, { x: "3" }]]);
-  assert.equal(lane(slots, ["x"], "x"), "12|3");
+  assert.equal(lane(slots, ["x"], "x"), "|12|3");
+});
+
+test("renderLanes: the leading bar is one column, not one per lane-render", () => {
+  // Guards the obvious regression: pushing the opening bar inside the slot loop instead of once
+  // before it would prepend a bar per slot and silently double the width.
+  const slots = build([[0.1, { x: "1" }], [0.2, { x: "2" }], [0.3, { x: "3" }]]);
+  assert.equal(lane(slots, ["x"], "x"), "|123");
+});
+
+test("renderLanes: no slots means no seconds, so no leading bar either", () => {
+  assert.equal(body(renderLanes([], ["x"])[1], ["x"]), "");
 });
 
 test("renderLanes: lanes stay column-aligned when nodes are sampled unequally", () => {
@@ -61,7 +74,7 @@ test("renderLanes: lanes stay column-aligned when nodes are sampled unequally", 
   // ...and every lane's content starts at the same column, so the `|` bars line up vertically.
   const lanes = ["n1 ops", "n2 ops", "n2 file b"];
   for (const [i, l] of lines.entries()) assert.equal(l.indexOf(lanes[i]), 6);
-  assert.deepEqual(lines.map((l) => body(l, lanes)), ["a.| ", "  | ", "F |."]);
+  assert.deepEqual(lines.map((l) => body(l, lanes)), ["|a.| ", "|  | ", "|F |."]);
 });
 
 test("renderLanes: no lanes, or no slots, is not an error", () => {
@@ -200,8 +213,8 @@ test("foldEvents: an append marks its own note letter on its own node's ops lane
     { t: 0.1, kind: "appended", node: "n1", note: "a", fullname: NOTE },
     { t: 0.5, kind: "appended", node: "n2", note: "b", fullname: "bughunt/x-b-N1AaN2W" },
   ]);
-  assert.equal(row(r, "n1 ops"), "a ");
-  assert.equal(row(r, "n2 ops"), " b");
+  assert.equal(row(r, "n1 ops"), "|a ");
+  assert.equal(row(r, "n2 ops"), "| b");
 });
 
 test("foldEvents: a lane nothing could populate is not drawn at all", () => {
@@ -221,8 +234,8 @@ test("foldEvents: a mid-history wait attributes its state to the one node it nam
     { t: 2.1, kind: "settle-poll", nodes: ["n1", "n2"], states: ["synced", "timeout"] },
   ]);
   // Columns are slot, bar, slot, bar, slot — the bars are part of the row, not decoration.
-  assert.equal(row(r, "n2 sync"), " |s|x"); // unprobed, then `syncing`, then a blocked call
-  assert.equal(row(r, "n1 sync"), " | |."); // the mid-history wait never looked at n1
+  assert.equal(row(r, "n2 sync"), "| |s|x"); // unprobed, then `syncing`, then a blocked call
+  assert.equal(row(r, "n1 sync"), "| | |."); // the mid-history wait never looked at n1
 });
 
 test("foldEvents: an arrival and the poll after it are separate columns, both visible", () => {
@@ -233,8 +246,8 @@ test("foldEvents: an arrival and the poll after it are separate columns, both vi
     { t: 1.10, kind: "token-arrived", to: "n2", note: NOTE, token: "(n1-1-a)" },
     { t: 1.12, kind: "settle-poll", wait: "n2", states: ["synced"], note: NOTE, missing: 0 },
   ]);
-  assert.equal(row(r, "n2 file a"), " |u.");
-  assert.equal(row(r, "n1 ops"), "a|  ");
+  assert.equal(row(r, "n2 file a"), "| |u.");
+  assert.equal(row(r, "n1 ops"), "|a|  ");
 });
 
 test("foldEvents: every measurement is its own column, however close together", () => {
@@ -247,8 +260,8 @@ test("foldEvents: every measurement is its own column, however close together", 
     { t: 1.13, kind: "sample", node: "n2", note: NOTE, vers: 1, versStatus: "ok", sync: "synced" },
     { t: 2.10, kind: "sample", node: "n1", note: NOTE, vers: 2, versStatus: "ok", sync: "synced" },
   ]);
-  assert.equal(row(r, "n1 vers a"), " |1 |2");
-  assert.equal(row(r, "n2 vers a"), " | 1| ");
+  assert.equal(row(r, "n1 vers a"), "| |1 |2");
+  assert.equal(row(r, "n2 vers a"), "| | 1| ");
 });
 
 test("foldEvents: an event with nothing to say leaves no column behind", () => {
@@ -259,7 +272,7 @@ test("foldEvents: an event with nothing to say leaves no column behind", () => {
     { t: 0.2, kind: "network-probe", node: "n1", reachable: true },
     { t: 0.3, kind: "timings", totalSec: 1 },
   ]);
-  assert.equal(row(r, "n1 ops"), "a");
+  assert.equal(row(r, "n1 ops"), "|a");
 });
 
 test("foldEvents: a rep with nothing appended yields no lanes rather than an empty grid", () => {
@@ -273,7 +286,7 @@ test("foldEvents: a sample carrying no counter leaves the vers lane alone", () =
     { t: 0.1, kind: "appended", node: "n1", note: "a", fullname: NOTE },
     { t: 0.2, kind: "sample", node: "n1", note: NOTE, fileStatus: "present", changed: true },
   ]);
-  assert.equal(row(r, "n1 file a"), " " + MARK.updated);
+  assert.equal(row(r, "n1 file a"), "| " + MARK.updated);
   assert.equal(r.lanes.some((l) => l === "n1 vers a"), false, "no counter reading, so no counter lane");
 });
 
@@ -284,7 +297,7 @@ test("foldEvents: a conflict appearing with an update draws c on that node's fil
     // Same note changed again later, with the conflict copy still sitting there but not NEW.
     { t: 0.3, kind: "sample", node: "n1", note: NOTE, fileStatus: "present", changed: true, conflictAppeared: false },
   ]);
-  assert.equal(row(r, "n1 file a"), " " + MARK.conflicted + MARK.updated);
+  assert.equal(row(r, "n1 file a"), "| " + MARK.conflicted + MARK.updated);
 });
 
 test("foldEvents: a recognized sync state gets its own mark, not the unparseable one", () => {
@@ -306,7 +319,7 @@ test("foldEvents: a settle keeps only the columns where something changed", () =
   ];
   const quiet = foldEvents(base);
   assert.equal(quiet.quietSettleSlots, 2, "the first poll establishes the state; the next two change nothing");
-  assert.equal(row(quiet, "n1 ops"), "a| ", "the establishing poll stays, its two repeats do not");
+  assert.equal(row(quiet, "n1 ops"), "|a| ", "the establishing poll stays, its two repeats do not");
 
   // A settle where something happens keeps THAT column — but not the unchanging ones around it.
   // Dropping only a trailing run was defeated by anything at all happening late: one flicker in the
@@ -324,8 +337,8 @@ test("foldEvents: a note that is not on a node reads as absent, never as unchang
     { t: 1.1, kind: "sample", node: "n2", note: NOTE, vers: null, versStatus: "absent", fileStatus: "absent", sync: "synced" },
     { t: 1.2, kind: "sample", node: "n2", note: NOTE, vers: 1, versStatus: "ok", fileStatus: "present", sync: "synced" },
   ]);
-  assert.equal(row(r, "n2 file a"), " |-.");
-  assert.equal(row(r, "n2 vers a"), " |-1");
+  assert.equal(row(r, "n2 file a"), "| |-.");
+  assert.equal(row(r, "n2 vers a"), "| |-1");
 });
 
 test("foldEvents: the file lane carries the state AND whether it just changed", () => {
@@ -340,7 +353,7 @@ test("foldEvents: the file lane carries the state AND whether it just changed", 
     { t: 1.4, kind: "sample", node: "n2", note: NOTE, fileStatus: "present", changed: false, lost: true, sync: "synced" },
     { t: 1.5, kind: "sample", node: "n2", note: NOTE, fileStatus: "present", changed: true, lost: true, sync: "synced" },
   ]);
-  assert.equal(row(r, "n2 file a"), " |-u.mM");
+  assert.equal(row(r, "n2 file a"), "| |-u.mM");
 });
 
 test("foldEvents: a settle that repeats the SAME non-dot mark is still shaved", () => {
@@ -394,8 +407,8 @@ test("foldEvents: a pause is an op, a loss or weirdness is not", () => {
     { t: 0.3, kind: "weirdness", what: "fs-led-counter", node: "n2", note: NOTE },
     { t: 0.4, kind: "loss-detected", node: "n2", note: NOTE, missing: ["(t)"] },
   ]);
-  assert.equal(row(r, "n1 ops"), "aP  ");
-  assert.equal(row(r, "n2 file a"), "  !L");
+  assert.equal(row(r, "n1 ops"), "|aP  ");
+  assert.equal(row(r, "n2 file a"), "|  !L");
   assert.ok(!r.lanes.includes("n2 ops"), "n2 did nothing; a detection about it is not an op");
 });
 
@@ -408,14 +421,14 @@ test("foldEvents: where the sampler watches a file lane, token-arrived does not 
     { t: 1.1, kind: "sample", node: "n2", note: NOTE, fileStatus: "present", changed: true, lost: true, sync: "synced" },
     { t: 1.2, kind: "token-arrived", to: "n2", note: NOTE, token: "(t)" },
   ]);
-  assert.equal(row(withSampler, "n2 file a"), " |M", "no contradicting `u` beside the `M`");
+  assert.equal(row(withSampler, "n2 file a"), "| |M", "no contradicting `u` beside the `M`");
 
   // With no sampler — a strategic run — the arrival is the only thing that can mark the lane.
   const strategic = foldEvents([
     { t: 0.1, kind: "appended", node: "n1", note: "a", fullname: NOTE },
     { t: 1.2, kind: "token-arrived", to: "n2", note: NOTE, token: "(t)" },
   ]);
-  assert.equal(row(strategic, "n2 file a"), " |u");
+  assert.equal(row(strategic, "n2 file a"), "| |u");
 });
 
 // --- what the live rewind counts ---------------------------------------------------------------
@@ -502,13 +515,16 @@ test("ruler: a label's FIRST DIGIT sits in the same column as the bar that opens
   }
   // The checkable form of "aligned": at every column where the ruler starts a number, the lane has
   // the bar that opens that second.
+  // Column 0 is now a bar too (the one opening the first second), so it needs no exception here —
+  // EVERY label start, including the leftmost, must sit on a second boundary.
   for (let i = 0; i < rule.length; i++) {
     const isLabelStart = rule[i] !== " " && (i === 0 || rule[i - 1] === " ");
-    if (!isLabelStart || i === 0) continue;
+    if (!isLabelStart) continue;
     assert.equal(bar[i], MARK.second, `a label starts at column ${i}, so that column must be a second boundary`);
   }
-  // And the numbers are the seconds those bars open, every 5.
-  assert.deepEqual(rule.trim().split(/\s+/), ["0", "5", "10"]);
+  // Every second through the dense head, then the multiples. One slot per second leaves two columns
+  // per second, which is room for a single digit plus its separating space.
+  assert.deepEqual(rule.trim().split(/\s+/), ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
 });
 
 test("ruler: second 0 is labelled at the left edge, where no bar precedes it", () => {
@@ -520,7 +536,30 @@ test("ruler: a timeline starting mid-run labels only the multiples it actually c
   // A reconstruction can start anywhere; the ruler must carry real second numbers, not an offset
   // from wherever the log happened to begin.
   const slots = build([[7.2, { x: "." }], [8.2, { x: "." }], [9.2, { x: "." }], [10.2, { x: "." }]]);
-  assert.deepEqual(rulerOf(slots, ["x"]).trim().split(/\s+/), ["10"], "7 is not a multiple of 5, and 10 is where its bar is");
+  // 7, 8 and 9 are labelled because they fall inside the dense head (an ABSOLUTE second range, so
+  // it does not slide with the window); 10 because it is a multiple. The point the test defends is
+  // unchanged: these are real run seconds, not an offset from wherever the log began.
+  assert.deepEqual(rulerOf(slots, ["x"]).trim().split(/\s+/), ["7", "8", "9", "10"]);
+});
+
+test("ruler: the dense head is absolute, so a timeline starting past it gets only the multiples", () => {
+  // The companion to the test above: begin at second 20 and the every-second labelling is gone,
+  // because these are not the first seconds of the run — they merely start this view.
+  const slots = build(Array.from({ length: 7 }, (_, i) => [20 + i + 0.5, { x: "." }] as [number, Record<string, string>]));
+  assert.deepEqual(rulerOf(slots, ["x"]).trim().split(/\s+/), ["20", "25"]);
+});
+
+test("ruler: a dense label is dropped unless it keeps a clear column either side", () => {
+  // Two slots per second is three columns per second, so single digits fit with room to spare...
+  const roomy = build(Array.from({ length: 12 }, (_, i) => [i / 2 + 0.25, { x: "." }] as [number, Record<string, string>]));
+  assert.deepEqual(rulerOf(roomy, ["x"]).trim().split(/\s+/), ["0", "1", "2", "3", "4", "5"]);
+  // ...but with no slot inside most seconds, a second is one bar wide and consecutive labels would
+  // touch. The multiples survive (they are placed first and need only not overlap); the dense ones
+  // that cannot keep their space are dropped rather than run together.
+  const tight = build([[0.5, { x: "." }], [9.5, { x: "." }]]);
+  const rule = rulerOf(tight, ["x"]);
+  assert.ok(!/\d\d/.test(rule), `no two single-digit labels may end up adjacent: ${JSON.stringify(rule)}`);
+  assert.ok(rule.trimEnd().startsWith("0"), "the multiple still anchors the left edge");
 });
 
 test("ruler: a label that would collide with the previous one is dropped, not merged", () => {
