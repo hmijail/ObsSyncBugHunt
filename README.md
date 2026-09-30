@@ -8,8 +8,8 @@ Inspired by [Jepsen](https://jepsen.io/), which would be overkill for something 
 
 **I wrote this README personally. Everything else, including the docs/ directory, are Claude artifacts.**
 
-Reproduce a data loss example on your own Obsidian Sync [here](#lets-lose-some-data).  
-See that example as a timeline [here](#timelines), as reported by the fuzzer.
+Lose data on your own Obsidian Sync [here](#lets-lose-some-data).  
+See the timeline of that example [here](#timelines), as reported by the fuzzer.
 
 # Some background: data loss in Obsidian Sync!?
 
@@ -27,15 +27,17 @@ Long story short, I started guiding the design of a semantic fuzzer, following t
 
 One result is that **the fuzzer works**: the harness finds different sequences of operations that trigger sync bugs in Obsidian, measures their repeatability and even helps understand how the sequence failed. Yay!
 
-The other result is that **Claude is "interesting" for coding, but a surprisingly, increasingly incompetent assistant**. Full experience report [here](https://hmijail.substack.com/p/building-a-semantic-fuzzer-for-obsidian-sync-in-spite-of-claude), plus some posible remediations.
+The other result is that **Claude is a surprisingly, increasingly incompetent assistant**. The project ballooned into 60h, half of it fighting the bug treadmill. Full experience report [here](https://hmijail.substack.com/p/building-a-semantic-fuzzer-for-obsidian-sync-in-spite-of-claude), plus some posible remediations. 
 
-The summary is that keeping Claude in a leash tight enough to stop it from doing silly stuff is hard work. Claude is like an intern that knows far too much for their own good, uses that knowledge to make bad choices... plus periodically forgets instructions... but rarely lets go of pointless minutiae. Also, you're responsible for what it remembers, even though you only have coarse tools to control that. Also, those tools keep changing, no one knows how to best use them, and even Anthropic's instructions aren't very consistent.
+The summary is that keeping Claude in a leash tight enough to stop it from doing silly stuff is hard work, which eventually turns into a bug treadmill anyway. Claude is like an intern that knows far too much for their own good, uses that knowledge to make bad choices... plus periodically forgets instructions... but rarely lets go of pointless minutiae.  
+Also, you're responsible for what it remembers, even though you only have blunt tools to control that.  
+Also, those tools keep changing, and even Anthropic's instructions aren't very consistent, which confuses even Claude.
 
 So that's a blurry mess. OK, but what did *I* learn from this project? Only things about Claude itself, the stuff that keeps changing. But nothing about the matter at hand. In fact, it's the opposite: I had to teach Claude how to build this.
 
-**If Claude was an intern, I could expect that they learnt something, and maybe even that they'd take over and keep the project moving forward. But Claude doesn't learn.** The wordy, knows-too-much, unwise intern is memory-wiped every morning, who quickly goes through the code to get an idea of what is what, and then fumbles onward one more day at a time.
+**If Claude was an intern, I would expect that they learnt something, and maybe even that they'd take over and keep the project moving forward. But Claude doesn't learn.** 
 
-In a nutshell: this is an **insta-legacy project**, that **ties you to LLMs**, and **requires experience, but doesn't create it**.
+In a nutshell: this is an **insta-legacy project**, that **ties you to LLMs**, and **required experience, but didn't create it**.
 
 # Let's lose some data
 
