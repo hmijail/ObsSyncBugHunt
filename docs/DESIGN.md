@@ -446,7 +446,7 @@ conflict files, never a time.
 > settles every claim above — where the boundary sits, how wide the transition is, and whether
 > losses really do concentrate at the narrow end.
 >
-> Note what it must NOT become: another `2+ of 4` gate. Step 12 already asserts the apparatus still
+> Note what it must NOT become: another `2+ of 4` gate. Step 13 already asserts the apparatus still
 > conflicts and is deliberately cheap; this is a measurement to be read, like `make bench-cli` or
 > `make probe-propagation`, and belongs beside them. Wiring it in as advisory (the way step 14 and
 > step 15 are) is the likely shape.

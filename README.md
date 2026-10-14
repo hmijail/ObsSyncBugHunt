@@ -41,7 +41,7 @@ In a nutshell: this is an **insta-legacy project**, that **ties you to LLMs**, a
 
 # Let's lose some data
 
-As a motivating example, this is one sequence of operations found by the fuzzer that causes data loss ~100% of the time in Obsidian 1.12 and 1.13.7 (latest as of this writing). Reported 2 months ago,  still not acknowledged nor fixed as of this writing.
+As a motivating example, this is one sequence of operations that reliably causes data loss. The fuzzer found it in Obsidian 1.12 and I reported it to the devs, but there was no response; the bug is still there in 1.14.4 (latest as of this writing). NOTE: 1.14.5 (only for iOS) doesn't reproduce this bug.
 
 Let’s assume you use Obsidian with Sync in your phone and your laptop. Both should set their Sync settings to “Conflict file” mode, which is the [devs’ recommendation](https://forum.obsidian.md/t/obsidian-sync-on-iphone-overwrites-newer-data-causing-data-loss/85214/33)  hoping to minimize data loss.
 

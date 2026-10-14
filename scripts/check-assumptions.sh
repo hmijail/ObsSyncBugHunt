@@ -170,7 +170,7 @@ if [ -z "$live" ]; then
 fi
 
 # And is Sync actually RUNNING on them? A fresh container boots paused, and nothing in
-# `containers-up` changes that. Paused, this script does not fail — it answers. Step 7's blocking
+# `containers-up` changes that. Paused, this script does not fail — it answers. Step 8's blocking
 # claims, step 9's write path, step 12's divergence and step 13's race all read differently against a
 # node whose Sync was never started, and the verdict at the end would say the apparatus is sound.
 #
@@ -193,7 +193,7 @@ if [ -n "$paused" ]; then
   exit 1
 fi
 
-# 2. The test network. What matters is NOT which subnet it happens to carry — any private range
+# 3. The test network. What matters is NOT which subnet it happens to carry — any private range
 #    would do — but whether the addresses this harness actually pins are assignable inside it.
 #    Every node is started and reconnected with an explicit `--ip`, so if the network's subnet
 #    doesn't cover those addresses, every `containers-up` and every `C` fails with an obscure
@@ -285,13 +285,13 @@ else
   fi
 fi
 
-# 3. The image for the pinned version exists and still ships obsidian-cli — not a documented API,
+# 4. The image for the pinned version exists and still ships obsidian-cli — not a documented API,
 #    so it could quietly stop being in the portable tarball.
 #
 #    Only its PRESENCE can be checked here. obsidian-cli is an IPC client to a running Obsidian,
 #    not a standalone binary, so `obsidian-cli version` in a bare container answers "The CLI is
 #    unable to find Obsidian" — there is no headless mode. The version comparison therefore needs
-#    a live node, and happens in step 7 with the rest of the live-node checks.
+#    a live node, and happens at the very end, after step 15 ("The deferred half of step 4").
 say "node image $IMAGE:$OBSIDIAN_VERSION is present and ships the CLI" \
     "$CONTAINER_ENGINE image inspect $IMAGE:$OBSIDIAN_VERSION" \
     "$CONTAINER_ENGINE run --rm --entrypoint /bin/sh $IMAGE:$OBSIDIAN_VERSION -c 'test -x $CLI && echo present'"
@@ -307,7 +307,7 @@ else
   fi
 fi
 
-# 4. Advisory only: how far behind the pin is. After a long break the useful signal is simply
+# 5. Advisory only: how far behind the pin is. After a long break the useful signal is simply
 #    "there are newer releases" — never a failure, since testing an older build is legitimate
 #    (and bisecting across releases is an explicit workflow here).
 say "pinned Obsidian vs upstream (advisory)" \
@@ -322,7 +322,7 @@ else
   note "pinned $OBSIDIAN_VERSION, latest upstream is $latest — 'make obsidian-latest' for how to move"
 fi
 
-# 5. The fault primitive. A D/C must still be a brief link blip rather than a network reset, or
+# 6. The fault primitive. A D/C must still be a brief link blip rather than a network reset, or
 #    every history containing D/C tests something other than what it says. Nothing else exercises
 #    this: a history with no `D` never touches it, so it needs its own deliberate measurement.
 say "a D/C reconnect is still a brief blip (check-net, $ROUNDS rounds x 10s outage)" \
@@ -333,7 +333,7 @@ else
   bad "reconnect is too slow, or lost the pinned IP — see the check-net output above"
 fi
 
-# 6. obsidian-cli output formats. The runtime DOES guard these (cli-parse.ts refuses to guess),
+# 7. obsidian-cli output formats. The runtime DOES guard these (cli-parse.ts refuses to guess),
 #    but only reactively: you find out mid-soak, one burned `-UNKNOWN` rep at a time. Since a
 #    format change is the likeliest breakage right after an Obsidian upgrade — i.e. right when
 #    this script gets run — check it up front. Needs live nodes, so it goes last; with them down
@@ -347,7 +347,7 @@ case $? in
   *) bad "obsidian-cli output drifted — see above; parsers in src/cli-parse.ts need updating" ;;
 esac
 
-# 7. Two claims the settle loop is BUILT on, both of them OURS — written into driver.ts from
+# 8. Two claims the settle loop is BUILT on, both of them OURS — written into driver.ts from
 #    observation at some past moment, never from Obsidian documentation, and therefore liable to
 #    expire silently under an upgrade. `syncStateProbe`'s whole design assumes `sync:status` blocks
 #    until a node is synced; if it stopped blocking, a probe timeout would no longer mean "not
@@ -361,7 +361,7 @@ else
   bad "sync CLI blocking behaviour changed — src/driver.ts's syncStateProbe may be reading noise"
 fi
 
-# 8. The write path's two load-bearing CLI behaviours. execute.ts appends FIRST and only creates
+# 9. The write path's two load-bearing CLI behaviours. execute.ts appends FIRST and only creates
 #    when the CLI positively says the note is missing, which rests on both of these being true:
 #
 #      - append to a missing note ERRORS ("not found"). If a future CLI made it auto-create instead,
@@ -396,7 +396,7 @@ fi
 cli delete "file=$probe" >/dev/null 2>&1 || true
 cli delete "file=$probe 1" >/dev/null 2>&1 || true
 
-# 9. `vault=` is still a REQUEST THE CLI MAY IGNORE, not an instruction it obeys.
+# 10. `vault=` is still a REQUEST THE CLI MAY IGNORE, not an instruction it obeys.
 #
 #    This is the only step here that checks an assumption by hoping it still FAILS. `vault=<name>`
 #    reaches a vault only if that vault is already open as its own window; for anything else — a
@@ -454,7 +454,7 @@ else
            actually switch vaults now. src/local-vault.ts assumes it cannot; re-read that file
            before trusting any local run."
 fi
-# `vaults verbose` is the listing the guard resolves names against and builds its error out of.
+# 11. `vaults verbose` is the listing the guard resolves names against and builds its error out of.
 # check-cli.ts already parses it (so format drift fails step 7); what matters HERE is the weaker,
 # structural claim the guard needs even when parsing succeeds: it enumerates vaults with paths.
 say "\`vaults verbose\` still lists vaults with their paths (the guard resolves names against it)" \
@@ -469,8 +469,9 @@ else
 fi
 # <<< vault-premise-check
 
-# 11. Conflict files are still what a real divergence produces — i.e. every node is still in
-#    Sync's "create conflict file" mode.
+# 12. Checks OBSIDIAN'S CONFIG: is every node still in Sync's "create conflict file" mode?
+#    Forces an edit-vs-edit divergence with a partition and expects a conflict file, not a merge.
+#    Harness-free on purpose. Step 13 is its counterpart: same symptom, different question.
 #
 #    That mode is set BY HAND, per node, through VNC (README's setup step). Nothing in the harness
 #    reads it back, and a node brought up without it does not fail: Obsidian merges the divergent
@@ -519,7 +520,7 @@ if [ "$#" -ge 2 ]; then
   # Printed resolved, not as the formula: a command nobody can paste is not worth a line. Same guard
   # cg_ip uses below, so a node whose name is not nN prints a placeholder instead of an arithmetic error.
   case "${2#n}" in ""|*[!0-9]*) cgB_ip="<its pinned ip>" ;; *) cgB_ip="10.89.0.$((100 + ${2#n}))" ;; esac
-  say "a real divergence still produces a conflict file, not a merge" \
+  say "Obsidian config: a forced edit-vs-edit divergence still makes a conflict file, not a merge" \
     "$CONTAINER_ENGINE exec $1 $CLI create 'path=<note>.md' 'content=(base)'   # then wait for it on $2" \
     "$CONTAINER_ENGINE network disconnect $NET $2" \
     "$CONTAINER_ENGINE exec $1 $CLI append 'file=<note>' 'content=(from-$1)'" \
@@ -527,7 +528,7 @@ if [ "$#" -ge 2 ]; then
     "$CONTAINER_ENGINE network connect --ip $cgB_ip $NET $2" \
     "$CONTAINER_ENGINE exec $2 $CLI files 'folder=bughunt'   # expect: a (Conflicted copy ...) sibling"
 else
-  say "a real divergence still produces a conflict file, not a merge"
+  say "Obsidian config: a forced edit-vs-edit divergence still makes a conflict file, not a merge"
 fi
 if [ "$#" -lt 2 ]; then
   note "SKIPPED — needs two live nodes, found $#; a PASS below does NOT cover conflict-file mode"
@@ -641,9 +642,11 @@ else
   cg_restore
 fi
 
-# 12. `N1AaN2Aa` still conflicts, with no partition to force it — in 2 reps of 4.
+# 13. Checks THE HARNESS: is its write path still fast enough to provoke the race it hunts?
+#    Runs `N1AaN2Aa` through the real harness — create vs create, timing only, no partition — and
+#    expects a conflict file in 2+ of 4 reps.
 #
-#    Step 9 forces a divergence and asks whether Sync still conflicts it. This asks the other half:
+#    Step 12 forces a divergence and asks whether Sync still conflicts it. This asks the other half:
 #    does the canonical race still race? `N1AaN2Aa` is two appends to a note that does not exist
 #    yet, back to back on two nodes. It diverges only while both writes land before either node's
 #    note reaches the other, so anything the harness does between the two appends can suppress it —
@@ -683,7 +686,7 @@ fi
 pre10_fails=$fails
 race_clean=0
 race_dir="./check-assumptions-runs/race-$(date -u +%Y%m%dT%H%M%SZ)"
-say "N1AaN2Aa still conflicts: 2+ of 4 reps (no partition, timing only)" \
+say "harness speed: N1AaN2Aa's two creates still race into a conflict in 2+ of 4 reps" \
     "$NPM run start -- --history N1AaN2Aa --repeat 4 --runs-dir ${race_dir#./} --display off"
 rm -rf "$race_dir"
 # Not runs/: corpus.ts parses a run directory as `<ts>-<history>` and analyze.ts groups by the
@@ -785,7 +788,7 @@ PY
     esac
     case "$race_out" in
       *"MERGE "*)
-        note "MERGE: two independent creates became one note with both tokens. Step 9 is the check"
+        note "MERGE: two independent creates became one note with both tokens. Step 12 is the check"
         note "  for Sync's conflict-file mode; if it passed, this is unexplained and worth a look." ;;
     esac
   fi
@@ -816,7 +819,7 @@ PY
   [ "${race_clean:-0}" = 1 ] && rm -rf "$race_dir"
 fi
 
-# 13. Advisory: how fast a change actually reaches the other node. NOT a showstopper check — these
+# 14. Advisory: how fast a change actually reaches the other node. NOT a showstopper check — these
 #    numbers can move without anything being broken — but they shape how every timing result here
 #    is read, and how patient a `W<n>` has to be, so a silent shift is exactly the kind of thing
 #    that leaves old conclusions standing on a floor that moved. It prints its own verdict; the exit
@@ -829,7 +832,7 @@ else
   bad "a change never arrived at the peer at all — that is not drift, something is broken"
 fi
 
-# 14. Advisory: are the two call arrangements the harness actually uses still among the fast ones?
+# 15. Advisory: are the two call arrangements the harness actually uses still among the fast ones?
 #
 #    The sampler issues its four calls unbatched + parallel; the write path, whose calls each depend
 #    on the last, goes batched + sequential. Those were the arguably best arrangements measured

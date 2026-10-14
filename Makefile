@@ -262,7 +262,7 @@ RUN_FLAGS = --nodes $(NODES_CSV) --network $(NET) \
 
 .DEFAULT_GOAL := help
 .PHONY: help install typecheck test test-scripts check smoke check-local \
-        build-image net secrets-dir clean-secrets login capture-login node1 containers-up solo-check reconnect-nodes unpause-sync run campaign soak analyze generate-histories repro \
+        build-image net secrets-dir clean-secrets login capture-login node1 containers-up solo-check reconnect-nodes disconnect-nodes unpause-sync run campaign soak analyze generate-histories repro \
         clean-runs clean-notes clean-data clean-images trial containers-down ps logs health \
         list-images obsidian-latest obsidian-upgrade check-net check-assumptions corpus probe-propagation timeline-rep bench-cli probe-vault-param
 
@@ -540,6 +540,16 @@ reconnect-nodes: ## Reconnect all CONTAINER_NODES to the network (fixes a node l
 	  $(NODE_ADDR); \
 	  $(ENGINE_GUARD) $(CONTAINER_ENGINE) network connect --ip $$ip $(NET) $$n 2>/dev/null && echo "reconnected $$n ($$ip)" || echo "$$n already connected (or absent)"; \
 	done
+
+# The by-hand half of a `D`, for poking at a node outside a history (e.g. the README's airplane-mode
+# example, watched over VNC). Pick nodes with NODES=n2. Undo with reconnect-nodes, NOT a bare
+# `network connect`: that would hand back a fresh IP and turn the blip into a network reset.
+# run/campaign/soak reconnect everything first, so a node left detached here cannot leak into a run.
+disconnect-nodes: ## Detach CONTAINER_NODES from the network (NODES=n2 for one); undo with reconnect-nodes
+	@for n in $(CONTAINER_NODES); do \
+	  $(ENGINE_GUARD) $(CONTAINER_ENGINE) network disconnect $(NET) $$n 2>/dev/null && echo "disconnected $$n" || echo "$$n already disconnected (or absent)"; \
+	done
+	@echo "Undo with: make reconnect-nodes NODES=$(CONTAINER_NODES_CSV)"
 
 # A fresh node boots with Sync PAUSED and nothing in `containers-up` changes that — wait-node.sh
 # accepts `paused` as ready on purpose, so that a Sync that is genuinely stuck stays distinguishable
